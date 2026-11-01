@@ -35,6 +35,8 @@ public:
 
     // where (c-include ...) looks first (then the system directories)
     std::vector<std::string> include_dirs;
+    // -D NAME[=value]: an untyped constant (a number, or else a string; 1 without a value)
+    void define_const(const std::string &name, const std::string &value);
 
     // used by the C header importer (cimport.cpp)
     void add_type(const std::string &name, Type *t);

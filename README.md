@@ -21,7 +21,7 @@ through libclang, so libc and kernel interfaces need no hand-written bindings.
 
     make            # needs llvm-18 and libclang-18 (headers + libraries)
     make test
-    ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [--emit-llvm] [-c] [-lname ...]
+    ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 
 Extra `.c`/`.o` inputs are linked in. `(c-include ...)` searches the source
 file's directory and `-I` directories, then the system ones.
@@ -56,6 +56,7 @@ Expressions — everything is one; statements have type `void`:
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
     "strings" are (ptr i8);  true false null
+    (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
 
 Typing rules:
 
@@ -63,6 +64,7 @@ Typing rules:
   `f32` is expected, `0.1` (double) otherwise; integers take the type they meet.
 - Operands of an operator must have one type; mixing `i32` and `f32` (or `i32`
   and `i64`) is an error — write `(cast T e)`.
+- `#define` and enum constants from C headers are untyped too, as in C.
 - Implicit conversions only: `(ptr void)` ↔ any pointer, arrays to a pointer to
   their first element, and C's default promotions for variadic arguments.
 - Conditions may be `bool`, integers or pointers.

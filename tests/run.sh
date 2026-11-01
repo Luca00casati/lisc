@@ -8,6 +8,7 @@ pass=0 fail=0
 for src in *.lsp; do
     name=${src%.lsp}
     extra=; [ -e "$name.c" ] && extra="$name.c"   # C code linked into the test
+    [ "$name" = defines ] && extra="-DWIDTH=640 -DNAME=teapot -DFAST"
     if ../lisc "$src" $extra -o "out/$name" 2>"out/$name.err" && "./out/$name" >"out/$name.txt" 2>&1 && cmp -s "out/$name.txt" "$name.out"; then
         pass=$((pass + 1))
     else

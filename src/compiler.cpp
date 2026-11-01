@@ -729,6 +729,15 @@ struct Compiler::Impl : MetaHost {
             return {llvm::ConstantInt::get(ll(rt), hs == "sizeof" ? size_of(t) : align_of(t)), rt};
         }
         if (hs == "make") return make(f);
+        if (hs == "defined") {  // (defined NAME): is there a global NAME (e.g. from -D)?
+            if (f->size() != 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(defined NAME)");
+            return {b.getInt1(c.globals_.count(f->at(1)->text) != 0), t_bool()};
+        }
+        if (hs == "if-defined") {  // compile-time: only the chosen branch is compiled, like #ifdef
+            if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(if-defined NAME then [else])");
+            if (c.globals_.count(f->at(1)->text)) return expr(f->at(2), want);
+            return f->size() == 4 ? expr(f->at(3), want) : Val{nullptr, t_void()};
+        }
         if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoted forms exist only inside macros");
         return call(f);
     }
@@ -1237,7 +1246,14 @@ struct Compiler::Impl : MetaHost {
                 fixed.push_back(value_for(a, ft->params[i], "argument"));
                 continue;
             }
-            // variadic: C's default promotions
+            // variadic: C's default promotions; arrays decay to a pointer to their first element
+            if (is_place(a)) {
+                Val p = place(a);
+                if (p.t->kind == Type::Array) {
+                    var.push_back({p.v, t_ptr(p.t->elem)});
+                    continue;
+                }
+            }
             Val v = expr(a, nullptr);
             if (v.t->is_float() && v.t->bits < 64) v = cast(v, t_float(64), a->loc);
             else if (v.t->is_int() && v.t->bits < 32) v = cast(v, t_int(32, v.t->sign), a->loc);
@@ -1581,6 +1597,16 @@ void Compiler::compile(const std::vector<Form *> &forms) {
 
 void Compiler::add_type(const std::string &name, Type *t) { types_[name] = t; }
 
+void Compiler::define_const(const std::string &name, const std::string &value) {
+    char *end;
+    strtod(value.c_str(), &end);
+    bool number = !value.empty() && !*end;
+    Form *lit = new Form{number ? (value.find_first_of(".eE") == std::string::npos ? Form::Int : Form::Float) : Form::Str, {"<-D>", 0, 0}};
+    lit->text = value;
+    if (lit->kind == Form::Int) lit->ival = strtoull(value.c_str(), nullptr, 0);
+    globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
+}
+
 void Compiler::add_extern_fn(const std::string &name, Type *fn) {
     if (globals_.count(name)) return;
     llvm::Function *f = mod_->getFunction(name);
@@ -1599,15 +1625,26 @@ void Compiler::add_extern_var(const std::string &name, Type *t) {
     globals_[name].imported = true;
 }
 
+// C's #define and enum constants are untyped, as in C: they take the type
+// they meet, like a literal written in their place
 void Compiler::add_const_int(const std::string &name, Type *t, uint64_t v) {
     if (globals_.count(name)) return;
-    globals_[name] = Global{Global::Const, t, llvm::ConstantInt::get(impl_->ll(t), v)};
+    Form *lit = new Form{Form::Int, {"<c-include>", 0, 0}};
+    lit->ival = v;
+    lit->text = t->sign ? std::to_string((int64_t)v) : std::to_string(v);
+    globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
     globals_[name].imported = true;
 }
 
 void Compiler::add_const_float(const std::string &name, Type *t, double v) {
     if (globals_.count(name)) return;
-    globals_[name] = Global{Global::Const, t, llvm::ConstantFP::get(impl_->ll(t), v)};
+    Form *lit = new Form{Form::Float, {"<c-include>", 0, 0}};
+    char buf[64];
+    snprintf(buf, sizeof buf, "%.17g", v);
+    lit->text = buf;
+    if (lit->text.find_first_of(".eEn") == std::string::npos) lit->text += ".0";
+    (void)t;
+    globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
     globals_[name].imported = true;
 }
 

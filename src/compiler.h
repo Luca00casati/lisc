@@ -32,6 +32,9 @@ public:
     void compile(const std::vector<Form *> &forms);
     llvm::Module &module() { return *mod_; }
 
+    // where (c-include ...) looks first (then the system directories)
+    std::vector<std::string> include_dirs;
+
     // used by the C header importer (cimport.cpp)
     void add_type(const std::string &name, Type *t);
     bool has_type(const std::string &name) const { return types_.count(name) != 0; }

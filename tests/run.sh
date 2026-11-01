@@ -7,7 +7,8 @@ mkdir -p out
 pass=0 fail=0
 for src in *.lsp; do
     name=${src%.lsp}
-    if ../lisc "$src" -o "out/$name" 2>"out/$name.err" && "./out/$name" >"out/$name.txt" 2>&1 && cmp -s "out/$name.txt" "$name.out"; then
+    extra=; [ -e "$name.c" ] && extra="$name.c"   # C code linked into the test
+    if ../lisc "$src" $extra -o "out/$name" 2>"out/$name.err" && "./out/$name" >"out/$name.txt" 2>&1 && cmp -s "out/$name.txt" "$name.out"; then
         pass=$((pass + 1))
     else
         fail=$((fail + 1)); echo "FAIL $src"; cat "out/$name.err"; diff "$name.out" "out/$name.txt" | head -20

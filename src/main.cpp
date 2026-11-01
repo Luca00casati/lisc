@@ -1,7 +1,10 @@
 // main.cpp — the lisc driver: source → LLVM IR → optimised native object →
 // executable (linked by the system C compiler, against libc and libm).
 //
-//   lisc prog.lsp [-o prog] [-O0..-O3] [--emit-llvm] [-c] [-lname ...]
+//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [--emit-llvm] [-c] [-lname ...]
+//
+// Other input files go to the linker (cc), so C code can be linked in.
+// (c-include ...) searches the source file's directory and -I directories.
 
 #include <cstdio>
 #include <cstring>
@@ -27,7 +30,7 @@
 namespace {
 
 [[noreturn]] void usage() {
-    fprintf(stderr, "usage: lisc file.lsp [-o out] [-O0|-O1|-O2|-O3] [--emit-llvm] [-c] [-lname ...]\n");
+    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-I dir] [--emit-llvm] [-c] [-lname ...]\n");
     exit(1);
 }
 
@@ -71,10 +74,14 @@ int main(int argc, char **argv) {
     std::string out;
     int opt = 2;
     bool emit_llvm = false, object_only = false;
-    std::vector<std::string> libs;
+    std::vector<std::string> libs, includes;
     for (int i = 1; i < argc; i++) {
         const char *s = argv[i];
+        size_t len = strlen(s);
         if (!strcmp(s, "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(s, "-I") && i + 1 < argc) includes.push_back(argv[++i]);
+        else if (!strncmp(s, "-I", 2) && s[2]) includes.push_back(s + 2);
+        else if (s[0] != '-' && !(len > 4 && !strcmp(s + len - 4, ".lsp"))) libs.push_back(s);
         else if (s[0] == '-' && s[1] == 'O' && s[2] >= '0' && s[2] <= '3' && !s[3]) opt = s[2] - '0';
         else if (!strcmp(s, "--emit-llvm")) emit_llvm = true;
         else if (!strcmp(s, "-c")) object_only = true;
@@ -92,6 +99,10 @@ int main(int argc, char **argv) {
     }
 
     Compiler c;
+    std::string dir = in;
+    dir = dir.find('/') == std::string::npos ? "." : dir.substr(0, dir.rfind('/'));
+    c.include_dirs.push_back(dir);
+    c.include_dirs.insert(c.include_dirs.end(), includes.begin(), includes.end());
     c.compile(read_file(in));
     llvm::Module &m = c.module();
 

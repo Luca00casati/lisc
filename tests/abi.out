@@ -1,0 +1,14 @@
+v3 0.5 1 1.5
+d2 2.25 1.5 sum 3.75
+mix -7 0.25  fi 3 42 0.25
+sm 10 -299  l2 31 42
+big 5 4 3 2 1  f3 -1 2 -3.5
+many_ints 8721
+many_doubles 109828
+partial 87615
+small 100
+apply_v3 18
+apply_big 1002 3 4 5 1
+bf 5 17 -33 100000 1 -2  sum 1099996861
+bf after 5 31 63 100000 0 -2  sum 100006601
+mybf size 8/8  sum 1099996861

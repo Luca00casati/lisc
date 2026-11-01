@@ -17,7 +17,9 @@ struct Type;
 struct Field {
     std::string name;
     Type *type;
-    uint64_t offset;  // bytes
+    uint64_t offset;       // bytes (for a bit field: the byte holding its first bit)
+    uint64_t bit_off = 0;  // bit field: first bit, counted from the struct's start
+    unsigned bit_width = 0;  // 0 = an ordinary field
 };
 
 struct StructInfo {
@@ -62,6 +64,6 @@ Type *t_struct(StructInfo *st);  // one Type per StructInfo
 
 uint64_t size_of(const Type *t);
 uint64_t align_of(const Type *t);
-// lay out the fields in order with natural alignment (C rules)
+// lay out the fields in order with natural alignment, bit fields included (C rules, x86-64 SysV)
 void layout_struct(StructInfo *st);
 std::string type_name(const Type *t);

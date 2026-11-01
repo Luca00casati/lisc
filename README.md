@@ -21,7 +21,10 @@ through libclang, so libc and kernel interfaces need no hand-written bindings.
 
     make            # needs llvm-18 and libclang-18 (headers + libraries)
     make test
-    ./lisc prog.lsp [-o prog] [-O0..-O3] [--emit-llvm] [-c] [-lname ...]
+    ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [--emit-llvm] [-c] [-lname ...]
+
+Extra `.c`/`.o` inputs are linked in. `(c-include ...)` searches the source
+file's directory and `-I` directories, then the system ones.
 
 ## Language (core, phases 1-2)
 
@@ -34,7 +37,7 @@ Top level:
 | form | |
 |---|---|
 | `(c-include "h" ...)` | functions, extern variables, structs (clang's exact layout), typedefs, enum constants and constant `#define`s of these headers |
-| `(struct name (field T) ...)` `(union ...)` | C layout |
+| `(struct name (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
 | `(defn name ((a T) ...) R body...)` | function; the last expression is the result |
@@ -60,6 +63,11 @@ Typing rules:
 - Implicit conversions only: `(ptr void)` ↔ any pointer, arrays to a pointer to
   their first element, and C's default promotions for variadic arguments.
 - Conditions may be `bool`, integers or pointers.
+- Every function uses the C calling convention (x86-64 System V), lisc's own
+  included: structs pass and return by value to and from C, and C can call
+  lisc functions through function pointers.
+- Bit fields (imported or declared) read and write like other fields; only
+  `(addr ...)` of one is an error.
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 

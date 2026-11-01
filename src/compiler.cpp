@@ -42,6 +42,21 @@ struct Val {
     llvm::Value *v = nullptr;
     Type *t = nullptr;
     uint64_t align = 0;  // for addresses: known alignment (0 = the type's)
+    // a bit field: v is the address of the bytes holding it, read as one integer
+    llvm::IntegerType *bwin = nullptr;
+    unsigned bshift = 0, bwidth = 0;
+};
+
+// How a value crosses a call, per the x86-64 System V ABI.
+struct ArgAbi {
+    enum Kind { Direct, Coerce, Memory, Ignore } kind = Direct;
+    std::vector<llvm::Type *> parts;  // Coerce: one register-sized piece per eightbyte
+};
+struct FnAbi {
+    ArgAbi ret;
+    std::vector<ArgAbi> params;
+    llvm::FunctionType *ty = nullptr;
+    llvm::AttributeList attrs;
 };
 
 struct Loop {
@@ -68,6 +83,8 @@ struct Compiler::Impl {
     llvm::IRBuilder<> b;
     llvm::Function *fn = nullptr;
     Type *fn_ret = nullptr;
+    Type *cur_ft = nullptr;            // the current function's type
+    llvm::Value *cur_sret = nullptr;   // where a struct result returned in memory goes
     std::vector<std::map<std::string, Val>> scopes;  // locals: name → address
     std::vector<Loop> loops;
     std::map<StructInfo *, bool> laying_out;          // cycle guard
@@ -85,13 +102,179 @@ struct Compiler::Impl {
         case Type::Ptr: return b.getPtrTy();
         case Type::Array: return llvm::ArrayType::get(ll(t->elem), t->n);
         case Type::Struct: return ll_struct(t->st);
-        case Type::Fn: {
-            std::vector<llvm::Type *> ps;
-            for (Type *p : t->params) ps.push_back(ll(p));
-            return llvm::FunctionType::get(ll(t->elem), ps, t->variadic);
-        }
+        case Type::Fn: return fn_abi(t).ty;
         }
         return nullptr;
+    }
+
+    /* ------------------------------------------- calling convention --- */
+    // Every function, lisc's own included, uses the C calling convention, so
+    // C can call lisc functions through pointers. Scalars pass directly
+    // (small integers extended, as C expects); a struct of up to 16 bytes
+    // passes as one or two register-sized pieces, each INTEGER or SSE by what
+    // it holds; bigger structs (or ones that no longer fit in the remaining
+    // registers) go through memory: a copy on the stack (byval) for arguments,
+    // a pointer to the caller's space (sret) for results.
+
+    std::map<Type *, FnAbi> abis;
+
+    // the scalars inside t, with their byte offsets
+    void leaves(Type *t, uint64_t off, std::vector<std::pair<uint64_t, Type *>> &out) {
+        if (t->kind == Type::Struct) {
+            for (auto &f : t->st->fields) {
+                if (f.bit_width) {
+                    for (uint64_t b0 = f.bit_off / 8; b0 <= (f.bit_off + f.bit_width - 1) / 8; b0++) out.push_back({off + b0, t_int(8, false)});
+                } else leaves(f.type, off + f.offset, out);
+            }
+        } else if (t->kind == Type::Array) {
+            for (uint64_t i = 0; i < t->n; i++) leaves(t->elem, off + i * size_of(t->elem), out);
+        } else out.push_back({off, t});
+    }
+
+    ArgAbi classify(Type *t) {
+        ArgAbi a;
+        if (t->kind != Type::Struct) return a;  // Direct
+        uint64_t size = size_of(t);
+        if (size == 0) { a.kind = ArgAbi::Ignore; return a; }
+        a.kind = ArgAbi::Memory;
+        if (size > 16) return a;
+        enum { NONE, INT, SSE } cls[2] = {NONE, NONE};
+        std::vector<std::pair<uint64_t, Type *>> ls;
+        leaves(t, 0, ls);
+        for (auto &l : ls) {
+            uint64_t eb = l.first / 8;
+            if ((l.first + size_of(l.second) - 1) / 8 != eb) return a;  // straddles two eightbytes
+            auto c = l.second->is_float() ? SSE : INT;
+            if (cls[eb] == NONE || (cls[eb] == SSE && c == INT)) cls[eb] = c;
+        }
+        a.kind = ArgAbi::Coerce;
+        for (uint64_t eb = 0; eb * 8 < size; eb++) {
+            uint64_t bytes = std::min<uint64_t>(8, size - eb * 8);
+            if (cls[eb] != SSE) { a.parts.push_back(b.getIntNTy(8 * bytes)); continue; }
+            bool dbl = false, f0 = false, f4 = false;
+            for (auto &l : ls) {
+                if (l.first / 8 != eb) continue;
+                if (l.second->bits == 64) dbl = true;
+                else if (l.first % 8 == 0) f0 = true;
+                else f4 = true;
+            }
+            if (dbl) a.parts.push_back(b.getDoubleTy());
+            else if (f0 && !f4) a.parts.push_back(b.getFloatTy());
+            else a.parts.push_back(llvm::FixedVectorType::get(b.getFloatTy(), 2));
+        }
+        return a;
+    }
+
+    FnAbi &fn_abi(Type *ft) {
+        auto it = abis.find(ft);
+        if (it != abis.end()) return it->second;
+        FnAbi a;
+        std::vector<llvm::Type *> irps;
+        std::vector<llvm::AttributeSet> sets;  // per IR parameter
+        llvm::AttrBuilder rattrs(ctx);
+        int gpr = 6, sse = 8;  // argument registers left
+        auto ext = [&](llvm::AttrBuilder &ab, Type *t) {
+            if (t->kind == Type::Bool || (t->is_int() && t->bits < 32)) ab.addAttribute(t->kind == Type::Int && t->sign ? llvm::Attribute::SExt : llvm::Attribute::ZExt);
+        };
+        Type *rt = ft->elem;
+        llvm::Type *irret = rt == t_void() ? b.getVoidTy() : nullptr;
+        if (rt != t_void()) {
+            a.ret = classify(rt);
+            switch (a.ret.kind) {
+            case ArgAbi::Direct: irret = ll(rt); ext(rattrs, rt); break;
+            case ArgAbi::Ignore: irret = b.getVoidTy(); break;
+            case ArgAbi::Coerce:
+                irret = a.ret.parts.size() == 1 ? a.ret.parts[0] : llvm::StructType::get(ctx, a.ret.parts);
+                break;
+            case ArgAbi::Memory: {
+                irret = b.getVoidTy();
+                irps.push_back(b.getPtrTy());
+                llvm::AttrBuilder ab(ctx);
+                ab.addStructRetAttr(ll(rt));
+                ab.addAlignmentAttr(align_of(rt));
+                ab.addAttribute(llvm::Attribute::NoAlias);
+                sets.push_back(llvm::AttributeSet::get(ctx, ab));
+                gpr--;
+                break;
+            }
+            }
+        }
+        for (Type *p : ft->params) {
+            ArgAbi pa = classify(p);
+            if (pa.kind == ArgAbi::Coerce) {
+                int need_int = 0, need_sse = 0;
+                for (llvm::Type *part : pa.parts) (part->isIntegerTy() ? need_int : need_sse)++;
+                if (need_int <= gpr && need_sse <= sse) { gpr -= need_int; sse -= need_sse; }
+                else { pa.kind = ArgAbi::Memory; pa.parts.clear(); }
+            }
+            switch (pa.kind) {
+            case ArgAbi::Direct: {
+                irps.push_back(ll(p));
+                llvm::AttrBuilder ab(ctx);
+                ext(ab, p);
+                sets.push_back(llvm::AttributeSet::get(ctx, ab));
+                if (p->is_float()) sse--; else gpr--;
+                break;
+            }
+            case ArgAbi::Coerce:
+                for (llvm::Type *part : pa.parts) {
+                    irps.push_back(part);
+                    sets.emplace_back();
+                }
+                break;
+            case ArgAbi::Memory: {
+                irps.push_back(b.getPtrTy());
+                llvm::AttrBuilder ab(ctx);
+                ab.addByValAttr(ll(p));
+                ab.addAlignmentAttr(std::max<uint64_t>(8, align_of(p)));
+                sets.push_back(llvm::AttributeSet::get(ctx, ab));
+                break;
+            }
+            case ArgAbi::Ignore: break;
+            }
+            a.params.push_back(pa);
+        }
+        a.ty = llvm::FunctionType::get(irret, irps, ft->variadic);
+        a.attrs = llvm::AttributeList::get(ctx, llvm::AttributeSet(), llvm::AttributeSet::get(ctx, rattrs), sets);
+        return abis[ft] = a;
+    }
+
+    // byte offset `off` inside the memory at p
+    llvm::Value *at_offset(llvm::Value *p, uint64_t off) { return off ? b.CreateInBoundsGEP(b.getInt8Ty(), p, b.getInt64(off)) : p; }
+
+    // a struct value as its register pieces
+    void coerce_out(const ArgAbi &abi, Val v, std::vector<llvm::Value *> &out) {
+        Val m = spill(v);
+        for (size_t i = 0; i < abi.parts.size(); i++)
+            out.push_back(b.CreateAlignedLoad(abi.parts[i], at_offset(m.v, 8 * i), llvm::Align(std::min<uint64_t>(8, align_of(v.t)))));
+    }
+    // register pieces stored into a struct's memory
+    void coerce_in(const ArgAbi &abi, const std::vector<llvm::Value *> &parts, llvm::Value *mem, Type *t) {
+        for (size_t i = 0; i < parts.size(); i++)
+            b.CreateAlignedStore(parts[i], at_offset(mem, 8 * i), llvm::Align(std::min<uint64_t>(8, align_of(t))));
+        (void)abi;
+    }
+
+    // return v from the current function, lowered per its ABI
+    void emit_ret(Val v) {
+        const ArgAbi &r = fn_abi(cur_ft).ret;
+        switch (r.kind) {
+        case ArgAbi::Direct: b.CreateRet(v.v); break;
+        case ArgAbi::Ignore: b.CreateRetVoid(); break;
+        case ArgAbi::Memory:
+            store({cur_sret, v.t}, v.v);
+            b.CreateRetVoid();
+            break;
+        case ArgAbi::Coerce: {
+            std::vector<llvm::Value *> parts;
+            coerce_out(r, v, parts);
+            if (parts.size() == 1) { b.CreateRet(parts[0]); break; }
+            llvm::Value *agg = llvm::UndefValue::get(fn->getReturnType());
+            for (unsigned i = 0; i < parts.size(); i++) agg = b.CreateInsertValue(agg, parts[i], i);
+            b.CreateRet(agg);
+            break;
+        }
+        }
     }
 
     // a packed LLVM struct with explicit padding, so the layout is exactly
@@ -102,7 +285,8 @@ struct Compiler::Impl {
         std::vector<llvm::Type *> parts;
         uint64_t cur = 0;
         std::vector<const Field *> order;
-        for (auto &f : st->fields) order.push_back(&f);
+        for (auto &f : st->fields)
+            if (!f.bit_width) order.push_back(&f);  // bit fields live in the padding bytes
         std::stable_sort(order.begin(), order.end(), [](const Field *a, const Field *x) { return a->offset < x->offset; });
         for (const Field *f : order) {
             if (f->offset < cur) continue;  // overlaps (union member): reached by offset only
@@ -168,10 +352,37 @@ struct Compiler::Impl {
     }
 
     llvm::Value *load(Val addr) {
+        if (addr.bwidth) return load_bits(addr);
         return b.CreateAlignedLoad(ll(addr.t), addr.v, llvm::Align(addr.align ? addr.align : align_of(addr.t)));
     }
     void store(Val addr, llvm::Value *v) {
+        if (addr.bwidth) return store_bits(addr, v);
         b.CreateAlignedStore(v, addr.v, llvm::Align(addr.align ? addr.align : align_of(addr.t)));
+    }
+
+    // bit fields: read the bytes holding the field as one integer (little
+    // endian: the field's bits are bshift..bshift+bwidth-1), then shift/mask
+    llvm::Value *load_bits(Val a) {
+        unsigned n = a.bwin->getBitWidth();
+        llvm::Value *w = b.CreateAlignedLoad(a.bwin, a.v, llvm::Align(1));
+        if (a.t->is_int() && a.t->sign) {  // sign-extend from the field's top bit
+            w = b.CreateShl(w, n - a.bshift - a.bwidth);
+            w = b.CreateAShr(w, n - a.bwidth);
+        } else {
+            w = b.CreateLShr(w, a.bshift);
+            w = b.CreateAnd(w, llvm::APInt::getLowBitsSet(n, a.bwidth));
+        }
+        if (a.t->kind == Type::Bool) return b.CreateICmpNE(w, llvm::ConstantInt::get(a.bwin, 0));
+        return b.CreateIntCast(w, ll(a.t), a.t->sign);
+    }
+    void store_bits(Val a, llvm::Value *v) {
+        unsigned n = a.bwin->getBitWidth();
+        llvm::APInt mask = llvm::APInt::getBitsSet(n, a.bshift, a.bshift + a.bwidth);
+        llvm::Value *nv = a.t->kind == Type::Bool ? b.CreateZExt(v, a.bwin) : b.CreateZExtOrTrunc(v, a.bwin);
+        nv = b.CreateAnd(b.CreateShl(nv, a.bshift), mask);
+        llvm::Value *w = b.CreateAlignedLoad(a.bwin, a.v, llvm::Align(1));
+        w = b.CreateOr(b.CreateAnd(w, ~mask), nv);
+        b.CreateAlignedStore(w, a.v, llvm::Align(1));
     }
 
     // after a return/break the current block is closed; later code goes to an unreachable block
@@ -336,6 +547,14 @@ struct Compiler::Impl {
         ensure_layout(a.t->st, name->loc);
         const Field *fd = a.t->st->find(name->text);
         if (!fd) fatal(name->loc, "%s has no field '%s'", type_name(a.t).c_str(), name->text.c_str());
+        if (fd->bit_width) {
+            uint64_t first = fd->bit_off / 8, last = (fd->bit_off + fd->bit_width - 1) / 8;
+            Val v{at_offset(a.v, first), fd->type, 1};
+            v.bwin = b.getIntNTy(8 * (last - first + 1));
+            v.bshift = fd->bit_off % 8;
+            v.bwidth = fd->bit_width;
+            return v;
+        }
         llvm::Value *p = fd->offset ? b.CreateInBoundsGEP(b.getInt8Ty(), a.v, b.getInt64(fd->offset)) : a.v;
         // alignment: what the struct's alignment and the offset guarantee
         uint64_t base = a.align ? a.align : align_of(a.t);
@@ -443,6 +662,7 @@ struct Compiler::Impl {
                 if (g && g->kind == Global::Func && !lookup_local(f->at(1)->text).v) return {g->value, t_ptr(g->type)};
             }
             Val a = place(f->at(1));
+            if (a.bwidth) fatal(f->at(1)->loc, "cannot take the address of a bit field");
             return {a.v, t_ptr(a.t)};
         }
         if (hs == "cast" || hs == "bitcast") {
@@ -783,7 +1003,7 @@ struct Compiler::Impl {
             b.CreateRetVoid();
         } else {
             Val v = value_for(f->at(1), fn_ret, "return value");
-            b.CreateRet(v.v);
+            emit_ret(v);
         }
         return {nullptr, t_void()};
     }
@@ -854,11 +1074,18 @@ struct Compiler::Impl {
         size_t n = f->size() - 1;
         if (n < ft->params.size() || (n > ft->params.size() && !ft->variadic))
             fatal(f->loc, "%s takes %zu argument%s, got %zu", show(head).c_str(), ft->params.size(), ft->params.size() == 1 ? "" : "s", n);
+        FnAbi &abi = fn_abi(ft);
         std::vector<llvm::Value *> args;
+        llvm::Value *sret = nullptr;
+        if (abi.ret.kind == ArgAbi::Memory) args.push_back(sret = alloca_(ft->elem, "sret"));
         for (size_t i = 0; i < n; i++) {
             Form *a = f->at(i + 1);
             if (i < ft->params.size()) {
-                args.push_back(value_for(a, ft->params[i], "argument").v);
+                Val v = value_for(a, ft->params[i], "argument");
+                const ArgAbi &pa = abi.params[i];
+                if (pa.kind == ArgAbi::Direct) args.push_back(v.v);
+                else if (pa.kind == ArgAbi::Coerce) coerce_out(pa, v, args);
+                else if (pa.kind == ArgAbi::Memory) args.push_back(spill(v).v);  // byval: the callee gets its own copy
                 continue;
             }
             // variadic: C's default promotions
@@ -869,8 +1096,24 @@ struct Compiler::Impl {
             else if (v.t->kind == Type::Struct || v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
             args.push_back(v.v);
         }
-        llvm::CallInst *ci = b.CreateCall(llvm::cast<llvm::FunctionType>(ll(ft)), callee.v, args);
-        return {ci, ft->elem};
+        llvm::CallInst *ci = b.CreateCall(abi.ty, callee.v, args);
+        ci->setAttributes(abi.attrs);
+        Type *rt = ft->elem;
+        switch (abi.ret.kind) {
+        case ArgAbi::Direct: return {ci, rt};
+        case ArgAbi::Ignore: return {llvm::Constant::getNullValue(ll(rt)), rt};
+        case ArgAbi::Memory: return {load({sret, rt}), rt};
+        case ArgAbi::Coerce: {
+            llvm::AllocaInst *m = alloca_(rt, "ret");
+            std::vector<llvm::Value *> parts;
+            if (abi.ret.parts.size() == 1) parts.push_back(ci);
+            else
+                for (unsigned i = 0; i < abi.ret.parts.size(); i++) parts.push_back(b.CreateExtractValue(ci, i));
+            coerce_in(abi.ret, parts, m, rt);
+            return {load({m, rt}), rt};
+        }
+        }
+        return {};
     }
 
     /* ------------------------------------------------------ top level --- */
@@ -902,8 +1145,16 @@ struct Compiler::Impl {
         for (auto &s : structs) {
             for (size_t i = 2; i < s.first->size(); i++) {
                 Form *fd = s.first->at(i);
-                if (!fd->is_list() || fd->size() != 2 || fd->at(0)->kind != Form::Sym) fatal(fd->loc, "field must be (name T)");
-                s.second->fields.push_back({fd->at(0)->text, parse_type(fd->at(1)), 0});
+                bool bits = fd->is_list() && fd->size() == 4 && fd->at(2)->is_sym(":bits") && fd->at(3)->kind == Form::Int;
+                if (!fd->is_list() || (fd->size() != 2 && !bits) || fd->at(0)->kind != Form::Sym)
+                    fatal(fd->loc, "field must be (name T) or (name T :bits N)");
+                Field field{fd->at(0)->text, parse_type(fd->at(1)), 0};
+                if (bits) {
+                    field.bit_width = (unsigned)fd->at(3)->ival;
+                    if (!field.type->is_int() && field.type->kind != Type::Bool) fatal(fd->loc, "a bit field must be an integer or bool");
+                    if (field.bit_width == 0 || field.bit_width > 8 * size_of(field.type)) fatal(fd->at(3)->loc, "bit width must be 1..%lu", 8 * size_of(field.type));
+                }
+                s.second->fields.push_back(field);
             }
         }
         for (auto &s : structs) lay_out(s.second, s.first->loc);
@@ -971,7 +1222,8 @@ struct Compiler::Impl {
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
         const std::string &name = f->at(1)->text;
         auto link = name == "main" ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
-        llvm::Function *fn0 = llvm::Function::Create(llvm::cast<llvm::FunctionType>(ll(ft)), link, name, mod);
+        llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
+        fn0->setAttributes(fn_abi(ft).attrs);
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }
 
@@ -979,23 +1231,40 @@ struct Compiler::Impl {
         Global &g = c.globals_[f->at(1)->text];
         fn = llvm::cast<llvm::Function>(g.value);
         fn_ret = g.type->elem;
+        cur_ft = g.type;
+        FnAbi &abi = fn_abi(g.type);
         b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
         scopes.assign(1, {});
-        size_t i = 0;
-        for (llvm::Argument &arg : fn->args()) {
-            Form *p = f->at(2)->at(i);
-            Type *t = g.type->params[i++];
-            arg.setName(p->at(0)->text);
-            llvm::AllocaInst *a = alloca_(t, p->at(0)->text);
-            store({a, t}, &arg);
-            scopes.back()[p->at(0)->text] = {a, t};
+        auto arg = fn->arg_begin();
+        cur_sret = abi.ret.kind == ArgAbi::Memory ? &*arg++ : nullptr;
+        for (size_t i = 0; i < g.type->params.size(); i++) {
+            const std::string &name = f->at(2)->at(i)->at(0)->text;
+            Type *t = g.type->params[i];
+            const ArgAbi &pa = abi.params[i];
+            if (pa.kind == ArgAbi::Memory) {  // byval: the copy is ours to use as the variable
+                arg->setName(name);
+                scopes.back()[name] = {&*arg++, t};
+                continue;
+            }
+            llvm::AllocaInst *a = alloca_(t, name);
+            if (pa.kind == ArgAbi::Direct) {
+                arg->setName(name);
+                store({a, t}, &*arg++);
+            } else if (pa.kind == ArgAbi::Coerce) {
+                std::vector<llvm::Value *> parts;
+                for (size_t k = 0; k < pa.parts.size(); k++) parts.push_back(&*arg++);
+                coerce_in(pa, parts, a, t);
+            } else {
+                store({a, t}, llvm::Constant::getNullValue(ll(t)));
+            }
+            scopes.back()[name] = {a, t};
         }
         Val v = body(f, 4, fn_ret == t_void() ? nullptr : fn_ret);
         if (open()) {
             if (fn_ret == t_void()) b.CreateRetVoid();
             else {
                 if (v.t == t_void()) fatal(f->loc, "%s must end with a %s value or return", f->at(1)->text.c_str(), type_name(fn_ret).c_str());
-                b.CreateRet(coerce(v, fn_ret, f->at(f->size() - 1)->loc, "result").v);
+                emit_ret(coerce(v, fn_ret, f->at(f->size() - 1)->loc, "result"));
             }
         }
         // blocks left empty by control flow that never falls through
@@ -1026,7 +1295,10 @@ void Compiler::add_type(const std::string &name, Type *t) { types_[name] = t; }
 void Compiler::add_extern_fn(const std::string &name, Type *fn) {
     if (globals_.count(name)) return;
     llvm::Function *f = mod_->getFunction(name);
-    if (!f) f = llvm::Function::Create(llvm::cast<llvm::FunctionType>(impl_->ll(fn)), llvm::GlobalValue::ExternalLinkage, name, *mod_);
+    if (!f) {
+        f = llvm::Function::Create(llvm::cast<llvm::FunctionType>(impl_->ll(fn)), llvm::GlobalValue::ExternalLinkage, name, *mod_);
+        f->setAttributes(impl_->fn_abi(fn).attrs);
+    }
     globals_[name] = Global{Global::Func, fn, f};
 }
 

@@ -9,8 +9,8 @@
 //   object-like #defines             → typed constants, if clang can evaluate
 //                                      them (so DRM_IOCTL_MODE_GETCRTC works)
 //
-// Types lisc has no equivalent for (long double, __int128, vectors, bit
-// fields) are skipped; a declaration that needs one is left out.
+// Types lisc has no equivalent for (long double, __int128, vectors) are
+// skipped; a declaration that needs one is left out. Bit fields are kept.
 
 #include <clang-c/Index.h>
 
@@ -96,14 +96,28 @@ struct Importer {
         Ctx cx{this, st};
         clang_visitChildren(def, [](CXCursor f, CXCursor, CXClientData d) {
             Ctx *cx = (Ctx *)d;
-            if (f.kind != CXCursor_FieldDecl || clang_Cursor_isBitField(f)) return CXChildVisit_Continue;
-            long long off = clang_Cursor_getOffsetOfField(f);
+            if (f.kind != CXCursor_FieldDecl) return CXChildVisit_Continue;
+            long long off = clang_Cursor_getOffsetOfField(f);  // in bits
             Type *ft = cx->im->conv(clang_getCursorType(f));
             if (off < 0 || !ft) return CXChildVisit_Continue;
             std::string name = str(clang_getCursorSpelling(f));
+            if (clang_Cursor_isBitField(f)) {
+                int width = clang_getFieldDeclBitWidth(f);
+                if (!name.empty() && width > 0) {  // unnamed ones are only padding
+                    Field fd{name, ft, (uint64_t)off / 8};
+                    fd.bit_off = off;
+                    fd.bit_width = width;
+                    cx->st->fields.push_back(fd);
+                }
+                return CXChildVisit_Continue;
+            }
             if (clang_Cursor_isAnonymousRecordDecl(clang_getTypeDeclaration(clang_getCursorType(f))) && ft->kind == Type::Struct) {
                 // members of an anonymous struct/union are members of the outer one
-                for (auto &sub : ft->st->fields) cx->st->fields.push_back({sub.name, sub.type, (uint64_t)off / 8 + sub.offset});
+                for (auto sub : ft->st->fields) {
+                    sub.offset += off / 8;
+                    if (sub.bit_width) sub.bit_off += off;
+                    cx->st->fields.push_back(sub);
+                }
                 return CXChildVisit_Continue;
             }
             cx->st->fields.push_back({name, ft, (uint64_t)off / 8});
@@ -218,6 +232,9 @@ void c_include(Compiler &c, const std::vector<std::string> &headers, Loc at) {
     std::string src;
     for (auto &h : headers) src += "#include <" + h + ">\n";
     std::vector<const char *> args = {"-x", "c", "-std=gnu11", "-w", "-ferror-limit=0", "-resource-dir", CLANG_RESOURCE_DIR};
+    std::vector<std::string> incs;
+    for (auto &d : c.include_dirs) incs.push_back("-I" + d);
+    for (auto &i : incs) args.push_back(i.c_str());
     CXIndex idx = clang_createIndex(0, 0);
     CXUnsavedFile f{"lisc_import.c", src.c_str(), (unsigned long)src.size()};
     CXTranslationUnit tu = clang_parseTranslationUnit(idx, "lisc_import.c", args.data(), (int)args.size(), &f, 1,

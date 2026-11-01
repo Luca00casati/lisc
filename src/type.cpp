@@ -2,6 +2,7 @@
 
 #include "type.h"
 
+#include <algorithm>
 #include <map>
 #include <tuple>
 
@@ -77,21 +78,28 @@ uint64_t align_of(const Type *t) {
 }
 
 void layout_struct(StructInfo *st) {
-    uint64_t off = 0, align = 1;
+    uint64_t bits = 0, align = 1;  // position in bits, so bit fields can share bytes
+    auto up = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
     for (auto &f : st->fields) {
-        uint64_t a = align_of(f.type);
+        uint64_t a = align_of(f.type), unit = 8 * size_of(f.type);
         if (a > align) align = a;
         if (st->is_union) {
-            f.offset = 0;
-            if (size_of(f.type) > off) off = size_of(f.type);
+            f.offset = f.bit_off = 0;
+            bits = std::max(bits, f.bit_width ? up(f.bit_width, 8) : unit);
+        } else if (f.bit_width) {
+            // a bit field never straddles a boundary of its type's size
+            if (bits / unit != (bits + f.bit_width - 1) / unit) bits = up(bits, unit);
+            f.bit_off = bits;
+            f.offset = bits / 8;
+            bits += f.bit_width;
         } else {
-            off = (off + a - 1) / a * a;
-            f.offset = off;
-            off += size_of(f.type);
+            bits = up(bits, 8 * a);
+            f.offset = bits / 8;
+            bits += unit;
         }
     }
     st->align = align;
-    st->size = (off + align - 1) / align * align;
+    st->size = up(up(bits, 8) / 8, align);
     st->complete = true;
 }
 

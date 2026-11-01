@@ -25,7 +25,10 @@
 #include "compiler.h"
 #include "macro.h"
 
+#include <cerrno>
+#include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include <llvm/IR/Constants.h>
@@ -1258,7 +1261,29 @@ struct Compiler::Impl : MetaHost {
         } else out.push_back(f);
     }
 
-    void top(const std::vector<Form *> &input) {
+    // (include "file.lsp"): that file's top-level forms in place, recursively;
+    // the path is relative to the including file; each file is read once
+    std::map<std::string, bool> included;
+    void with_includes(const std::vector<Form *> &in, std::vector<Form *> &out) {
+        for (Form *f : in) {
+            if (!f->is_call("include")) { out.push_back(f); continue; }
+            for (size_t i = 1; i < f->size(); i++) {
+                Form *p = f->at(i);
+                if (p->kind != Form::Str) fatal(p->loc, "(include \"file.lsp\" ...)");
+                std::string from = f->loc.file, path = p->text;
+                if (path[0] != '/' && from.find('/') != std::string::npos) path = from.substr(0, from.rfind('/') + 1) + path;
+                char real[4096];
+                if (!realpath(path.c_str(), real)) fatal(p->loc, "cannot include %s: %s", path.c_str(), strerror(errno));
+                if (included[real]) continue;
+                included[real] = true;
+                with_includes(read_file(strdup(path.c_str())), out);
+            }
+        }
+    }
+
+    void top(const std::vector<Form *> &files) {
+        std::vector<Form *> input;
+        with_includes(files, input);
         // macros and compile-time helpers first, so everything can use them
         std::vector<Form *> forms;
         for (Form *f : input) {

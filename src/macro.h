@@ -48,10 +48,12 @@ struct MetaHost {
 class Meta {
 public:
     explicit Meta(MetaHost &host);
-    void define(Form *def);  // a defmacro or defmeta form
-    bool is_macro(const std::string &name) const { return macros_.count(name) != 0; }
-    // expand one macro call (its head is a macro)
-    Form *expand(Form *call);
+    // a defmacro (under its qualified name `key`, see modules in compiler.cpp)
+    // or defmeta form (compile-time helpers are global)
+    void define(Form *def, const std::string &key);
+    bool is_macro(const std::string &key) const { return macros_.count(key) != 0; }
+    // expand one macro call (its head names the macro `key`)
+    Form *expand(Form *call, const std::string &key);
 
     struct Env;
     struct Closure;

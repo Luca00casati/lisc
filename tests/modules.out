@@ -1,0 +1,4 @@
+len 5  sum 4 5
+doubled 2 2, 6  calls 2
+twice 42  strlen 4
+local 5, util::len 2

@@ -263,18 +263,19 @@ Form *Meta::type_form(Type *t, Loc at) {
 // (not called "bind": with a std::string argument, ADL would find std::bind)
 static void bind_params(Form *pat, Form *val, Meta::Env *env, const std::string &fn, Loc at);
 
-void Meta::define(Form *def) {
+void Meta::define(Form *def, const std::string &key) {
     bool macro = def->is_call("defmacro");
     if (def->size() < 3 || def->at(1)->kind != Form::Sym || !def->at(2)->is_list())
         fatal(def->loc, "(%s name (params...) body...)", macro ? "defmacro" : "defmeta");
     auto *c = new Closure{def->at(1)->text, def->at(2), def, 3, nullptr};
     auto &table = macro ? macros_ : metas_;
-    if (table.count(c->name)) fatal(def->loc, "'%s' is already defined", c->name.c_str());
-    table[c->name] = c;
+    const std::string &k = macro ? key : c->name;  // compile-time helpers are global
+    if (table.count(k)) fatal(def->loc, "'%s' is already defined", c->name.c_str());
+    table[k] = c;
 }
 
-Form *Meta::expand(Form *call) {
-    Closure *m = macros_.at(call->head());
+Form *Meta::expand(Form *call, const std::string &key) {
+    Closure *m = macros_.at(key);
     Loc saved = call_at_;
     unsigned saved_mark = mark_;
     call_at_ = call->loc;
@@ -330,6 +331,7 @@ Form *Meta::quasi(Form *f, Env *env, int depth) {
     if (f->kind == Form::Sym && mark_) {  // hygiene: the template's own symbols get this expansion's mark
         Form *m = mk_sym(f->loc, f->text);
         m->mark = mark_;
+        m->mod = f->mod;  // still resolved in the macro's module
         return m;
     }
     if (f->kind != Form::List) return f;

@@ -24,6 +24,9 @@ struct Form {
     // expansion's mark; it is bound and looked up as a different name from
     // the same symbol without the mark (see key() in compiler.cpp).
     unsigned mark = 0;
+    // Sym: the module whose source the symbol was read from (or whose macro
+    // template it was copied from); null for symbols the compiler made up
+    const char *mod = nullptr;
 
     bool is_sym(const char *s) const { return kind == Sym && text == s; }
     bool is_list() const { return kind == List; }

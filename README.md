@@ -36,6 +36,8 @@ Top level:
 
 | form | |
 |---|---|
+| `(import "mod" [:as m] [:all])` | a module: its names as `mod::name` (see below) |
+| `(include "file.lsp" ...)` | another file's forms as part of this module |
 | `(c-include "h" ...)` | functions, extern variables, structs (clang's exact layout), typedefs, enum constants and constant `#define`s of these headers |
 | `(struct name (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
@@ -45,6 +47,7 @@ Top level:
 | `(defop op ((a T) ...) R body...)` | an operator for these operand types |
 | `(defmacro name (params...) body...)` | a macro (see below) |
 | `(defmeta name (params...) body...)` | a compile-time helper function for macros |
+| `(defn- ...)` `(def- ...)` `(const- ...)` `(struct- ...)` `(defmacro- ...)` `(private form ...)` | names only their module can use |
 
 Expressions — everything is one; statements have type `void`:
 
@@ -78,6 +81,26 @@ Typing rules:
   `(addr ...)` of one is an error.
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
+
+## Modules
+
+Every file is a module, named after the file. `(import "scene")` (path
+relative to the importing file, `.lsp` optional) makes its names reachable as
+`scene::build`; there is one level only (`a::b::c` is an error).
+
+    (import "scene")             ; scene::build, scene::camera ...
+    (import "rt-kernel" :as rt)  ; rt::build
+    (import "vec" :all)          ; also dot, cross ... unqualified
+
+A name resolves to the module's own definition first, then to the `:all`
+imports (a name two of them define must be written qualified), then to C
+imports and `-D` constants, which are global as in C. Definitions marked
+private (`defn-`, `(private ...)` ...) are unreachable from other modules.
+
+Macros are hygienic across modules too: the symbols of a macro's template
+resolve in the macro's own module, so `(geom::doubled v)` works anywhere
+even though its expansion calls geom's private helpers. Operators (`defop`)
+are chosen by type, so they apply wherever their types are used.
 
 ## Operators
 

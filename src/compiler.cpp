@@ -30,6 +30,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <set>
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -104,12 +106,171 @@ struct Compiler::Impl : MetaHost {
 
     Impl(Compiler &c) : c(c), ctx(*c.ctx_), mod(*c.mod_), b(ctx) {}
 
+    /* ------------------------------------------------------- modules --- */
+    // A module is a file. Its top-level names are stored as "module::name" in
+    // the tables (globals, types, macros); C imports and -D constants keep
+    // their plain names. A symbol is resolved in the module it was read from
+    // (a macro template's symbols in the macro's module):
+    //   name      the module's own name, else from an (import ... :all), else a plain global
+    //   m::name   from the module imported as m (one level: no m::n::x); not if private
+
+    struct ModInfo {
+        std::string name, path;
+        std::map<std::string, std::string> alias;  // import alias → module name
+        std::vector<std::string> all;               // modules imported with :all
+    };
+    std::map<std::string, ModInfo> mods;            // by name
+    std::set<std::string> priv;                     // qualified names defined private
+    std::set<Form *> priv_names;                    // name symbols of private definitions
+    std::vector<std::pair<Form *, ModInfo *>> items;  // every top-level form, with its module
+    std::set<std::string> loaded_files;             // (include ...) reads a file once per module
+    ModInfo *cur = nullptr;                         // module of the top-level form being compiled
+
+    ModInfo *mod_of(Form *sym) { return sym->mod ? &mods[sym->mod] : cur; }
+
+    // the qualified name a definition in the current module gets
+    std::string def_key(Form *name) {
+        if (name->text.find("::") != std::string::npos) fatal(name->loc, "a definition's name has no module part: %s", name->text.c_str());
+        return cur ? cur->name + "::" + name->text : name->text;
+    }
+
+    // the table key a symbol refers to, or "" if `has` knows none
+    std::string resolve(Form *sym, const std::function<bool(const std::string &)> &has) {
+        const std::string &t = sym->text;
+        ModInfo *m = mod_of(sym);
+        size_t p = t.find("::");
+        if (p != std::string::npos) {
+            std::string a = t.substr(0, p), n = t.substr(p + 2);
+            if (a.empty() || n.empty() || n.find("::") != std::string::npos) fatal(sym->loc, "'%s': a name has at most one module part", t.c_str());
+            ModInfo *target = nullptr;
+            if (m) {
+                auto it = m->alias.find(a);
+                if (it != m->alias.end()) target = &mods[it->second];
+                else if (a == m->name) target = m;
+            }
+            if (!target) fatal(sym->loc, "no module '%s' is imported here", a.c_str());
+            std::string k = target->name + "::" + n;
+            if (!has(k)) return "";
+            if (target != m && priv.count(k)) fatal(sym->loc, "'%s' is private to module %s", n.c_str(), target->name.c_str());
+            return k;
+        }
+        if (m) {
+            std::string k = m->name + "::" + t;
+            if (has(k)) return k;
+            std::string found;
+            for (auto &x : m->all) {
+                std::string k2 = x + "::" + t;
+                if (!has(k2) || priv.count(k2)) continue;
+                if (!found.empty() && found != k2)
+                    fatal(sym->loc, "'%s' is in both %s and %s: write %s or %s", t.c_str(), found.substr(0, found.find("::")).c_str(),
+                          x.c_str(), found.c_str(), k2.c_str());
+                found = k2;
+            }
+            if (!found.empty()) return found;
+        }
+        return has(t) ? t : "";
+    }
+    std::string global_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return c.globals_.count(k) != 0; }); }
+    std::string type_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return c.types_.count(k) != 0; }); }
+    std::string macro_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return meta.is_macro(k); }); }
+
+    // every symbol of a file's forms belongs to its module
+    void tag(Form *f, const char *m) {
+        if (f->kind == Form::Sym && !f->mod) f->mod = m;
+        for (Form *x : f->items) tag(x, m);
+    }
+
+    std::string near(Form *at, const std::string &path) {
+        std::string from = at->loc.file;
+        if (path[0] == '/' || from.find('/') == std::string::npos) return path;
+        return from.substr(0, from.rfind('/') + 1) + path;
+    }
+
+    // a module's file, read once; its forms (and its imports') go to items
+    ModInfo *load_module(const std::string &path, Loc at, std::vector<Form *> *forms = nullptr) {
+        char real[4096];
+        if (!realpath(path.c_str(), real)) fatal(at, "cannot import %s: %s", path.c_str(), strerror(errno));
+        std::string name = path.substr(path.find('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".lsp") == 0) name.resize(name.size() - 4);
+        auto it = mods.find(name);
+        if (it != mods.end()) {
+            if (it->second.path != real) fatal(at, "two modules named %s: %s and %s", name.c_str(), it->second.path.c_str(), real);
+            return &it->second;
+        }
+        ModInfo &m = mods[name];
+        m.name = name;
+        m.path = real;
+        std::vector<Form *> fs = forms ? *forms : read_file(strdup(path.c_str()));
+        for (Form *f : fs) tag(f, m.name.c_str());
+        add_forms(fs, &m);
+        return &m;
+    }
+
+    void add_forms(const std::vector<Form *> &fs, ModInfo *m) {
+        for (Form *f : fs) {
+            if (f->is_call("import")) {
+                // (import "path" [:as alias] [:all]); the path is relative to this file, .lsp optional
+                if (f->size() < 2 || f->at(1)->kind != Form::Str) fatal(f->loc, "(import \"module\" [:as name] [:all])");
+                std::string path = near(f, f->at(1)->text);
+                if (path.size() < 4 || path.compare(path.size() - 4, 4, ".lsp") != 0) path += ".lsp";
+                std::string as;
+                bool all = false;
+                for (size_t i = 2; i < f->size(); i++) {
+                    if (f->at(i)->is_sym(":all")) all = true;
+                    else if (f->at(i)->is_sym(":as") && i + 1 < f->size() && f->at(i + 1)->kind == Form::Sym) as = f->at(++i)->text;
+                    else fatal(f->at(i)->loc, "(import \"module\" [:as name] [:all])");
+                }
+                ModInfo *t = load_module(path, f->loc);
+                m->alias[as.empty() ? t->name : as] = t->name;
+                if (all) m->all.push_back(t->name);
+            } else if (f->is_call("include")) {
+                // (include "file.lsp" ...): that file's forms as part of this module
+                for (size_t i = 1; i < f->size(); i++) {
+                    if (f->at(i)->kind != Form::Str) fatal(f->at(i)->loc, "(include \"file.lsp\" ...)");
+                    std::string path = near(f, f->at(i)->text);
+                    char real[4096];
+                    if (!realpath(path.c_str(), real)) fatal(f->at(i)->loc, "cannot include %s: %s", path.c_str(), strerror(errno));
+                    if (!loaded_files.insert(m->name + ":" + real).second) continue;
+                    std::vector<Form *> inc = read_file(strdup(path.c_str()));
+                    for (Form *x : inc) tag(x, m->name.c_str());
+                    add_forms(inc, m);
+                }
+            } else if (f->is_call("private")) {
+                // (private form ...): definitions only this module can use
+                std::vector<Form *> inner(f->items.begin() + 1, f->items.end());
+                for (Form *x : inner) mark_private(x);
+                add_forms(inner, m);
+            } else {
+                static const char *const dash[] = {"defn-", "def-", "const-", "defmacro-", "struct-", "union-"};
+                for (const char *d : dash)
+                    if (f->is_call(d)) {  // (defn- name ...) = (private (defn name ...))
+                        std::vector<Form *> it = f->items;
+                        std::string h = d;
+                        it[0] = mk_sym(f->at(0)->loc, h.substr(0, h.size() - 1));
+                        f = mk_list(f->loc, it);
+                        mark_private(f);
+                    }
+                items.push_back({f, m});
+            }
+        }
+    }
+
+    void mark_private(Form *f) {
+        if (f->is_list() && f->size() >= 2 && f->at(1)->kind == Form::Sym) priv_names.insert(f->at(1));
+    }
+    void note_private(Form *name, const std::string &key) {
+        if (priv_names.count(name)) priv.insert(key);
+    }
+
     /* -------------------------------------------------------- macros --- */
 
     // f with its macro calls at the head expanded (repeatedly)
     Form *expand(Form *f) {
-        while (f->kind == Form::List && !f->items.empty() && f->at(0)->kind == Form::Sym && meta.is_macro(f->at(0)->text))
-            f = meta.expand(f);
+        while (f->kind == Form::List && !f->items.empty() && f->at(0)->kind == Form::Sym) {
+            std::string k = macro_key(f->at(0));
+            if (k.empty()) break;
+            f = meta.expand(f, k);
+        }
         return f;
     }
 
@@ -356,8 +517,8 @@ struct Compiler::Impl : MetaHost {
             };
             auto it = builtin.find(f->text);
             if (it != builtin.end()) return it->second;
-            auto ut = c.types_.find(f->text);
-            if (ut != c.types_.end()) return ut->second;
+            std::string tk = type_key(f);
+            if (!tk.empty()) return c.types_[tk];
             fatal(f->loc, "unknown type '%s'", f->text.c_str());
         }
         if (f->is_call("ptr") && f->size() == 2) return t_ptr(parse_type(f->at(1)));
@@ -440,9 +601,9 @@ struct Compiler::Impl : MetaHost {
         return {};
     }
 
-    Global *lookup_global(const std::string &n) {
-        auto it = c.globals_.find(n);
-        return it == c.globals_.end() ? nullptr : &it->second;
+    Global *lookup_global(Form *sym) {
+        std::string k = global_key(sym);
+        return k.empty() ? nullptr : &c.globals_[k];
     }
 
     // does f's value take its type from the context? (literals and arithmetic on them)
@@ -451,7 +612,7 @@ struct Compiler::Impl : MetaHost {
         if (f->kind == Form::Int || f->kind == Form::Float) return true;
         if (f->kind == Form::Sym) {
             if (lookup_local(key(f)).v) return false;
-            Global *g = lookup_global(f->text);
+            Global *g = lookup_global(f);
             return g && g->kind == Global::Const && g->form && untyped(g->form);
         }
         if (f->is_list() && f->size() >= 2 && is_arith(f->head())) {
@@ -474,7 +635,7 @@ struct Compiler::Impl : MetaHost {
             if (hex && (int64_t)f->ival < 0) return t_int(64, false);
             return t_int(64, true);
         }
-        if (f->kind == Form::Sym) return default_type(lookup_global(f->text)->form);
+        if (f->kind == Form::Sym) return default_type(lookup_global(f)->form);
         if (f->is_call("sizeof") || f->is_call("alignof")) return t_int(64, false);
         if (f->is_call("if")) return default_type(mk_list(f->loc, {mk_sym(f->loc, "+"), f->at(2), f->at(3)}));
         Type *t = t_int(32, true);
@@ -532,7 +693,7 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         if (f->kind == Form::Sym) {
             if (lookup_local(key(f)).v) return true;
-            Global *g = lookup_global(f->text);
+            Global *g = lookup_global(f);
             return g && g->kind == Global::Var;
         }
         return f->is_call(".") || f->is_call("aref") || f->is_call("deref");
@@ -544,7 +705,7 @@ struct Compiler::Impl : MetaHost {
         if (f->kind == Form::Sym) {
             Val l = lookup_local(key(f));
             if (l.v) return l;
-            Global *g = lookup_global(f->text);
+            Global *g = lookup_global(f);
             if (g && g->kind == Global::Var) return {g->value, g->type};
             fatal(f->loc, "'%s' is not a variable", f->text.c_str());
         }
@@ -663,7 +824,7 @@ struct Compiler::Impl : MetaHost {
         }
         Val l = lookup_local(key(f));
         if (l.v) return {load(l), l.t};
-        Global *g = lookup_global(n);
+        Global *g = lookup_global(f);
         if (!g) fatal(f->loc, "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
@@ -684,6 +845,7 @@ struct Compiler::Impl : MetaHost {
             return {s, t_ptr(t_int(8, true))};
         }
         case Form::Sym: return symbol(f, want);
+        case Form::Fn: fatal(f->loc, "a compile-time function (from a macro) cannot be used in code");
         case Form::List: break;
         }
         if (f->items.empty()) fatal(f->loc, "empty form ()");
@@ -720,7 +882,7 @@ struct Compiler::Impl : MetaHost {
         if (hs == "addr") {
             if (f->size() != 2) fatal(f->loc, "(addr place)");
             if (f->at(1)->kind == Form::Sym) {
-                Global *g = lookup_global(f->at(1)->text);
+                Global *g = lookup_global(f->at(1));
                 if (g && g->kind == Global::Func && !lookup_local(key(f->at(1))).v) return {g->value, t_ptr(g->type)};
             }
             Val a = place(f->at(1));
@@ -744,11 +906,11 @@ struct Compiler::Impl : MetaHost {
         if (hs == "make") return make(f);
         if (hs == "defined") {  // (defined NAME): is there a global NAME (e.g. from -D)?
             if (f->size() != 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(defined NAME)");
-            return {b.getInt1(c.globals_.count(f->at(1)->text) != 0), t_bool()};
+            return {b.getInt1(!global_key(f->at(1)).empty()), t_bool()};
         }
         if (hs == "if-defined") {  // compile-time: only the chosen branch is compiled, like #ifdef
             if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(if-defined NAME then [else])");
-            if (c.globals_.count(f->at(1)->text)) return expr(f->at(2), want);
+            if (!global_key(f->at(1)).empty()) return expr(f->at(2), want);
             return f->size() == 4 ? expr(f->at(3), want) : Val{nullptr, t_void()};
         }
         if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoted forms exist only inside macros");
@@ -1038,7 +1200,7 @@ struct Compiler::Impl : MetaHost {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64"};
             for (const char *n : names)
                 if (f->text == n) return true;
-            return c.types_.count(f->text) && !lookup_local(key(f)).v && !lookup_global(f->text);
+            return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn");
     }
@@ -1247,7 +1409,7 @@ struct Compiler::Impl : MetaHost {
         Val callee;
         Type *ft = nullptr;
         if (head->kind == Form::Sym && !lookup_local(key(head)).v) {
-            Global *g = lookup_global(head->text);
+            Global *g = lookup_global(head);
             if (!g) fatal(head->loc, "unknown function '%s'", head->text.c_str());
             if (g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
         }
@@ -1327,37 +1489,33 @@ struct Compiler::Impl : MetaHost {
         } else out.push_back(f);
     }
 
-    // (include "file.lsp"): that file's top-level forms in place, recursively;
-    // the path is relative to the including file; each file is read once
-    std::map<std::string, bool> included;
-    void with_includes(const std::vector<Form *> &in, std::vector<Form *> &out) {
-        for (Form *f : in) {
-            if (!f->is_call("include")) { out.push_back(f); continue; }
-            for (size_t i = 1; i < f->size(); i++) {
-                Form *p = f->at(i);
-                if (p->kind != Form::Str) fatal(p->loc, "(include \"file.lsp\" ...)");
-                std::string from = f->loc.file, path = p->text;
-                if (path[0] != '/' && from.find('/') != std::string::npos) path = from.substr(0, from.rfind('/') + 1) + path;
-                char real[4096];
-                if (!realpath(path.c_str(), real)) fatal(p->loc, "cannot include %s: %s", path.c_str(), strerror(errno));
-                if (included[real]) continue;
-                included[real] = true;
-                with_includes(read_file(strdup(path.c_str())), out);
-            }
+    ModInfo *root = nullptr;  // the program's first file
+
+    // the top-level forms of every module, each with its module set as cur
+    template <class F> void each(const std::vector<std::pair<Form *, ModInfo *>> &fs, F fn) {
+        for (auto &it : fs) {
+            cur = it.second;
+            fn(it.first);
         }
+        cur = nullptr;
     }
 
     void top(const std::vector<Form *> &files) {
-        std::vector<Form *> input;
-        with_includes(files, input);
+        if (files.empty()) return;
+        std::vector<Form *> fs = files;
+        root = load_module(files[0]->loc.file, files[0]->loc, &fs);
         // macros and compile-time helpers first, so everything can use them
-        std::vector<Form *> forms;
-        for (Form *f : input) {
-            if (f->is_call("defmacro") || f->is_call("defmeta")) meta.define(f);
-            else forms.push_back(f);
-        }
+        std::vector<std::pair<Form *, ModInfo *>> all;
+        each(items, [&](Form *f) {
+            if (f->is_call("defmacro") || f->is_call("defmeta")) {
+                if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(%s name (params...) body...)", f->head());
+                std::string k = def_key(f->at(1));
+                meta.define(f, k);
+                note_private(f->at(1), k);
+            } else all.push_back({f, cur});
+        });
         // pass 0: C headers and hand-written externs
-        for (Form *f : forms) {
+        each(all, [&](Form *f) {
             if (f->is_call("c-include")) {
                 std::vector<std::string> hs;
                 for (size_t i = 1; i < f->size(); i++) {
@@ -1366,44 +1524,59 @@ struct Compiler::Impl : MetaHost {
                 }
                 c_include(c, hs, f->loc);
             }
-        }
+        });
         // pass 1: struct names, so structs can refer to each other
         std::vector<std::pair<Form *, StructInfo *>> structs;
-        for (Form *f : forms) {
-            if (!f->is_call("struct") && !f->is_call("union")) continue;
+        std::vector<ModInfo *> struct_mods;
+        each(all, [&](Form *f) {
+            if (!f->is_call("struct") && !f->is_call("union")) return;
             if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(struct name (field T) ...)");
             auto *st = new StructInfo;
             st->name = f->at(1)->text;
             st->is_union = f->is_call("union");
-            if (c.types_.count(st->name)) fatal(f->loc, "type '%s' is already defined", st->name.c_str());
-            c.types_[st->name] = t_struct(st);
+            std::string k = def_key(f->at(1));
+            if (c.types_.count(k)) fatal(f->loc, "type '%s' is already defined", st->name.c_str());
+            c.types_[k] = t_struct(st);
+            note_private(f->at(1), k);
             structs.push_back({f, st});
-        }
-        add_fields(structs);
+            struct_mods.push_back(cur);
+        });
+        add_fields(structs, struct_mods);
         for (auto &s : structs) lay_out(s.second, s.first->loc);
         // top-level macros run once the structs are known (they may ask about them);
         // structs they produce are added the same way
-        std::vector<Form *> expanded;
-        for (Form *f : forms) {
-            if (f->is_call("struct") || f->is_call("union") || f->is_call("c-include")) expanded.push_back(f);
-            else expand_top(f, expanded);
-        }
-        forms = expanded;
+        std::vector<std::pair<Form *, ModInfo *>> expanded;
+        each(all, [&](Form *f) {
+            if (f->is_call("struct") || f->is_call("union") || f->is_call("c-include")) {
+                expanded.push_back({f, cur});
+                return;
+            }
+            std::vector<Form *> out;
+            expand_top(f, out);
+            for (Form *x : out) expanded.push_back({x, cur});
+        });
+        all = expanded;
         std::vector<std::pair<Form *, StructInfo *>> more;
-        for (Form *f : forms) {
-            if ((!f->is_call("struct") && !f->is_call("union")) || f->size() < 2 || f->at(1)->kind != Form::Sym) continue;
-            if (c.types_.count(f->at(1)->text) && c.types_[f->at(1)->text]->kind == Type::Struct && c.types_[f->at(1)->text]->st->complete) continue;
+        std::vector<ModInfo *> more_mods;
+        each(all, [&](Form *f) {
+            if ((!f->is_call("struct") && !f->is_call("union")) || f->size() < 2 || f->at(1)->kind != Form::Sym) return;
+            std::string k = def_key(f->at(1));
+            if (c.types_.count(k) && c.types_[k]->kind == Type::Struct && c.types_[k]->st->complete) return;
             auto *st = new StructInfo;
             st->name = f->at(1)->text;
             st->is_union = f->is_call("union");
-            c.types_[st->name] = t_struct(st);
+            c.types_[k] = t_struct(st);
+            note_private(f->at(1), k);
             more.push_back({f, st});
-        }
-        add_fields(more);
+            more_mods.push_back(cur);
+        });
+        add_fields(more, more_mods);
         for (auto &s : more) lay_out(s.second, s.first->loc);
         // defop: a function named after the operator and its types
-        std::vector<std::pair<std::string, Form *>> ops;
-        for (Form *&f : forms) {
+        std::vector<std::pair<std::string, std::string>> ops;  // operator, qualified function name
+        for (auto &item : all) {
+            Form *&f = item.first;
+            cur = item.second;
             if (!f->is_call("defop")) continue;
             if (f->size() < 5 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(defop op ((a T) ...) R body...)");
             std::string name = f->at(1)->text + "(";
@@ -1416,10 +1589,13 @@ struct Compiler::Impl : MetaHost {
             std::vector<Form *> items = f->items;
             items[0] = mk_sym(f->loc, "defn");
             items[1] = mk_sym(f->at(1)->loc, name);
-            ops.push_back({f->at(1)->text, f = mk_list(f->loc, items)});
+            std::string op = f->at(1)->text;
+            f = mk_list(f->loc, items);
+            ops.push_back({op, def_key(f->at(1))});
         }
+        cur = nullptr;
         // pass 2: constants, globals, function signatures
-        for (Form *f : forms) {
+        each(all, [&](Form *f) {
             const char *h = f->head();
             if (!strcmp(h, "const")) {
                 if (f->size() != 3 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(const NAME expr)");
@@ -1435,15 +1611,18 @@ struct Compiler::Impl : MetaHost {
             } else if (strcmp(h, "c-include") && strcmp(h, "struct") && strcmp(h, "union")) {
                 fatal(f->loc, "unknown top-level form %s", show(f).c_str());
             }
-        }
-        for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second->at(1)->text]);
+        });
+        for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second]);
         // pass 3: function bodies
-        for (Form *f : forms)
+        each(all, [&](Form *f) {
             if (f->is_call("defn")) define_fn(f);
+        });
     }
 
-    void add_fields(std::vector<std::pair<Form *, StructInfo *>> &structs) {
-        for (auto &s : structs) {
+    void add_fields(std::vector<std::pair<Form *, StructInfo *>> &structs, std::vector<ModInfo *> &ms) {
+        for (size_t si = 0; si < structs.size(); si++) {
+            auto &s = structs[si];
+            cur = ms[si];
             for (size_t i = 2; i < s.first->size(); i++) {
 
                 Form *fd = s.first->at(i);
@@ -1459,6 +1638,7 @@ struct Compiler::Impl : MetaHost {
                 s.second->fields.push_back(field);
             }
         }
+        cur = nullptr;
     }
 
     void lay_out(StructInfo *st, Loc at) {
@@ -1474,9 +1654,11 @@ struct Compiler::Impl : MetaHost {
     }
 
     void define(Form *name, Global g) {
-        auto it = c.globals_.find(name->text);
+        std::string k = def_key(name);
+        auto it = c.globals_.find(k);
         if (it != c.globals_.end() && !it->second.imported) fatal(name->loc, "'%s' is already defined", name->text.c_str());
-        c.globals_[name->text] = g;
+        c.globals_[k] = g;
+        note_private(name, k);
     }
 
     void def_global(Form *f) {
@@ -1484,7 +1666,7 @@ struct Compiler::Impl : MetaHost {
         Type *t = parse_type(f->at(2));
         llvm::Constant *init = llvm::Constant::getNullValue(ll(t));
         if (f->size() == 4) init = constant(f->at(3), t);
-        auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, f->at(1)->text);
+        auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, def_key(f->at(1)));
         gv->setAlignment(llvm::Align(align_of(t)));
         define(f->at(1), Global{Global::Var, t, gv});
     }
@@ -1544,16 +1726,17 @@ struct Compiler::Impl : MetaHost {
             ps.push_back(parse_type(p->at(1)));
         }
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
-        const std::string &name = f->at(1)->text;
-        auto link = name == "main" ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
-        // (a name taken by a C import gets a suffix in the module; the import stays as it was)
-        llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, mod.getNamedValue(name) ? name + ".lisc" : name, mod);
+        // the program's main (in the first module) is the C entry point; everything else is internal
+        bool entry = f->at(1)->text == "main" && cur == root;
+        std::string name = entry ? "main" : def_key(f->at(1));
+        auto link = entry ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
+        llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
         fn0->setAttributes(fn_abi(ft).attrs);
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }
 
     void define_fn(Form *f) {
-        Global &g = c.globals_[f->at(1)->text];
+        Global &g = c.globals_[def_key(f->at(1))];
         fn = llvm::cast<llvm::Function>(g.value);
         fn_ret = g.type->elem;
         cur_ft = g.type;

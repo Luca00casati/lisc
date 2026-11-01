@@ -2,7 +2,7 @@
 // typed core forms.
 //
 // Top level:
-//   (c-include "h" ...)              C declarations from headers (cimport.cpp)
+//   (import "m" [:as a])  (import-c "h" ... [:as a])  (using m ...)   modules, see "modules" below
 //   (struct name (field T) ...)      also (union name ...)
 //   (const NAME expr)                a compile-time constant; untyped if expr is
 //   (def name T [init])              a global variable

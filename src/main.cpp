@@ -4,7 +4,7 @@
 //   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 //
 // Other input files go to the linker (cc), so C code can be linked in.
-// (c-include ...) searches the source file's directory and -I directories.
+// import-c searches the source file's directory and -I directories for headers.
 
 #include <cstdio>
 #include <cstring>

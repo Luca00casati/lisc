@@ -22,7 +22,7 @@ struct Global {
     llvm::Value *value = nullptr;   // Function, GlobalVariable, or Constant
     Form *form = nullptr;           // Const without a type: its expression, compiled at each use
     Form *def = nullptr;            // Func: the defn form (null for externs)
-    bool imported = false;          // from (c-include ...): a definition of the program replaces it
+    bool imported = false;          // from a C module
 };
 
 class Compiler {
@@ -33,7 +33,7 @@ public:
     void compile(const std::vector<Form *> &forms);
     llvm::Module &module() { return *mod_; }
 
-    // where (c-include ...) looks first (then the system directories)
+    // where import-c looks for headers first (then the system directories)
     std::vector<std::string> include_dirs;
     // -D NAME[=value]: an untyped constant (a number, or else a string; 1 without a value)
     void define_const(const std::string &name, const std::string &value);

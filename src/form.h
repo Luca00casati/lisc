@@ -20,6 +20,10 @@ struct Form {
     std::string text;           // Sym name, Str contents, Int/Float as written
     std::vector<Form *> items;  // List
     void *fn = nullptr;         // Fn
+    // Sym: hygiene mark. A symbol written in a macro's template gets the
+    // expansion's mark; it is bound and looked up as a different name from
+    // the same symbol without the mark (see key() in compiler.cpp).
+    unsigned mark = 0;
 
     bool is_sym(const char *s) const { return kind == Sym && text == s; }
     bool is_list() const { return kind == List; }

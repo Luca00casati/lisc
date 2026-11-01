@@ -1,0 +1,6 @@
+swap 2 1
+scaled 20 (local scale 3)
+sum-twice 10
+aif 43 -1
+counter 40
+rotate 2 3 1

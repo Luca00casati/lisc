@@ -21,6 +21,13 @@
 //            (type-kind T) → void bool int float ptr array struct fn
 //            (type-elem T) (type-len T) (type-fields T) → ((name T) ...)   (type-size T)
 //   (error "msg" ...) stops compilation at the macro call;  (print x ...) debugs to stderr
+//
+// Hygiene: every symbol written in a quasiquote template gets a mark unique
+// to the expansion. Variables the template binds (let, for, parameters) are
+// then distinct from the same names at the use site, both ways, and names the
+// template uses without binding mean the global definitions, not a local that
+// happens to be in scope where the macro is used. Arguments keep their own
+// names. To capture a name on purpose, insert an unmarked symbol: ,'it
 #pragma once
 
 #include <functional>
@@ -61,4 +68,5 @@ private:
     std::map<std::string, std::function<Form *(std::vector<Form *> &, Loc)>> builtins_;
     Loc call_at_;  // the macro call being expanded (for errors)
     int gensym_ = 0;
+    unsigned mark_ = 0, marks_ = 0;  // hygiene: the current expansion's mark, the last one handed out
 };

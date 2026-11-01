@@ -111,7 +111,18 @@ field of a struct:
 (derive-ops v3)
 ```
 
-Macros are not hygienic; use `gensym` for temporaries.
+Macros are hygienic. Every symbol written in a template gets a mark unique to
+that expansion, so:
+
+- variables the template binds can't capture the user's names, and the user's
+  code (passed in as arguments) can't see them: `(swap! tmp other)` works
+  with a `swap!` whose template binds its own `tmp`;
+- names the template uses without binding mean the global definitions, even if
+  the use site has a local of the same name;
+- keywords, operators, types, fields and global definitions are unaffected.
+
+To capture a name on purpose (an anaphoric `it`), insert an unmarked symbol
+with `,'it`. `gensym` still exists for names a macro builds itself.
 
 ## Status
 

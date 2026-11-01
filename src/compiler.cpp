@@ -72,6 +72,12 @@ bool in(const char *s, const char *const *list, size_t n) {
         if (!strcmp(s, list[i])) return true;
     return false;
 }
+// A local variable's name in the scopes: the symbol's text, plus its
+// hygiene mark if a macro template introduced it. Globals, types, fields and
+// keywords are looked up by text alone, so a template's free names mean the
+// global definitions, never a local of the code the macro is used in.
+std::string key(const Form *sym) { return sym->mark ? sym->text + "\x01" + std::to_string(sym->mark) : sym->text; }
+
 bool is_arith(const char *s) { return in(s, ARITH, sizeof ARITH / sizeof *ARITH); }
 bool is_cmp(const char *s) { return in(s, CMP, sizeof CMP / sizeof *CMP); }
 
@@ -441,7 +447,7 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         if (f->kind == Form::Int || f->kind == Form::Float) return true;
         if (f->kind == Form::Sym) {
-            if (lookup_local(f->text).v) return false;
+            if (lookup_local(key(f)).v) return false;
             Global *g = lookup_global(f->text);
             return g && g->kind == Global::Const && g->form && untyped(g->form);
         }
@@ -506,7 +512,7 @@ struct Compiler::Impl : MetaHost {
     bool is_place(Form *f) {
         f = expand(f);
         if (f->kind == Form::Sym) {
-            if (lookup_local(f->text).v) return true;
+            if (lookup_local(key(f)).v) return true;
             Global *g = lookup_global(f->text);
             return g && g->kind == Global::Var;
         }
@@ -517,7 +523,7 @@ struct Compiler::Impl : MetaHost {
     Val place(Form *f) {
         f = expand(f);
         if (f->kind == Form::Sym) {
-            Val l = lookup_local(f->text);
+            Val l = lookup_local(key(f));
             if (l.v) return l;
             Global *g = lookup_global(f->text);
             if (g && g->kind == Global::Var) return {g->value, g->type};
@@ -636,7 +642,7 @@ struct Compiler::Impl : MetaHost {
             Type *t = want && want->is_ptr() ? want : t_ptr(t_void());
             return {llvm::ConstantPointerNull::get(b.getPtrTy()), t};
         }
-        Val l = lookup_local(n);
+        Val l = lookup_local(key(f));
         if (l.v) return {load(l), l.t};
         Global *g = lookup_global(n);
         if (!g) fatal(f->loc, "unknown name '%s'", n.c_str());
@@ -696,7 +702,7 @@ struct Compiler::Impl : MetaHost {
             if (f->size() != 2) fatal(f->loc, "(addr place)");
             if (f->at(1)->kind == Form::Sym) {
                 Global *g = lookup_global(f->at(1)->text);
-                if (g && g->kind == Global::Func && !lookup_local(f->at(1)->text).v) return {g->value, t_ptr(g->type)};
+                if (g && g->kind == Global::Func && !lookup_local(key(f->at(1))).v) return {g->value, t_ptr(g->type)};
             }
             Val a = place(f->at(1));
             if (a.bwidth) fatal(f->at(1)->loc, "cannot take the address of a bit field");
@@ -965,7 +971,7 @@ struct Compiler::Impl : MetaHost {
             }
             llvm::AllocaInst *a = alloca_(t, name);
             store({a, t}, init ? v.v : llvm::Constant::getNullValue(ll(t)));
-            scopes.back()[name] = {a, t};
+            scopes.back()[key(bd->at(0))] = {a, t};
         }
         Val r = body(f, 2, want);
         scopes.pop_back();
@@ -979,7 +985,7 @@ struct Compiler::Impl : MetaHost {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64"};
             for (const char *n : names)
                 if (f->text == n) return true;
-            return c.types_.count(f->text) && !lookup_local(f->text).v && !lookup_global(f->text);
+            return c.types_.count(f->text) && !lookup_local(key(f)).v && !lookup_global(f->text);
         }
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn");
     }
@@ -1086,7 +1092,7 @@ struct Compiler::Impl : MetaHost {
         scopes.emplace_back();
         llvm::AllocaInst *iv = alloca_(t, spec->at(0)->text);
         store({iv, t}, start.v);
-        scopes.back()[spec->at(0)->text] = {iv, t};
+        scopes.back()[key(spec->at(0))] = {iv, t};
         BasicBlock *cond = BasicBlock::Create(ctx, "for", fn), *bodyb = BasicBlock::Create(ctx, "body", fn);
         BasicBlock *step = BasicBlock::Create(ctx, "step", fn), *done = BasicBlock::Create(ctx, "endfor", fn);
         b.CreateBr(cond);
@@ -1178,7 +1184,7 @@ struct Compiler::Impl : MetaHost {
         Form *head = f->at(0);
         Val callee;
         Type *ft = nullptr;
-        if (head->kind == Form::Sym && !lookup_local(head->text).v) {
+        if (head->kind == Form::Sym && !lookup_local(key(head)).v) {
             Global *g = lookup_global(head->text);
             if (!g) fatal(head->loc, "unknown function '%s'", head->text.c_str());
             if (g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
@@ -1426,7 +1432,7 @@ struct Compiler::Impl : MetaHost {
             const ArgAbi &pa = abi.params[i];
             if (pa.kind == ArgAbi::Memory) {  // byval: the copy is ours to use as the variable
                 arg->setName(name);
-                scopes.back()[name] = {&*arg++, t};
+                scopes.back()[key(f->at(2)->at(i)->at(0))] = {&*arg++, t};
                 continue;
             }
             llvm::AllocaInst *a = alloca_(t, name);
@@ -1440,7 +1446,7 @@ struct Compiler::Impl : MetaHost {
             } else {
                 store({a, t}, llvm::Constant::getNullValue(ll(t)));
             }
-            scopes.back()[name] = {a, t};
+            scopes.back()[key(f->at(2)->at(i)->at(0))] = {a, t};
         }
         Val v = body(f, 4, fn_ret == t_void() ? nullptr : fn_ret);
         if (open()) {

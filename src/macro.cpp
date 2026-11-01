@@ -276,10 +276,13 @@ void Meta::define(Form *def) {
 Form *Meta::expand(Form *call) {
     Closure *m = macros_.at(call->head());
     Loc saved = call_at_;
+    unsigned saved_mark = mark_;
     call_at_ = call->loc;
+    mark_ = ++marks_;  // a fresh mark per expansion
     std::vector<Form *> args(call->items.begin() + 1, call->items.end());  // unevaluated: macros get forms
     Form *r = call_closure(m, args, call->loc);
     call_at_ = saved;
+    mark_ = saved_mark;
     return r;
 }
 
@@ -324,6 +327,11 @@ Form *Meta::apply(Form *fn, const std::vector<Form *> &args, Loc at) {
 }
 
 Form *Meta::quasi(Form *f, Env *env, int depth) {
+    if (f->kind == Form::Sym && mark_) {  // hygiene: the template's own symbols get this expansion's mark
+        Form *m = mk_sym(f->loc, f->text);
+        m->mark = mark_;
+        return m;
+    }
     if (f->kind != Form::List) return f;
     if (f->is_call("unquote") && f->size() == 2) {
         if (depth == 1) return eval(f->at(1), env);

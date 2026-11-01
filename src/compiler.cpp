@@ -496,9 +496,22 @@ struct Compiler::Impl : MetaHost {
 
     // implicit conversions on assignment and argument passing: same type, or
     // between (ptr void) and any pointer
+    // Lossless widening, done implicitly (as Zig does): a smaller integer into a
+    // bigger one of the same signedness, or an unsigned one into a bigger signed one
+    static bool widens(Type *from, Type *to) {
+        return from->is_int() && to->is_int() && to->bits > from->bits && (from->sign == to->sign || to->sign);
+    }
+    // two operands of different integer types: both get the wider type, if one widens to the other
+    bool unify(Val &a, Val &x, Loc at) {
+        if (widens(a.t, x.t)) a = cast(a, x.t, at);
+        else if (widens(x.t, a.t)) x = cast(x, a.t, at);
+        return a.t == x.t;
+    }
+
     Val coerce(Val v, Type *to, Loc at, const char *what) {
         if (v.t == to) return v;
         if (v.t->is_ptr() && to->is_ptr() && (v.t->elem == t_void() || to->elem == t_void())) return {v.v, to};
+        if (widens(v.t, to) || (v.t->is_float() && to->is_float() && to->bits > v.t->bits)) return cast(v, to, at);
         type_error(at, what, to, v.t);
     }
 
@@ -779,7 +792,13 @@ struct Compiler::Impl : MetaHost {
             if (vs[i].v) continue;
             Type *ti = t->is_ptr() ? t_int(64, true) : t;  // pointer arithmetic: integer offsets
             vs[i] = expr(f->at(i), ti);
-            if (!t->is_ptr() && vs[i].t != t) type_error(f->at(i)->loc, f->head(), t, vs[i].t);
+            if (t->is_ptr() || vs[i].t == t) continue;
+            if (widens(vs[i].t, t)) vs[i] = cast(vs[i], t, f->at(i)->loc);
+            else if (widens(t, vs[i].t)) {  // a wider operand: everything so far widens to it
+                t = vs[i].t;
+                for (Val &v : vs)
+                    if (v.v && v.t != t) v = cast(v, t, f->at(i)->loc);
+            } else type_error(f->at(i)->loc, f->head(), t, vs[i].t);
         }
         return {vs.begin() + from, vs.end()};
     }
@@ -838,7 +857,8 @@ struct Compiler::Impl : MetaHost {
         if (!x.v.v) x.v = expr(x.f, t->is_ptr() && !is_compare ? t_int(64, true) : t);
         if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
         bool shift = op == "<<" || op == ">>";  // as in C, the count may be any integer type
-        if (!t->is_ptr() && a.v.t != x.v.t && !(shift && a.v.t->is_int() && x.v.t->is_int())) type_error(at, op.c_str(), a.v.t, x.v.t);
+        if (!t->is_ptr() && a.v.t != x.v.t && !(shift && a.v.t->is_int() && x.v.t->is_int()) && !unify(a.v, x.v, at))
+            type_error(at, op.c_str(), a.v.t, x.v.t);
         if (!t->is_num() && !t->is_ptr()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(a.v.t).c_str(), type_name(x.v.t).c_str());
         return {binop(op, a.v, x.v, at), nullptr};
     }
@@ -946,7 +966,7 @@ struct Compiler::Impl : MetaHost {
     Val compare_vals(const std::string &op, Val a, Val x, Loc at) {
         if (x.t != a.t) {
             if (a.t->is_ptr() && x.t->is_ptr()) x.t = a.t;
-            else type_error(at, op.c_str(), a.t, x.t);
+            else if (!unify(a, x, at)) type_error(at, op.c_str(), a.t, x.t);
         }
         Type *t = a.t;
         using P = llvm::CmpInst::Predicate;

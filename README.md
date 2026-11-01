@@ -62,8 +62,11 @@ Typing rules:
 
 - Literals are untyped until used: `0.1` becomes exactly C's `0.1f` where an
   `f32` is expected, `0.1` (double) otherwise; integers take the type they meet.
-- Operands of an operator must have one type; mixing `i32` and `f32` (or `i32`
-  and `i64`) is an error — write `(cast T e)`.
+- Operands of an operator must have one type. Lossless integer widening is
+  implicit (as in Zig): a smaller integer into a bigger one of the same
+  signedness, or unsigned into a bigger signed type; in assignments and
+  arguments also `f32` into `f64`. Anything else — mixing `i32` and `u32`,
+  integers and floats, narrowing — needs `(cast T e)`.
 - `#define` and enum constants from C headers are untyped too, as in C.
 - Implicit conversions only: `(ptr void)` ↔ any pointer, arrays to a pointer to
   their first element, and C's default promotions for variadic arguments.

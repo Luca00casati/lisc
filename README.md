@@ -26,7 +26,7 @@ through libclang, so libc and kernel interfaces need no hand-written bindings.
 Extra `.c`/`.o` inputs are linked in. `(c-include ...)` searches the source
 file's directory and `-I` directories, then the system ones.
 
-## Language (core, phases 1-2)
+## Language
 
 Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void`,
 `(ptr T)`, `(array T N)`, `(fn (A B ...) R)`, struct/union names, and every
@@ -42,6 +42,9 @@ Top level:
 | `(def name T [init])` | global variable |
 | `(defn name ((a T) ...) R body...)` | function; the last expression is the result |
 | `(extern name (T ... [...]) R)` | a C function by hand |
+| `(defop op ((a T) ...) R body...)` | an operator for these operand types |
+| `(defmacro name (params...) body...)` | a macro (see below) |
+| `(defmeta name (params...) body...)` | a compile-time helper function for macros |
 
 Expressions — everything is one; statements have type `void`:
 
@@ -71,9 +74,47 @@ Typing rules:
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
+## Operators
+
+`(defop + ((a v3) (b v3)) v3 ...)` defines `+` for two `v3`s. An operator form
+uses the definition whose parameter types match its operands exactly; a
+literal operand takes the type the definition wants (`(* 2.0 v)` with
+`(defop * ((k f32) (a v3)) ...)`). n-ary forms fold left: `(+ a b c)` is
+`(+ (+ a b) c)`. Unary `-` and the comparisons can be defined the same way.
+Definitions are ordinary functions, so the optimiser inlines them: there is no
+runtime cost.
+
+## Macros
+
+A macro is a function that runs inside the compiler, on forms: it receives its
+arguments unevaluated and returns the form to compile in its place. The
+language inside is a small Lisp (see `src/macro.h` for the full list):
+quasiquote, `if`/`cond`/`let`/`while`/`lambda`, list functions (`map`,
+`mapcat`, `filter`, `range`, ...), `sym`/`str`/`gensym`, and parameters that
+destructure (`(defmacro unroll ((i n) &body body) ...)`).
+
+Macros can ask about types: `(type-of e)` is the type `e` has where the macro
+is used, and `(type-kind T)`, `(type-elem T)`, `(type-fields T)` ... describe a
+type. So a macro can dispatch on its argument's type, or generate code for every
+field of a struct:
+
+```lisp
+(defmacro derive-ops (T)                 ; + - * and = for any struct, field by field
+  (let ((fields (map first (type-fields T))))
+    `(do ,@(map (lambda (op)
+                  `(defop ,op ((a ,T) (b ,T)) ,T
+                     (make ,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields))))
+                '(+ - *))
+         (defop = ((a ,T) (b ,T)) bool
+           (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
+
+(derive-ops v3)
+```
+
+Macros are not hygienic; use `gensym` for temporaries.
+
 ## Status
 
 Done: reader, typed core, LLVM code generation and optimisation, C header
-import. Next: macros (a compile-time Lisp interpreter with quasiquote that can
-ask for the type of an expression), operator overloading by type (`defop`),
-then porting the teapot ray tracer to lisc.
+import, the C calling convention, bit fields, macros with type queries, and
+operator overloading. Next: porting the teapot ray tracer to lisc.

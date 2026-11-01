@@ -23,6 +23,7 @@
 // (cast T e).
 
 #include "compiler.h"
+#include "macro.h"
 
 #include <cmath>
 #include <cstring>
@@ -76,7 +77,7 @@ bool is_cmp(const char *s) { return in(s, CMP, sizeof CMP / sizeof *CMP); }
 
 }  // namespace
 
-struct Compiler::Impl {
+struct Compiler::Impl : MetaHost {
     Compiler &c;
     llvm::LLVMContext &ctx;
     llvm::Module &mod;
@@ -88,8 +89,38 @@ struct Compiler::Impl {
     std::vector<std::map<std::string, Val>> scopes;  // locals: name → address
     std::vector<Loop> loops;
     std::map<StructInfo *, bool> laying_out;          // cycle guard
+    Meta meta{*this};
+    // defop: operator → its definitions (functions named like "+(v3,v3)")
+    std::map<std::string, std::vector<Global *>> overloads;
 
     Impl(Compiler &c) : c(c), ctx(*c.ctx_), mod(*c.mod_), b(ctx) {}
+
+    /* -------------------------------------------------------- macros --- */
+
+    // f with its macro calls at the head expanded (repeatedly)
+    Form *expand(Form *f) {
+        while (f->kind == Form::List && !f->items.empty() && f->at(0)->kind == Form::Sym && meta.is_macro(f->at(0)->text))
+            f = meta.expand(f);
+        return f;
+    }
+
+    // the type of an expression where it stands, without emitting code: it is
+    // compiled into a scratch block that is thrown away
+    Type *type_of(Form *f) override {
+        if (!fn) fatal(f->loc, "type-of works only inside functions");
+        llvm::IRBuilderBase::InsertPoint ip = b.saveIP();
+        size_t nblocks = fn->size();
+        b.SetInsertPoint(BasicBlock::Create(ctx, "typeof", fn));
+        Type *t = expr(f, nullptr).t;
+        std::vector<BasicBlock *> made;
+        size_t i = 0;
+        for (BasicBlock &bb : *fn)
+            if (i++ >= nblocks) made.push_back(&bb);
+        for (BasicBlock *bb : made) bb->dropAllReferences();
+        for (BasicBlock *bb : made) bb->eraseFromParent();
+        b.restoreIP(ip);
+        return t;
+    }
 
     /* --------------------------------------------------------- types --- */
 
@@ -304,7 +335,8 @@ struct Compiler::Impl {
         fatal(at, "struct %s is used before its fields are known", st->name.c_str());
     }
 
-    Type *parse_type(Form *f) {
+    Type *parse_type(Form *f) override {
+        f = expand(f);
         if (f->kind == Form::Sym) {
             static const std::map<std::string, Type *> builtin = {
                 {"void", t_void()}, {"bool", t_bool()},
@@ -406,6 +438,7 @@ struct Compiler::Impl {
 
     // does f's value take its type from the context? (literals and arithmetic on them)
     bool untyped(Form *f) {
+        f = expand(f);
         if (f->kind == Form::Int || f->kind == Form::Float) return true;
         if (f->kind == Form::Sym) {
             if (lookup_local(f->text).v) return false;
@@ -421,6 +454,7 @@ struct Compiler::Impl {
     }
     // the type an untyped form gets when nothing is expected
     Type *default_type(Form *f) {
+        f = expand(f);
         if (f->kind == Form::Float) return t_float(64);
         if (f->kind == Form::Int) {
             int64_t v = (int64_t)f->ival;
@@ -470,6 +504,7 @@ struct Compiler::Impl {
     /* ------------------------------------------------------- places ---- */
 
     bool is_place(Form *f) {
+        f = expand(f);
         if (f->kind == Form::Sym) {
             if (lookup_local(f->text).v) return true;
             Global *g = lookup_global(f->text);
@@ -480,6 +515,7 @@ struct Compiler::Impl {
 
     // the address of a place, with the place's type
     Val place(Form *f) {
+        f = expand(f);
         if (f->kind == Form::Sym) {
             Val l = lookup_local(f->text);
             if (l.v) return l;
@@ -615,6 +651,7 @@ struct Compiler::Impl {
     }
 
     Val expr(Form *f, Type *want) {
+        f = expand(f);
         switch (f->kind) {
         case Form::Int: case Form::Float: return literal(f, want);
         case Form::Str: {
@@ -680,7 +717,7 @@ struct Compiler::Impl {
             return {llvm::ConstantInt::get(ll(rt), hs == "sizeof" ? size_of(t) : align_of(t)), rt};
         }
         if (hs == "make") return make(f);
-        if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoted forms are only for macros (not implemented yet)");
+        if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoted forms exist only inside macros");
         return call(f);
     }
 
@@ -726,9 +763,77 @@ struct Compiler::Impl {
         return {vs.begin() + from, vs.end()};
     }
 
+    /* ------------------------------------------- operator overloading --- */
+
+    // an operand: compiled (v.v set) or still untyped (only the form)
+    struct Opnd {
+        Val v;
+        Form *f;
+    };
+
+    // typed operands compiled in order; untyped ones wait for a type
+    std::vector<Opnd> opnds(Form *f) {
+        std::vector<Opnd> xs;
+        for (size_t i = 1; i < f->size(); i++) xs.push_back({untyped(f->at(i)) ? Val{} : expr(f->at(i), nullptr), f->at(i)});
+        return xs;
+    }
+
+    // the defop matching these operands, called; found = false if none matches
+    Val overload(const std::string &op, std::vector<Opnd> xs, Loc at, bool *found) {
+        std::vector<Global *> match;
+        for (Global *g : overloads[op]) {
+            if (g->type->params.size() != xs.size()) continue;
+            bool ok = true;
+            for (size_t i = 0; i < xs.size() && ok; i++)
+                ok = xs[i].v.v ? g->type->params[i] == xs[i].v.t : g->type->params[i]->is_num();
+            if (ok) match.push_back(g);
+        }
+        *found = !match.empty();
+        if (match.empty()) return {};
+        if (match.size() > 1) fatal(at, "(%s ...) matches %zu definitions; give the literals a type", op.c_str(), match.size());
+        Global *g = match[0];
+        std::vector<Val> args;
+        for (size_t i = 0; i < xs.size(); i++) args.push_back(xs[i].v.v ? xs[i].v : expr(xs[i].f, g->type->params[i]));
+        return emit_call(g->value, g->type, args, {});
+    }
+
+    // (op a b) with built-in semantics, for operands already sorted out
+    Opnd builtin_pair(const std::string &op, Opnd a, Opnd x, Loc at, bool is_compare) {
+        if (!a.v.v && !x.v.v && !is_compare)  // both untyped: stays untyped
+            return {Val{}, mk_list(at, {mk_sym(at, op), a.f, x.f})};
+        Type *t = a.v.v ? a.v.t : x.v.t;
+        if (!a.v.v) a.v = expr(a.f, t);
+        if (!x.v.v) x.v = expr(x.f, t->is_ptr() && !is_compare ? t_int(64, true) : t);
+        if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
+        if (!t->is_ptr() && a.v.t != x.v.t) type_error(at, op.c_str(), a.v.t, x.v.t);
+        if (!t->is_num() && !t->is_ptr()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(a.v.t).c_str(), type_name(x.v.t).c_str());
+        return {binop(op, a.v, x.v, at), nullptr};
+    }
+
     Val arith(Form *f, Type *want) {
         std::string op = f->head();
         if (f->size() < 2) fatal(f->loc, "(%s ...) needs operands", op.c_str());
+        if (overloads.count(op) && !untyped(f)) {  // all-literal arithmetic is never overloaded
+            std::vector<Opnd> xs = opnds(f);
+            bool found;
+            if (xs.size() == 1) {
+                Val r = overload(op, xs, f->loc, &found);
+                if (found) return r;
+            } else {
+                Opnd acc = xs[0];
+                for (size_t i = 1; i < xs.size(); i++) {
+                    Val r = overload(op, {acc, xs[i]}, f->at(i + 1)->loc, &found);
+                    acc = found ? Opnd{r, nullptr} : builtin_pair(op, acc, xs[i], f->at(i + 1)->loc, false);
+                }
+                return acc.v.v ? acc.v : expr(acc.f, want);
+            }
+            // a unary operator with no matching definition: built in
+            Val v = xs[0].v.v ? xs[0].v : expr(xs[0].f, want);
+            if (op != "-") fatal(f->loc, "(%s x) needs two operands", op.c_str());
+            if (v.t->is_float()) return {b.CreateFNeg(v.v), v.t};
+            if (v.t->is_int()) return {b.CreateNeg(v.v), v.t};
+            fatal(f->loc, "no (- %s): define it with defop", type_name(v.t).c_str());
+        }
         std::vector<Val> vs = operands(f, 1, want);
         if (vs.size() == 1) {
             if (op != "-") fatal(f->loc, "(%s x) needs two operands", op.c_str());
@@ -773,7 +878,7 @@ struct Compiler::Impl {
             if (op == "%") return {b.CreateFRem(a.v, x.v), t};
             fatal(at, "'%s' needs integers", op.c_str());
         }
-        if (!t->is_int()) fatal(at, "'%s' is not defined on %s", op.c_str(), type_name(t).c_str());
+        if (!t->is_int()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
         if (op == "+") return {b.CreateAdd(a.v, x.v), t};
         if (op == "-") return {b.CreateSub(a.v, x.v), t};
         if (op == "*") return {b.CreateMul(a.v, x.v), t};
@@ -787,11 +892,22 @@ struct Compiler::Impl {
     Val compare(Form *f) {
         std::string op = f->head();
         if (f->size() != 3) fatal(f->loc, "(%s a b)", op.c_str());
+        if (overloads.count(op)) {
+            std::vector<Opnd> xs = opnds(f);
+            bool found;
+            Val r = overload(op, xs, f->loc, &found);
+            if (found) return r;
+            if (!xs[0].v.v && !xs[1].v.v) xs[0].v = expr(xs[0].f, default_type(mk_list(f->loc, {mk_sym(f->loc, "+"), xs[0].f, xs[1].f})));
+            return builtin_pair(op, xs[0], xs[1], f->loc, true).v;
+        }
         std::vector<Val> vs = operands(f, 1, nullptr);
-        Val a = vs[0], x = vs[1];
+        return compare_vals(op, vs[0], vs[1], f->at(2)->loc);
+    }
+
+    Val compare_vals(const std::string &op, Val a, Val x, Loc at) {
         if (x.t != a.t) {
             if (a.t->is_ptr() && x.t->is_ptr()) x.t = a.t;
-            else type_error(f->at(2)->loc, op.c_str(), a.t, x.t);
+            else type_error(at, op.c_str(), a.t, x.t);
         }
         Type *t = a.t;
         using P = llvm::CmpInst::Predicate;
@@ -800,7 +916,7 @@ struct Compiler::Impl {
             const P fp[] = {P::FCMP_OEQ, P::FCMP_UNE, P::FCMP_OLT, P::FCMP_OLE, P::FCMP_OGT, P::FCMP_OGE};
             return {b.CreateFCmp(fp[k], a.v, x.v), t_bool()};
         }
-        if (t->kind == Type::Struct || t->kind == Type::Array) fatal(f->loc, "cannot compare %s", type_name(t).c_str());
+        if (t->kind == Type::Struct || t->kind == Type::Array) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
         const P si[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_SLT, P::ICMP_SLE, P::ICMP_SGT, P::ICMP_SGE};
         const P ui[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_ULT, P::ICMP_ULE, P::ICMP_UGT, P::ICMP_UGE};
         return {b.CreateICmp(t->is_int() && t->sign ? si[k] : ui[k], a.v, x.v), t_bool()};
@@ -858,6 +974,7 @@ struct Compiler::Impl {
 
     // (x T) in a let: is the second item a type rather than an initializer?
     bool is_type_form(Form *f) {
+        f = expand(f);
         if (f->kind == Form::Sym) {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64"};
             for (const char *n : names)
@@ -1074,18 +1191,11 @@ struct Compiler::Impl {
         size_t n = f->size() - 1;
         if (n < ft->params.size() || (n > ft->params.size() && !ft->variadic))
             fatal(f->loc, "%s takes %zu argument%s, got %zu", show(head).c_str(), ft->params.size(), ft->params.size() == 1 ? "" : "s", n);
-        FnAbi &abi = fn_abi(ft);
-        std::vector<llvm::Value *> args;
-        llvm::Value *sret = nullptr;
-        if (abi.ret.kind == ArgAbi::Memory) args.push_back(sret = alloca_(ft->elem, "sret"));
+        std::vector<Val> fixed, var;
         for (size_t i = 0; i < n; i++) {
             Form *a = f->at(i + 1);
             if (i < ft->params.size()) {
-                Val v = value_for(a, ft->params[i], "argument");
-                const ArgAbi &pa = abi.params[i];
-                if (pa.kind == ArgAbi::Direct) args.push_back(v.v);
-                else if (pa.kind == ArgAbi::Coerce) coerce_out(pa, v, args);
-                else if (pa.kind == ArgAbi::Memory) args.push_back(spill(v).v);  // byval: the callee gets its own copy
+                fixed.push_back(value_for(a, ft->params[i], "argument"));
                 continue;
             }
             // variadic: C's default promotions
@@ -1094,9 +1204,25 @@ struct Compiler::Impl {
             else if (v.t->is_int() && v.t->bits < 32) v = cast(v, t_int(32, v.t->sign), a->loc);
             else if (v.t->kind == Type::Bool) v = cast(v, t_int(32, true), a->loc);
             else if (v.t->kind == Type::Struct || v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
-            args.push_back(v.v);
+            var.push_back(v);
         }
-        llvm::CallInst *ci = b.CreateCall(abi.ty, callee.v, args);
+        return emit_call(callee.v, ft, fixed, var);
+    }
+
+    // a call with its arguments compiled, lowered per the calling convention
+    Val emit_call(llvm::Value *callee, Type *ft, const std::vector<Val> &fixed, const std::vector<Val> &var) {
+        FnAbi &abi = fn_abi(ft);
+        std::vector<llvm::Value *> args;
+        llvm::Value *sret = nullptr;
+        if (abi.ret.kind == ArgAbi::Memory) args.push_back(sret = alloca_(ft->elem, "sret"));
+        for (size_t i = 0; i < fixed.size(); i++) {
+            const ArgAbi &pa = abi.params[i];
+            if (pa.kind == ArgAbi::Direct) args.push_back(fixed[i].v);
+            else if (pa.kind == ArgAbi::Coerce) coerce_out(pa, fixed[i], args);
+            else if (pa.kind == ArgAbi::Memory) args.push_back(spill(fixed[i]).v);  // byval: the callee gets its own copy
+        }
+        for (const Val &v : var) args.push_back(v.v);
+        llvm::CallInst *ci = b.CreateCall(abi.ty, callee, args);
         ci->setAttributes(abi.attrs);
         Type *rt = ft->elem;
         switch (abi.ret.kind) {
@@ -1118,7 +1244,21 @@ struct Compiler::Impl {
 
     /* ------------------------------------------------------ top level --- */
 
-    void top(const std::vector<Form *> &forms) {
+    // top-level macro calls expanded; (do ...) at the top level is spliced
+    void expand_top(Form *f, std::vector<Form *> &out) {
+        f = expand(f);
+        if (f->is_call("do")) {
+            for (size_t i = 1; i < f->size(); i++) expand_top(f->at(i), out);
+        } else out.push_back(f);
+    }
+
+    void top(const std::vector<Form *> &input) {
+        // macros and compile-time helpers first, so everything can use them
+        std::vector<Form *> forms;
+        for (Form *f : input) {
+            if (f->is_call("defmacro") || f->is_call("defmeta")) meta.define(f);
+            else forms.push_back(f);
+        }
         // pass 0: C headers and hand-written externs
         for (Form *f : forms) {
             if (f->is_call("c-include")) {
@@ -1142,22 +1282,45 @@ struct Compiler::Impl {
             c.types_[st->name] = t_struct(st);
             structs.push_back({f, st});
         }
-        for (auto &s : structs) {
-            for (size_t i = 2; i < s.first->size(); i++) {
-                Form *fd = s.first->at(i);
-                bool bits = fd->is_list() && fd->size() == 4 && fd->at(2)->is_sym(":bits") && fd->at(3)->kind == Form::Int;
-                if (!fd->is_list() || (fd->size() != 2 && !bits) || fd->at(0)->kind != Form::Sym)
-                    fatal(fd->loc, "field must be (name T) or (name T :bits N)");
-                Field field{fd->at(0)->text, parse_type(fd->at(1)), 0};
-                if (bits) {
-                    field.bit_width = (unsigned)fd->at(3)->ival;
-                    if (!field.type->is_int() && field.type->kind != Type::Bool) fatal(fd->loc, "a bit field must be an integer or bool");
-                    if (field.bit_width == 0 || field.bit_width > 8 * size_of(field.type)) fatal(fd->at(3)->loc, "bit width must be 1..%lu", 8 * size_of(field.type));
-                }
-                s.second->fields.push_back(field);
-            }
-        }
+        add_fields(structs);
         for (auto &s : structs) lay_out(s.second, s.first->loc);
+        // top-level macros run once the structs are known (they may ask about them);
+        // structs they produce are added the same way
+        std::vector<Form *> expanded;
+        for (Form *f : forms) {
+            if (f->is_call("struct") || f->is_call("union") || f->is_call("c-include")) expanded.push_back(f);
+            else expand_top(f, expanded);
+        }
+        forms = expanded;
+        std::vector<std::pair<Form *, StructInfo *>> more;
+        for (Form *f : forms) {
+            if ((!f->is_call("struct") && !f->is_call("union")) || f->size() < 2 || f->at(1)->kind != Form::Sym) continue;
+            if (c.types_.count(f->at(1)->text) && c.types_[f->at(1)->text]->kind == Type::Struct && c.types_[f->at(1)->text]->st->complete) continue;
+            auto *st = new StructInfo;
+            st->name = f->at(1)->text;
+            st->is_union = f->is_call("union");
+            c.types_[st->name] = t_struct(st);
+            more.push_back({f, st});
+        }
+        add_fields(more);
+        for (auto &s : more) lay_out(s.second, s.first->loc);
+        // defop: a function named after the operator and its types
+        std::vector<std::pair<std::string, Form *>> ops;
+        for (Form *&f : forms) {
+            if (!f->is_call("defop")) continue;
+            if (f->size() < 5 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(defop op ((a T) ...) R body...)");
+            std::string name = f->at(1)->text + "(";
+            for (size_t i = 0; i < f->at(2)->size(); i++) {
+                Form *p = f->at(2)->at(i);
+                if (!p->is_list() || p->size() != 2) fatal(p->loc, "parameter must be (name T)");
+                name += (i ? "," : "") + type_name(parse_type(p->at(1)));
+            }
+            name += ")";
+            std::vector<Form *> items = f->items;
+            items[0] = mk_sym(f->loc, "defn");
+            items[1] = mk_sym(f->at(1)->loc, name);
+            ops.push_back({f->at(1)->text, f = mk_list(f->loc, items)});
+        }
         // pass 2: constants, globals, function signatures
         for (Form *f : forms) {
             const char *h = f->head();
@@ -1176,9 +1339,29 @@ struct Compiler::Impl {
                 fatal(f->loc, "unknown top-level form %s", show(f).c_str());
             }
         }
+        for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second->at(1)->text]);
         // pass 3: function bodies
         for (Form *f : forms)
             if (f->is_call("defn")) define_fn(f);
+    }
+
+    void add_fields(std::vector<std::pair<Form *, StructInfo *>> &structs) {
+        for (auto &s : structs) {
+            for (size_t i = 2; i < s.first->size(); i++) {
+
+                Form *fd = s.first->at(i);
+                bool bits = fd->is_list() && fd->size() == 4 && fd->at(2)->is_sym(":bits") && fd->at(3)->kind == Form::Int;
+                if (!fd->is_list() || (fd->size() != 2 && !bits) || fd->at(0)->kind != Form::Sym)
+                    fatal(fd->loc, "field must be (name T) or (name T :bits N)");
+                Field field{fd->at(0)->text, parse_type(fd->at(1)), 0};
+                if (bits) {
+                    field.bit_width = (unsigned)fd->at(3)->ival;
+                    if (!field.type->is_int() && field.type->kind != Type::Bool) fatal(fd->loc, "a bit field must be an integer or bool");
+                    if (field.bit_width == 0 || field.bit_width > 8 * size_of(field.type)) fatal(fd->at(3)->loc, "bit width must be 1..%lu", 8 * size_of(field.type));
+                }
+                s.second->fields.push_back(field);
+            }
+        }
     }
 
     void lay_out(StructInfo *st, Loc at) {

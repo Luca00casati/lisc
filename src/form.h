@@ -14,11 +14,12 @@ struct Loc {
 [[noreturn]] void fatal(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 struct Form {
-    enum Kind { Int, Float, Sym, Str, List } kind;
+    enum Kind { Int, Float, Sym, Str, List, Fn } kind;  // Fn: a compile-time closure (macro.cpp)
     Loc loc;
     uint64_t ival = 0;          // Int (two's complement of the written value)
     std::string text;           // Sym name, Str contents, Int/Float as written
     std::vector<Form *> items;  // List
+    void *fn = nullptr;         // Fn
 
     bool is_sym(const char *s) const { return kind == Sym && text == s; }
     bool is_list() const { return kind == List; }

@@ -186,6 +186,7 @@ std::string show(const Form *f) {
     switch (f->kind) {
     case Form::Int: case Form::Float: case Form::Sym: return f->text;
     case Form::Str: return "\"" + f->text + "\"";
+    case Form::Fn: return "<fn>";
     case Form::List: {
         std::string s = "(";
         for (size_t i = 0; i < f->items.size(); i++) s += (i ? " " : "") + show(f->items[i]);

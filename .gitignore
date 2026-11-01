@@ -1,0 +1,4 @@
+lisc
+*.o
+*.d
+tests/out/

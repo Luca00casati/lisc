@@ -1,0 +1,138 @@
+// main.cpp — the lisc driver: source → LLVM IR → optimised native object →
+// executable (linked by the system C compiler, against libc and libm).
+//
+//   lisc prog.lsp [-o prog] [-O0..-O3] [--emit-llvm] [-c] [-lname ...]
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Module.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
+#include <llvm/TargetParser/Host.h>
+
+#include "compiler.h"
+
+namespace {
+
+[[noreturn]] void usage() {
+    fprintf(stderr, "usage: lisc file.lsp [-o out] [-O0|-O1|-O2|-O3] [--emit-llvm] [-c] [-lname ...]\n");
+    exit(1);
+}
+
+int run(const std::vector<std::string> &argv) {
+    std::vector<char *> a;
+    for (auto &s : argv) a.push_back((char *)s.c_str());
+    a.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(a[0], a.data());
+        perror(a[0]);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
+void optimize(llvm::Module &m, llvm::TargetMachine *tm, int level) {
+    if (level == 0) return;
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    llvm::PassBuilder pb(tm);
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+    const llvm::OptimizationLevel levels[] = {llvm::OptimizationLevel::O0, llvm::OptimizationLevel::O1,
+                                              llvm::OptimizationLevel::O2, llvm::OptimizationLevel::O3};
+    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(levels[level]);
+    mpm.run(m, mam);
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+    const char *in = nullptr;
+    std::string out;
+    int opt = 2;
+    bool emit_llvm = false, object_only = false;
+    std::vector<std::string> libs;
+    for (int i = 1; i < argc; i++) {
+        const char *s = argv[i];
+        if (!strcmp(s, "-o") && i + 1 < argc) out = argv[++i];
+        else if (s[0] == '-' && s[1] == 'O' && s[2] >= '0' && s[2] <= '3' && !s[3]) opt = s[2] - '0';
+        else if (!strcmp(s, "--emit-llvm")) emit_llvm = true;
+        else if (!strcmp(s, "-c")) object_only = true;
+        else if (!strncmp(s, "-l", 2) && s[2]) libs.push_back(s);
+        else if (s[0] == '-' || in) usage();
+        else in = s;
+    }
+    if (!in) usage();
+    if (out.empty()) {
+        out = in;
+        size_t dot = out.rfind('.');
+        if (dot != std::string::npos) out.resize(dot);
+        if (emit_llvm) out += ".ll";
+        else if (object_only) out += ".o";
+    }
+
+    Compiler c;
+    c.compile(read_file(in));
+    llvm::Module &m = c.module();
+
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    std::string triple = llvm::sys::getDefaultTargetTriple(), err;
+    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, err);
+    if (!target) { fprintf(stderr, "lisc: %s\n", err.c_str()); return 1; }
+    llvm::StringMap<bool> host;
+    std::string features;
+    if (llvm::sys::getHostCPUFeatures(host))
+        for (auto &f : host) features += (features.empty() ? "" : ",") + std::string(f.second ? "+" : "-") + f.first().str();
+    llvm::TargetMachine *tm = target->createTargetMachine(triple, llvm::sys::getHostCPUName(), features, llvm::TargetOptions(),
+                                                          llvm::Reloc::PIC_, std::nullopt,
+                                                          opt >= 2 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::Default);
+    m.setDataLayout(tm->createDataLayout());
+    m.setTargetTriple(triple);
+    optimize(m, tm, opt);
+
+    std::error_code ec;
+    if (emit_llvm) {
+        llvm::raw_fd_ostream os(out, ec, llvm::sys::fs::OF_Text);
+        if (ec) { fprintf(stderr, "lisc: %s: %s\n", out.c_str(), ec.message().c_str()); return 1; }
+        m.print(os, nullptr);
+        return 0;
+    }
+    std::string obj = object_only ? out : out + ".o";
+    {
+        llvm::raw_fd_ostream os(obj, ec, llvm::sys::fs::OF_None);
+        if (ec) { fprintf(stderr, "lisc: %s: %s\n", obj.c_str(), ec.message().c_str()); return 1; }
+        llvm::legacy::PassManager pm;
+        if (tm->addPassesToEmitFile(pm, os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+            fprintf(stderr, "lisc: the target cannot emit object files\n");
+            return 1;
+        }
+        pm.run(m);
+    }
+    if (object_only) return 0;
+    std::vector<std::string> link = {"cc", "-o", out, obj, "-lm"};
+    link.insert(link.end(), libs.begin(), libs.end());
+    int r = run(link);
+    unlink(obj.c_str());
+    return r;
+}

@@ -1,0 +1,5 @@
+pi 3.141593  sqrtf(2) 1.4142135  INT_MAX 2147483647  UINT32_MAX 4294967295
+Lisc talks to libc (18 bytes)
+timespec 16 bytes: 3.000000500
+deadbeef -1 1
+EXIT_FAILURE 1  SEEK_END 2  EOF -1

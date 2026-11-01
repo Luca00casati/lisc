@@ -12,7 +12,7 @@
 // Expressions (everything is an expression; statements have type void):
 //   literals, names, (f args...), (do e...), (let ((x [T] [init]) ...) body...)
 //   (set place e)  (if c a [b])  (when c body...)  (unless c body...)
-//   (while c body...)  (for (i start end [step]) body...)  (break)  (continue)  (return [e])
+//   (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
 //   (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...) (or ...) (not x)
 //   (. x field ...)  (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)
 //   (sizeof T)  (alignof T)  (make T [:field e ...] | [e ...])
@@ -459,7 +459,7 @@ struct Compiler::Impl : MetaHost {
                 if (!untyped(f->at(i))) return false;
             return true;
         }
-        return false;
+        return f->is_call("sizeof") || f->is_call("alignof");  // constants, like literals
     }
     // the type an untyped form gets when nothing is expected
     Type *default_type(Form *f) {
@@ -474,6 +474,7 @@ struct Compiler::Impl : MetaHost {
             return t_int(64, true);
         }
         if (f->kind == Form::Sym) return default_type(lookup_global(f->text)->form);
+        if (f->is_call("sizeof") || f->is_call("alignof")) return t_int(64, false);
         Type *t = t_int(32, true);
         for (size_t i = 1; i < f->size(); i++) {
             Type *u = default_type(f->at(i));
@@ -822,6 +823,12 @@ struct Compiler::Impl : MetaHost {
     Val arith(Form *f, Type *want) {
         std::string op = f->head();
         if (f->size() < 2) fatal(f->loc, "(%s ...) needs operands", op.c_str());
+        if ((op == "<<" || op == ">>") && f->size() == 3 && !overloads.count(op)) {
+            // as in C, the shift count may be any integer type
+            Val a = expr(f->at(1), want);
+            Val n = expr(f->at(2), untyped(f->at(2)) ? a.t : nullptr);
+            return binop(op, a, n, f->at(2)->loc);
+        }
         if (overloads.count(op) && !untyped(f)) {  // all-literal arithmetic is never overloaded
             std::vector<Opnd> xs = opnds(f);
             bool found;
@@ -1077,15 +1084,24 @@ struct Compiler::Impl : MetaHost {
         return {nullptr, t_void()};
     }
 
-    // (for (i start end [step]) body...): i from start while i < end
+    // (for (i [T] start end [step]) body...): i from start while i < end
     Val for_(Form *f) {
-        if (f->size() < 2 || !f->at(1)->is_list() || f->at(1)->size() < 3 || f->at(1)->size() > 4 || f->at(1)->at(0)->kind != Form::Sym)
-            fatal(f->loc, "(for (i start end [step]) body...)");
+        if (f->size() < 2 || !f->at(1)->is_list() || f->at(1)->size() < 3 || f->at(1)->size() > 5 || f->at(1)->at(0)->kind != Form::Sym)
+            fatal(f->loc, "(for (i [T] start end [step]) body...)");
         Form *spec = f->at(1);
-        // the counter's type: the first typed bound's (untyped bounds have no side effects)
+        Type *given = nullptr;
+        if (spec->size() >= 4 && is_type_form(spec->at(1))) {  // drop the type: (i T a b) → (i a b)
+            given = parse_type(spec->at(1));
+            std::vector<Form *> items = spec->items;
+            items.erase(items.begin() + 1);
+            spec = mk_list(spec->loc, items);
+        }
+        if (spec->size() > 4) fatal(f->loc, "(for (i [T] start end [step]) body...)");
+        // the counter's type: given, or the first typed bound's (untyped bounds have no side effects)
         Val start, end;
         Type *t;
-        if (!untyped(spec->at(1))) t = (start = expr(spec->at(1), nullptr)).t;
+        if (given) t = given;
+        else if (!untyped(spec->at(1))) t = (start = expr(spec->at(1), nullptr)).t;
         else if (!untyped(spec->at(2))) t = (end = expr(spec->at(2), nullptr)).t;
         else t = default_type(mk_list(spec->loc, {mk_sym(spec->loc, "+"), spec->at(1), spec->at(2)}));
         if (!t->is_int()) fatal(spec->loc, "for needs an integer counter, got %s", type_name(t).c_str());
@@ -1416,14 +1432,57 @@ struct Compiler::Impl : MetaHost {
         if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(def name T [init])");
         Type *t = parse_type(f->at(2));
         llvm::Constant *init = llvm::Constant::getNullValue(ll(t));
-        if (f->size() == 4) {
-            Val v = expr(f->at(3), t);
-            init = llvm::dyn_cast<llvm::Constant>(coerce(v, t, f->at(3)->loc, "initializer").v);
-            if (!init) fatal(f->at(3)->loc, "a global's initializer must be a constant");
-        }
+        if (f->size() == 4) init = constant(f->at(3), t);
         auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, f->at(1)->text);
         gv->setAlignment(llvm::Align(align_of(t)));
         define(f->at(1), Global{Global::Var, t, gv});
+    }
+
+    // a compile-time constant of type t: an expression that folds, or a
+    // (make T ...) of constants (arrays and structs, nested)
+    llvm::Constant *constant(Form *f, Type *t) {
+        f = expand(f);
+        if (f->is_call("make") && f->size() >= 2) {
+            Type *mt = parse_type(f->at(1));
+            if (mt != t) type_error(f->loc, "initializer", t, mt);
+            if (t->kind == Type::Array) {
+                if (f->size() - 2 > t->n) fatal(f->loc, "too many elements for %s", type_name(t).c_str());
+                std::vector<llvm::Constant *> es;
+                for (uint64_t i = 0; i < t->n; i++)
+                    es.push_back(i + 2 < f->size() ? constant(f->at(i + 2), t->elem) : llvm::Constant::getNullValue(ll(t->elem)));
+                return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(ll(t)), es);
+            }
+            if (t->kind == Type::Struct) {
+                // the parts of ll_struct, in the same order: fields by offset, padding as zero bytes
+                std::map<std::string, Form *> given;
+                for (size_t i = 2; i + 1 < f->size(); i += 2) given[f->at(i)->text.substr(1)] = f->at(i + 1);
+                if ((f->size() - 2) % 2) fatal(f->loc, "(make %s :field value ...)", type_name(t).c_str());
+                std::vector<const Field *> order;
+                for (auto &fd : t->st->fields) {
+                    if (fd.bit_width && given.count(fd.name)) fatal(f->loc, "bit fields in constant initializers are not supported");
+                    if (!fd.bit_width) order.push_back(&fd);
+                }
+                for (auto &g : given)
+                    if (!t->st->find(g.first)) fatal(g.second->loc, "%s has no field '%s'", type_name(t).c_str(), g.first.c_str());
+                std::stable_sort(order.begin(), order.end(), [](const Field *a, const Field *x) { return a->offset < x->offset; });
+                auto *st = llvm::cast<llvm::StructType>(ll(t));
+                std::vector<llvm::Constant *> parts;
+                uint64_t cur = 0;
+                for (const Field *fd : order) {
+                    if (fd->offset < cur) continue;
+                    if (fd->offset > cur) parts.push_back(llvm::Constant::getNullValue(st->getElementType(parts.size())));
+                    auto it = given.find(fd->name);
+                    parts.push_back(it != given.end() ? constant(it->second, fd->type) : llvm::Constant::getNullValue(ll(fd->type)));
+                    cur = fd->offset + size_of(fd->type);
+                }
+                if (parts.size() < st->getNumElements()) parts.push_back(llvm::Constant::getNullValue(st->getElementType(parts.size())));
+                return llvm::ConstantStruct::get(st, parts);
+            }
+        }
+        Val v = expr(f, t);
+        auto *k = llvm::dyn_cast<llvm::Constant>(coerce(v, t, f->loc, "initializer").v);
+        if (!k) fatal(f->loc, "a global's initializer must be a constant");
+        return k;
     }
 
     void declare_fn(Form *f) {

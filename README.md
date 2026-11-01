@@ -50,7 +50,7 @@ Expressions — everything is one; statements have type `void`:
 
     (do e...)  (let ((x init) (y T init) (z T)) body...)  (set place e)
     (if c a [b])  (when c body...)  (unless c body...)
-    (while c body...)  (for (i start end [step]) body...)  (break)  (continue)  (return [e])
+    (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
     (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...)  (or ...)  (not x)
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)

@@ -129,13 +129,16 @@ struct Compiler::Impl : MetaHost {
     };
     std::vector<std::string> c_mods;                // C modules, in the order they were imported
 
-    // the C modules built in: (import "libc"), (import "math")
+    // the C modules built in: (import "libc"), (import "posix") ...
     static const std::vector<std::string> *builtin_c(const std::string &name) {
         static const std::map<std::string, std::vector<std::string>> mods = {
-            {"libc", {"stdio.h", "stdlib.h", "string.h", "ctype.h", "errno.h", "limits.h", "stdint.h", "stdbool.h",
-                      "unistd.h", "fcntl.h", "poll.h", "signal.h", "time.h", "pthread.h", "sys/ioctl.h", "sys/mman.h",
-                      "sys/stat.h", "sys/types.h"}},
+            {"libc", {"stdio.h", "stdlib.h", "string.h", "ctype.h", "errno.h", "limits.h", "stdint.h", "stdbool.h"}},
             {"math", {"math.h"}},
+            {"posix", {"unistd.h", "fcntl.h", "sys/stat.h", "sys/types.h"}},
+            {"io", {"poll.h", "sys/ioctl.h", "sys/mman.h"}},
+            {"signal", {"signal.h"}},
+            {"time", {"time.h"}},
+            {"thread", {"pthread.h"}},
         };
         auto it = mods.find(name);
         return it == mods.end() ? nullptr : &it->second;
@@ -178,7 +181,10 @@ struct Compiler::Impl : MetaHost {
     }
 
     // the table key a symbol refers to, or "" if `has` knows none
-    std::string resolve(Form *sym, const std::function<bool(const std::string &)> &has) {
+    // (same(a, b): do two keys name one thing? C headers include each other, so
+    // two C modules can both declare size_t or NULL)
+    std::string resolve(Form *sym, const std::function<bool(const std::string &)> &has,
+                        const std::function<bool(const std::string &, const std::string &)> &same = nullptr) {
         const std::string &t = sym->text;
         ModInfo *m = mod_of(sym);
         size_t p = t.find("::");
@@ -204,7 +210,7 @@ struct Compiler::Impl : MetaHost {
                     if (!x) fatal(sym->loc, "using %s: no module '%s' is imported here", a.c_str(), a.c_str());
                     std::string k2 = x->name + "::" + t;
                     if (!has(k2) || priv.count(k2)) continue;
-                    if (!found.empty() && found != k2)
+                    if (!found.empty() && found != k2 && !(same && same(found, k2)))
                         fatal(sym->loc, "'%s' is in both %s and %s: write %s or %s", t.c_str(), found.substr(0, found.find("::")).c_str(),
                               x->name.c_str(), found.c_str(), k2.c_str());
                     found = k2;
@@ -222,8 +228,19 @@ struct Compiler::Impl : MetaHost {
         }
         return has(t) ? t : "";
     }
-    std::string global_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return c.globals_.count(k) != 0; }); }
-    std::string type_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return c.types_.count(k) != 0; }); }
+    std::string global_key(Form *sym) {
+        return resolve(sym, [&](const std::string &k) { return c.globals_.count(k) != 0; },
+                       [&](const std::string &a, const std::string &b) {
+                           Global &x = c.globals_[a], &y = c.globals_[b];
+                           if (!x.imported || !y.imported || x.kind != y.kind) return false;
+                           if (x.value || y.value) return x.value == y.value || (x.kind == Global::Const && x.type == y.type);
+                           return x.form && y.form && x.form->kind == y.form->kind && x.form->text == y.form->text;
+                       });
+    }
+    std::string type_key(Form *sym) {
+        return resolve(sym, [&](const std::string &k) { return c.types_.count(k) != 0; },
+                       [&](const std::string &a, const std::string &b) { return c.types_[a] == c.types_[b]; });
+    }
     std::string macro_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return meta.is_macro(k); }); }
 
     // every symbol of a file's forms belongs to its module

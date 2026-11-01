@@ -1,7 +1,9 @@
 ; Ask the i915 kernel driver which GPU this is: open a render node and
 ; issue DRM_IOCTL_I915_GETPARAM, all with types and numbers from the headers.
 (import "libc")
-(using libc)
+(import "posix")
+(import "io")
+(using libc posix io)
 (import-c "drm/i915_drm.h" :as drm)
 (using drm)
 

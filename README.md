@@ -3,13 +3,13 @@
 A compiled language with Lisp syntax and C's types. Programs are
 s-expressions; the compiler (C++, LLVM 18) type-checks them and emits
 optimised native code linked against libc. C headers are read through
-libclang into modules (`libc::printf`, `math::sinf`, or any header with
-`import-c`), so libc and kernel interfaces need no hand-written bindings.
+libclang into modules (`libc::printf`, `posix::open`, `math::sinf`, or any
+header with `import-c`), so libc and kernel interfaces need no hand-written bindings.
 
 ```lisp
-(import "libc")
+(import "libc") (import "posix") (import "io")
 (import-c "drm/i915_drm.h" :as i915)
-(using libc)
+(using libc posix io)
 
 (defn main () i32
   (let ((fd (open "/dev/dri/renderD128" O_RDWR))
@@ -39,7 +39,7 @@ Top level:
 
 | form | |
 |---|---|
-| `(import "mod" [:as m])` | a module: its names as `mod::name` (see below); `"libc"` and `"math"` are built in |
+| `(import "mod" [:as m])` | a module: its names as `mod::name` (see below); the C modules below are built in |
 | `(import-c "h" ... [:as m])` | C headers as a module `m` (by default the first header's name) |
 | `(using m ...)` | `m`'s names unqualified, in the whole file — or, inside a function, until the block ends |
 | `(include "file.lsp" ...)` | another file's forms as part of this module |
@@ -113,10 +113,21 @@ are chosen by type, so they apply wherever their types are used.
 
 C modules hold a header's functions, extern variables, structs (with
 clang's exact layout, bit fields included), typedefs, enum constants and
-constant `#define`s. `libc` covers stdio, stdlib, string, ctype, errno,
-limits, stdint, unistd, fcntl, poll, signal, time, pthread, sys/ioctl,
-sys/mman, sys/stat; `math` is math.h. C names keep their C symbols, so
-`libc::printf` links to `printf`.
+constant `#define`s. The built-in ones:
+
+| module | headers |
+|---|---|
+| `libc` | stdio, stdlib, string, ctype, errno, limits, stdint, stdbool |
+| `math` | math |
+| `posix` | unistd, fcntl, sys/stat, sys/types |
+| `io` | poll, sys/ioctl, sys/mman |
+| `signal` | signal |
+| `time` | time |
+| `thread` | pthread |
+
+C names keep their C symbols, so `libc::printf` links to `printf`. C headers
+include each other, so two C modules can declare the same thing (`size_t`,
+`NULL`); using both is fine, it is one name.
 
 ## Operators
 

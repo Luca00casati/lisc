@@ -1,0 +1,4 @@
+libc 5  math 2
+posix fd ok 1  io poll 1
+time ok 1  signal 2
+thread 42

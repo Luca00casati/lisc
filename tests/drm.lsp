@@ -1,6 +1,9 @@
 ; kernel uapi headers: struct layouts and ioctl numbers straight from
 ; <drm/drm_mode.h> and <drm/i915_drm.h> (values checked against a C program)
-(c-include "stdio.h" "drm/drm.h" "drm/drm_mode.h" "drm/i915_drm.h")
+(import "libc")
+(using libc)
+(import-c "drm/drm.h" "drm/drm_mode.h" "drm/i915_drm.h" :as uapi)
+(using uapi)
 
 (defn main () i32
   (printf "%lx %lx %lx\n" DRM_IOCTL_MODE_GETRESOURCES DRM_IOCTL_MODE_SETCRTC DRM_IOCTL_MODE_GETCONNECTOR)

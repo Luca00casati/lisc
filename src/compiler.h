@@ -39,14 +39,17 @@ public:
     void define_const(const std::string &name, const std::string &value);
 
     // used by the C header importer (cimport.cpp)
+    // (names are put under c_prefix: the C module being imported, e.g. "libc::")
+    std::string c_prefix;
     void add_type(const std::string &name, Type *t);
-    bool has_type(const std::string &name) const { return types_.count(name) != 0; }
-    bool has_global(const std::string &name) const { return globals_.count(name) != 0; }
+    bool has_type(const std::string &name) const { return types_.count(c_prefix + name) != 0; }
+    bool has_global(const std::string &name) const { return globals_.count(c_prefix + name) != 0; }
     void add_extern_fn(const std::string &name, Type *fn);
     void add_extern_var(const std::string &name, Type *t);
     void add_const_int(const std::string &name, Type *t, uint64_t v);
     void add_const_float(const std::string &name, Type *t, double v);
     void add_const_str(const std::string &name, const std::string &s);
+    void put_c(const std::string &name, Global g);
 
 private:
     struct Impl;
@@ -58,5 +61,5 @@ private:
     friend struct Impl;
 };
 
-// (c-include "stdio.h" ...): make the C declarations of these headers usable
+// the C declarations of these headers, put under c.c_prefix (a C module)
 void c_include(Compiler &c, const std::vector<std::string> &headers, Loc at);

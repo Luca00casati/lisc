@@ -1,5 +1,6 @@
 ; integer conveniences: typed for counters, sizeof as an untyped constant, mixed shift counts
-(c-include "stdio.h" "stdlib.h")
+(import "libc")
+(using libc)
 (defn main () i32
   (let ((n u32 5) (sum u32 0) (buf (cast (ptr u32) (malloc (* (sizeof u32) (cast u64 n))))))
     (for (i u32 0 n) (set (aref buf i) (* i i)))

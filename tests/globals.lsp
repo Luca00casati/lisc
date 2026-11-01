@@ -1,5 +1,6 @@
 ; constant initializers for globals: nested arrays and structs
-(c-include "stdio.h")
+(import "libc")
+(using libc)
 (struct pt (x f32) (y f32) (tag u8))
 (def table (array (array i32 3) 2) (make (array (array i32 3) 2) (make (array i32 3) 1 2 3) (make (array i32 3) 4 5)))
 (def origin pt (make pt :y 2.5 :tag 7))

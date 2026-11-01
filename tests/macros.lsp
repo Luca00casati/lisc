@@ -1,5 +1,6 @@
 ; macros: a compile-time Lisp over the program's forms, with access to types
-(c-include "stdio.h")
+(import "libc")
+(using libc)
 
 (defmacro swap! (a b)                    ; gensym: a temporary that cannot clash
   (let ((tmp (gensym "tmp")))

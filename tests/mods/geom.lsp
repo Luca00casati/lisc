@@ -1,5 +1,6 @@
 ; a module: a struct, an operator, functions, a macro and private helpers
-(c-include "math.h")
+(import "math")
+(using math)
 
 (struct v2 (x f32) (y f32))
 (defop + ((a v2) (b v2)) v2 (make v2 :x (+ a.x b.x) :y (+ a.y b.y)))

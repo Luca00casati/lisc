@@ -1,5 +1,6 @@
 ; lossless integer widening is implicit; narrowing and sign changes need a cast
-(c-include "stdio.h")
+(import "libc")
+(using libc)
 (defn take64 ((x u64)) u64 (* x 2))
 (defn main () i32
   (let ((a u8 200) (b u16 60000) (c u32 4000000000) (d i32 -5) (f f32 1.5))

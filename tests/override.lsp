@@ -1,6 +1,9 @@
 ; a program's own definition replaces a C import of the same name, and
 ; defop prefers the parameter kind of a literal (int or float)
-(c-include "stdio.h" "math.h")
+(import "libc")
+(using libc)
+(import "math")
+(using math)
 (struct box (v f32) (n u32))
 (defn floor ((b box)) box (make box :v (floorf b.v) :n b.n))   ; replaces math.h's floor
 (defop * ((a box) (k f32)) box (make box :v (* a.v k) :n a.n))

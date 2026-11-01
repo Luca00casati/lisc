@@ -2,17 +2,20 @@
 
 A compiled language with Lisp syntax and C's types. Programs are
 s-expressions; the compiler (C++, LLVM 18) type-checks them and emits
-optimised native code linked against libc. C headers are imported directly
-through libclang, so libc and kernel interfaces need no hand-written bindings.
+optimised native code linked against libc. C headers are read through
+libclang into modules (`libc::printf`, `math::sinf`, or any header with
+`import-c`), so libc and kernel interfaces need no hand-written bindings.
 
 ```lisp
-(c-include "stdio.h" "fcntl.h" "sys/ioctl.h" "drm/i915_drm.h")
+(import "libc")
+(import-c "drm/i915_drm.h" :as i915)
+(using libc)
 
 (defn main () i32
   (let ((fd (open "/dev/dri/renderD128" O_RDWR))
         (id i32 0)
-        (gp (make drm_i915_getparam :param I915_PARAM_CHIPSET_ID :value (addr id))))
-    (when (= (ioctl fd DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
+        (gp (make i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID :value (addr id))))
+    (when (= (ioctl fd i915::DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
       (printf "i915 chip id 0x%04x\n" id)))
   0)
 ```
@@ -23,22 +26,23 @@ through libclang, so libc and kernel interfaces need no hand-written bindings.
     make test
     ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 
-Extra `.c`/`.o` inputs are linked in. `(c-include ...)` searches the source
-file's directory and `-I` directories, then the system ones.
+Extra `.c`/`.o` inputs are linked in. `import-c` searches the source file's
+directory and `-I` directories, then the system ones.
 
 ## Language
 
 Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void`,
 `(ptr T)`, `(array T N)`, `(fn (A B ...) R)`, struct/union names, and every
-typedef/struct a `c-include` brings in.
+typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
 Top level:
 
 | form | |
 |---|---|
-| `(import "mod" [:as m] [:all])` | a module: its names as `mod::name` (see below) |
+| `(import "mod" [:as m])` | a module: its names as `mod::name` (see below); `"libc"` and `"math"` are built in |
+| `(import-c "h" ... [:as m])` | C headers as a module `m` (by default the first header's name) |
+| `(using m ...)` | `m`'s names unqualified, in the whole file — or, inside a function, until the block ends |
 | `(include "file.lsp" ...)` | another file's forms as part of this module |
-| `(c-include "h" ...)` | functions, extern variables, structs (clang's exact layout), typedefs, enum constants and constant `#define`s of these headers |
 | `(struct name (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
@@ -90,17 +94,29 @@ relative to the importing file, `.lsp` optional) makes its names reachable as
 
     (import "scene")             ; scene::build, scene::camera ...
     (import "rt-kernel" :as rt)  ; rt::build
-    (import "vec" :all)          ; also dot, cross ... unqualified
+    (import "vec")
+    (using vec)                  ; also dot, cross ... unqualified
 
-A name resolves to the module's own definition first, then to the `:all`
-imports (a name two of them define must be written qualified), then to C
-imports and `-D` constants, which are global as in C. Definitions marked
+    (defn hyp ((a f32) (b f32)) f32
+      (using math)               ; just here: sqrtf
+      (sqrtf (+ (* a a) (* b b))))
+
+A name resolves to the module's own definition first, then to the modules in
+use (the innermost block's, then the file's; a name two of them define must
+be written qualified), then to `-D` constants. Definitions marked
 private (`defn-`, `(private ...)` ...) are unreachable from other modules.
 
 Macros are hygienic across modules too: the symbols of a macro's template
 resolve in the macro's own module, so `(geom::doubled v)` works anywhere
 even though its expansion calls geom's private helpers. Operators (`defop`)
 are chosen by type, so they apply wherever their types are used.
+
+C modules hold a header's functions, extern variables, structs (with
+clang's exact layout, bit fields included), typedefs, enum constants and
+constant `#define`s. `libc` covers stdio, stdlib, string, ctype, errno,
+limits, stdint, unistd, fcntl, poll, signal, time, pthread, sys/ioctl,
+sys/mman, sys/stat; `math` is math.h. C names keep their C symbols, so
+`libc::printf` links to `printf`.
 
 ## Operators
 
@@ -154,6 +170,6 @@ with `,'it`. `gensym` still exists for names a macro builds itself.
 
 ## Status
 
-Done: reader, typed core, LLVM code generation and optimisation, C header
-import, the C calling convention, bit fields, macros with type queries, and
+Done: reader, typed core, LLVM code generation and optimisation, modules
+(with C headers as modules), the C calling convention, bit fields, macros with type queries, and
 operator overloading. Next: porting the teapot ray tracer to lisc.

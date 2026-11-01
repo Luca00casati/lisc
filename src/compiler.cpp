@@ -97,7 +97,13 @@ struct Compiler::Impl : MetaHost {
     Type *fn_ret = nullptr;
     Type *cur_ft = nullptr;            // the current function's type
     llvm::Value *cur_sret = nullptr;   // where a struct result returned in memory goes
-    std::vector<std::map<std::string, Val>> scopes;  // locals: name → address
+    // a block's locals (name → address) and the modules it is using
+    struct Scope {
+        std::map<std::string, Val> vars;
+        std::vector<std::string> usings;
+        Val &operator[](const std::string &k) { return vars[k]; }
+    };
+    std::vector<Scope> scopes;
     std::vector<Loop> loops;
     std::map<StructInfo *, bool> laying_out;          // cycle guard
     Meta meta{*this};
@@ -111,14 +117,51 @@ struct Compiler::Impl : MetaHost {
     // the tables (globals, types, macros); C imports and -D constants keep
     // their plain names. A symbol is resolved in the module it was read from
     // (a macro template's symbols in the macro's module):
-    //   name      the module's own name, else from an (import ... :all), else a plain global
+    //   name      the module's own name, else from a module it is using (in this
+    //             block, then in the file), else a plain global (-D constants)
     //   m::name   from the module imported as m (one level: no m::n::x); not if private
 
     struct ModInfo {
         std::string name, path;
         std::map<std::string, std::string> alias;  // import alias → module name
-        std::vector<std::string> all;               // modules imported with :all
+        std::vector<std::string> usings;            // (using m) at the top level: aliases
+        std::vector<std::string> headers;           // a C module: its headers (read in pass 0)
     };
+    std::vector<std::string> c_mods;                // C modules, in the order they were imported
+
+    // the C modules built in: (import "libc"), (import "math")
+    static const std::vector<std::string> *builtin_c(const std::string &name) {
+        static const std::map<std::string, std::vector<std::string>> mods = {
+            {"libc", {"stdio.h", "stdlib.h", "string.h", "ctype.h", "errno.h", "limits.h", "stdint.h", "stdbool.h",
+                      "unistd.h", "fcntl.h", "poll.h", "signal.h", "time.h", "pthread.h", "sys/ioctl.h", "sys/mman.h",
+                      "sys/stat.h", "sys/types.h"}},
+            {"math", {"math.h"}},
+        };
+        auto it = mods.find(name);
+        return it == mods.end() ? nullptr : &it->second;
+    }
+
+    ModInfo *c_module(const std::string &name, const std::vector<std::string> &headers, Loc at) {
+        auto it = mods.find(name);
+        if (it != mods.end()) {
+            if (it->second.path != "<c>") fatal(at, "'%s' is already the name of module %s: give the C module another (:as name)", name.c_str(), it->second.path.c_str());
+            if (it->second.headers != headers) fatal(at, "C module %s is already imported with other headers", name.c_str());
+            return &it->second;
+        }
+        ModInfo &m = mods[name];
+        m.name = name;
+        m.path = "<c>";
+        m.headers = headers;
+        c_mods.push_back(name);
+        return &m;
+    }
+
+    // the module an alias names, as seen from module m
+    ModInfo *aliased(ModInfo *m, const std::string &a) {
+        auto it = m->alias.find(a);
+        if (it != m->alias.end()) return &mods[it->second];
+        return a == m->name ? m : nullptr;
+    }
     std::map<std::string, ModInfo> mods;            // by name
     std::set<std::string> priv;                     // qualified names defined private
     std::set<Form *> priv_names;                    // name symbols of private definitions
@@ -142,13 +185,9 @@ struct Compiler::Impl : MetaHost {
         if (p != std::string::npos) {
             std::string a = t.substr(0, p), n = t.substr(p + 2);
             if (a.empty() || n.empty() || n.find("::") != std::string::npos) fatal(sym->loc, "'%s': a name has at most one module part", t.c_str());
-            ModInfo *target = nullptr;
-            if (m) {
-                auto it = m->alias.find(a);
-                if (it != m->alias.end()) target = &mods[it->second];
-                else if (a == m->name) target = m;
-            }
+            ModInfo *target = m ? aliased(m, a) : nullptr;
             if (!target) fatal(sym->loc, "no module '%s' is imported here", a.c_str());
+            (void)0;
             std::string k = target->name + "::" + n;
             if (!has(k)) return "";
             if (target != m && priv.count(k)) fatal(sym->loc, "'%s' is private to module %s", n.c_str(), target->name.c_str());
@@ -157,16 +196,29 @@ struct Compiler::Impl : MetaHost {
         if (m) {
             std::string k = m->name + "::" + t;
             if (has(k)) return k;
-            std::string found;
-            for (auto &x : m->all) {
-                std::string k2 = x + "::" + t;
-                if (!has(k2) || priv.count(k2)) continue;
-                if (!found.empty() && found != k2)
-                    fatal(sym->loc, "'%s' is in both %s and %s: write %s or %s", t.c_str(), found.substr(0, found.find("::")).c_str(),
-                          x.c_str(), found.c_str(), k2.c_str());
-                found = k2;
-            }
-            if (!found.empty()) return found;
+            // a name from the modules in use: the innermost block's first, then the file's
+            auto look = [&](const std::vector<std::string> &usings) -> std::string {
+                std::string found;
+                for (auto &a : usings) {
+                    ModInfo *x = aliased(m, a);
+                    if (!x) fatal(sym->loc, "using %s: no module '%s' is imported here", a.c_str(), a.c_str());
+                    std::string k2 = x->name + "::" + t;
+                    if (!has(k2) || priv.count(k2)) continue;
+                    if (!found.empty() && found != k2)
+                        fatal(sym->loc, "'%s' is in both %s and %s: write %s or %s", t.c_str(), found.substr(0, found.find("::")).c_str(),
+                              x->name.c_str(), found.c_str(), k2.c_str());
+                    found = k2;
+                }
+                return found;
+            };
+            if (m == cur)  // (a macro template's symbols are not affected by the blocks they land in)
+                for (auto sc = scopes.rbegin(); sc != scopes.rend(); ++sc)
+                    if (!sc->usings.empty()) {
+                        std::string f = look(sc->usings);
+                        if (!f.empty()) return f;
+                    }
+            std::string f = look(m->usings);
+            if (!f.empty()) return f;
         }
         return has(t) ? t : "";
     }
@@ -209,20 +261,51 @@ struct Compiler::Impl : MetaHost {
     void add_forms(const std::vector<Form *> &fs, ModInfo *m) {
         for (Form *f : fs) {
             if (f->is_call("import")) {
-                // (import "path" [:as alias] [:all]); the path is relative to this file, .lsp optional
-                if (f->size() < 2 || f->at(1)->kind != Form::Str) fatal(f->loc, "(import \"module\" [:as name] [:all])");
-                std::string path = near(f, f->at(1)->text);
-                if (path.size() < 4 || path.compare(path.size() - 4, 4, ".lsp") != 0) path += ".lsp";
+                // (import "path" [:as alias]); the path is relative to this file, .lsp optional;
+                // "libc" and "math" are the C modules built in
+                if (f->size() < 2 || f->at(1)->kind != Form::Str) fatal(f->loc, "(import \"module\" [:as name])");
                 std::string as;
-                bool all = false;
                 for (size_t i = 2; i < f->size(); i++) {
-                    if (f->at(i)->is_sym(":all")) all = true;
-                    else if (f->at(i)->is_sym(":as") && i + 1 < f->size() && f->at(i + 1)->kind == Form::Sym) as = f->at(++i)->text;
-                    else fatal(f->at(i)->loc, "(import \"module\" [:as name] [:all])");
+                    if (f->at(i)->is_sym(":as") && i + 1 < f->size() && f->at(i + 1)->kind == Form::Sym) as = f->at(++i)->text;
+                    else if (f->at(i)->is_sym(":all")) {
+                        std::string n = f->at(1)->text;
+                        n = n.substr(n.find('/') == std::string::npos ? 0 : n.rfind('/') + 1);
+                        fatal(f->at(i)->loc, ":all is gone: import it, then (using %s)", n.c_str());
+                    }
+                    else fatal(f->at(i)->loc, "(import \"module\" [:as name])");
                 }
-                ModInfo *t = load_module(path, f->loc);
+                ModInfo *t;
+                if (const std::vector<std::string> *hs = builtin_c(f->at(1)->text)) t = c_module(f->at(1)->text, *hs, f->loc);
+                else {
+                    std::string path = near(f, f->at(1)->text);
+                    if (path.size() < 4 || path.compare(path.size() - 4, 4, ".lsp") != 0) path += ".lsp";
+                    t = load_module(path, f->loc);
+                }
                 m->alias[as.empty() ? t->name : as] = t->name;
-                if (all) m->all.push_back(t->name);
+            } else if (f->is_call("import-c")) {
+                // (import-c "header.h" ... [:as name]): C declarations as a module, named
+                // after the first header unless given
+                std::vector<std::string> hs;
+                std::string as;
+                for (size_t i = 1; i < f->size(); i++) {
+                    if (f->at(i)->kind == Form::Str) hs.push_back(f->at(i)->text);
+                    else if (f->at(i)->is_sym(":as") && i + 1 < f->size() && f->at(i + 1)->kind == Form::Sym) as = f->at(++i)->text;
+                    else fatal(f->at(i)->loc, "(import-c \"header.h\" ... [:as name])");
+                }
+                if (hs.empty()) fatal(f->loc, "(import-c \"header.h\" ... [:as name])");
+                if (as.empty()) {
+                    as = hs[0].substr(hs[0].find('/') == std::string::npos ? 0 : hs[0].rfind('/') + 1);
+                    if (as.size() > 2 && as.compare(as.size() - 2, 2, ".h") == 0) as.resize(as.size() - 2);
+                }
+                m->alias[as] = c_module(as, hs, f->loc)->name;
+            } else if (f->is_call("using")) {
+                // (using m ...) at the top level: m's names unqualified in the whole file
+                for (size_t i = 1; i < f->size(); i++) {
+                    if (f->at(i)->kind != Form::Sym) fatal(f->at(i)->loc, "(using module ...)");
+                    m->usings.push_back(f->at(i)->text);
+                }
+            } else if (f->is_call("c-include")) {
+                fatal(f->loc, "c-include is gone: (import \"libc\"), (import \"math\") or (import-c \"header.h\" :as name)");
             } else if (f->is_call("include")) {
                 // (include "file.lsp" ...): that file's forms as part of this module
                 for (size_t i = 1; i < f->size(); i++) {
@@ -595,8 +678,8 @@ struct Compiler::Impl : MetaHost {
 
     Val lookup_local(const std::string &n) {
         for (auto s = scopes.rbegin(); s != scopes.rend(); ++s) {
-            auto it = s->find(n);
-            if (it != s->end()) return it->second;
+            auto it = s->vars.find(n);
+            if (it != s->vars.end()) return it->second;
         }
         return {};
     }
@@ -904,6 +987,15 @@ struct Compiler::Impl : MetaHost {
             return {llvm::ConstantInt::get(ll(rt), hs == "sizeof" ? size_of(t) : align_of(t)), rt};
         }
         if (hs == "make") return make(f);
+        if (hs == "using") {  // (using m ...) in a block: m's names unqualified until the block ends
+            if (scopes.empty()) fatal(f->loc, "using outside a function");
+            for (size_t i = 1; i < f->size(); i++) {
+                if (f->at(i)->kind != Form::Sym) fatal(f->at(i)->loc, "(using module ...)");
+                if (!aliased(cur, f->at(i)->text)) fatal(f->at(i)->loc, "no module '%s' is imported here", f->at(i)->text.c_str());
+                scopes.back().usings.push_back(f->at(i)->text);
+            }
+            return {nullptr, t_void()};
+        }
         if (hs == "defined") {  // (defined NAME): is there a global NAME (e.g. from -D)?
             if (f->size() != 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(defined NAME)");
             return {b.getInt1(!global_key(f->at(1)).empty()), t_bool()};
@@ -1514,17 +1606,12 @@ struct Compiler::Impl : MetaHost {
                 note_private(f->at(1), k);
             } else all.push_back({f, cur});
         });
-        // pass 0: C headers and hand-written externs
-        each(all, [&](Form *f) {
-            if (f->is_call("c-include")) {
-                std::vector<std::string> hs;
-                for (size_t i = 1; i < f->size(); i++) {
-                    if (f->at(i)->kind != Form::Str) fatal(f->at(i)->loc, "header names are strings");
-                    hs.push_back(f->at(i)->text);
-                }
-                c_include(c, hs, f->loc);
-            }
-        });
+        // pass 0: the C modules' headers
+        for (auto &n : c_mods) {
+            c.c_prefix = n + "::";
+            c_include(c, mods[n].headers, files[0]->loc);
+        }
+        c.c_prefix.clear();
         // pass 1: struct names, so structs can refer to each other
         std::vector<std::pair<Form *, StructInfo *>> structs;
         std::vector<ModInfo *> struct_mods;
@@ -1547,7 +1634,7 @@ struct Compiler::Impl : MetaHost {
         // structs they produce are added the same way
         std::vector<std::pair<Form *, ModInfo *>> expanded;
         each(all, [&](Form *f) {
-            if (f->is_call("struct") || f->is_call("union") || f->is_call("c-include")) {
+            if (f->is_call("struct") || f->is_call("union")) {
                 expanded.push_back({f, cur});
                 return;
             }
@@ -1607,8 +1694,10 @@ struct Compiler::Impl : MetaHost {
             } else if (!strcmp(h, "extern")) {
                 if (f->size() != 4 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(extern name (T ...) R)");
                 Type *ft = parse_type(mk_list(f->loc, {mk_sym(f->loc, "fn"), f->at(2), f->at(3)}));
+                c.c_prefix = cur->name + "::";  // module::name, the C symbol name
                 c.add_extern_fn(f->at(1)->text, ft);
-            } else if (strcmp(h, "c-include") && strcmp(h, "struct") && strcmp(h, "union")) {
+                c.c_prefix.clear();
+            } else if (strcmp(h, "struct") && strcmp(h, "union")) {
                 fatal(f->loc, "unknown top-level form %s", show(f).c_str());
             }
         });
@@ -1798,7 +1887,7 @@ void Compiler::compile(const std::vector<Form *> &forms) {
     }
 }
 
-void Compiler::add_type(const std::string &name, Type *t) { types_[name] = t; }
+void Compiler::add_type(const std::string &name, Type *t) { types_[c_prefix + name] = t; }
 
 void Compiler::define_const(const std::string &name, const std::string &value) {
     char *end;
@@ -1810,51 +1899,54 @@ void Compiler::define_const(const std::string &name, const std::string &value) {
     globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
 }
 
+// The C importer's declarations go into the module being imported: the key
+// is c_prefix + name (libc::printf), the symbol keeps the C name (printf).
+void Compiler::put_c(const std::string &name, Global g) {
+    g.imported = true;
+    globals_[c_prefix + name] = g;
+}
+
 void Compiler::add_extern_fn(const std::string &name, Type *fn) {
-    if (globals_.count(name)) return;
+    if (has_global(name)) return;
     llvm::Function *f = mod_->getFunction(name);
     if (!f) {
         f = llvm::Function::Create(llvm::cast<llvm::FunctionType>(impl_->ll(fn)), llvm::GlobalValue::ExternalLinkage, name, *mod_);
         f->setAttributes(impl_->fn_abi(fn).attrs);
     }
-    globals_[name] = Global{Global::Func, fn, f};
-    globals_[name].imported = true;
+    put_c(name, Global{Global::Func, fn, f});
 }
 
 void Compiler::add_extern_var(const std::string &name, Type *t) {
-    if (globals_.count(name)) return;
-    auto *gv = new llvm::GlobalVariable(*mod_, impl_->ll(t), false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
-    globals_[name] = Global{Global::Var, t, gv};
-    globals_[name].imported = true;
+    if (has_global(name)) return;
+    llvm::GlobalVariable *gv = mod_->getGlobalVariable(name);
+    if (!gv) gv = new llvm::GlobalVariable(*mod_, impl_->ll(t), false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
+    put_c(name, Global{Global::Var, t, gv});
 }
 
 // C's #define and enum constants are untyped, as in C: they take the type
 // they meet, like a literal written in their place
 void Compiler::add_const_int(const std::string &name, Type *t, uint64_t v) {
-    if (globals_.count(name)) return;
-    Form *lit = new Form{Form::Int, {"<c-include>", 0, 0}};
+    if (has_global(name)) return;
+    Form *lit = new Form{Form::Int, {"<c>", 0, 0}};
     lit->ival = v;
     lit->text = t->sign ? std::to_string((int64_t)v) : std::to_string(v);
-    globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
-    globals_[name].imported = true;
+    put_c(name, Global{Global::Const, nullptr, nullptr, lit});
 }
 
 void Compiler::add_const_float(const std::string &name, Type *t, double v) {
-    if (globals_.count(name)) return;
-    Form *lit = new Form{Form::Float, {"<c-include>", 0, 0}};
+    if (has_global(name)) return;
+    Form *lit = new Form{Form::Float, {"<c>", 0, 0}};
     char buf[64];
     snprintf(buf, sizeof buf, "%.17g", v);
     lit->text = buf;
     if (lit->text.find_first_of(".eEn") == std::string::npos) lit->text += ".0";
     (void)t;
-    globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
-    globals_[name].imported = true;
+    put_c(name, Global{Global::Const, nullptr, nullptr, lit});
 }
 
 void Compiler::add_const_str(const std::string &name, const std::string &s) {
-    if (globals_.count(name)) return;
+    if (has_global(name)) return;
     llvm::Constant *init = llvm::ConstantDataArray::getString(*ctx_, s);
     auto *gv = new llvm::GlobalVariable(*mod_, init->getType(), true, llvm::GlobalValue::PrivateLinkage, init, name);
-    globals_[name] = Global{Global::Const, t_ptr(t_int(8, true)), gv};
-    globals_[name].imported = true;
+    put_c(name, Global{Global::Const, t_ptr(t_int(8, true)), gv});
 }

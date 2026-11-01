@@ -1,5 +1,6 @@
 ; operator overloading by static type, and a macro that writes defops for any struct
-(c-include "stdio.h")
+(import "libc")
+(using libc)
 
 (struct v3 (x f32) (y f32) (z f32))
 (struct rgb (r f32) (g f32) (b f32))

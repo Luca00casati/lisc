@@ -1,5 +1,8 @@
 ; C headers through libclang: functions, types, struct layouts, enums, #defines
-(c-include "stdio.h" "stdlib.h" "string.h" "math.h" "limits.h" "time.h" "stdint.h")
+(import "libc")
+(using libc)
+(import "math")
+(using math)
 
 (defn main () i32
   ; printf's real declaration: variadic, const char *

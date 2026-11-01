@@ -1,6 +1,9 @@
 ; Ask the i915 kernel driver which GPU this is: open a render node and
 ; issue DRM_IOCTL_I915_GETPARAM, all with types and numbers from the headers.
-(c-include "stdio.h" "fcntl.h" "unistd.h" "sys/ioctl.h" "drm/i915_drm.h")
+(import "libc")
+(using libc)
+(import-c "drm/i915_drm.h" :as drm)
+(using drm)
 
 (defn main () i32
   (let ((fd (open "/dev/dri/renderD128" O_RDWR)))

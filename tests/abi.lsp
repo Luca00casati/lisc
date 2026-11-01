@@ -1,5 +1,8 @@
 ; structs by value across the C calling convention, both ways, and bit fields
-(c-include "stdio.h" "abi.h")
+(import "libc")
+(using libc)
+(import-c "abi.h" :as cabi)
+(using cabi)
 
 ; a lisc struct laid out like C's struct bf, bit fields included
 (struct mybf (a u32 :bits 3) (b u32 :bits 5) (c i32 :bits 7) (d u32 :bits 17) (e bool :bits 1) (tail i8))

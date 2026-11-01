@@ -1,5 +1,6 @@
 ; hygienic macros: a template's names never clash with the use site's
-(c-include "stdio.h")
+(import "libc")
+(using libc)
 
 (const scale 10)
 

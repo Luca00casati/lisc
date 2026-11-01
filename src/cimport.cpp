@@ -1,5 +1,6 @@
-// cimport.cpp — (c-include "h" ...): C declarations from real headers, read
-// with libclang, become lisc declarations:
+// cimport.cpp — C modules ((import "libc"), (import-c "h" ...)): the
+// declarations of real headers, read with libclang, become lisc declarations
+// under the module's name:
 //
 //   functions with external linkage  → extern functions
 //   extern variables                 → global variables (stderr, environ, ...)
@@ -30,10 +31,16 @@ std::string str(CXString s) {
 
 const char *const MACRO_PREFIX = "__lisc_macro_";
 
+// one StructInfo per C struct, however many C modules declare it
+std::map<std::string, StructInfo *> &all_records() {
+    static std::map<std::string, StructInfo *> m;
+    return m;
+}
+
 struct Importer {
     Compiler &c;
     Loc at;
-    std::map<std::string, StructInfo *> records;  // by USR
+    std::map<std::string, StructInfo *> &records = all_records();  // by USR, shared by every C module
     std::vector<std::string> macros;
 
     Type *conv(CXType t) {
@@ -248,7 +255,7 @@ void c_include(Compiler &c, const std::vector<std::string> &headers, Loc at) {
         }
         clang_disposeDiagnostic(d);
     }
-    Importer im{c, at};
+    Importer im{c, at, all_records()};
     clang_visitChildren(clang_getTranslationUnitCursor(tu), [](CXCursor cur, CXCursor, CXClientData d) {
         ((Importer *)d)->top(cur);
         return CXChildVisit_Continue;

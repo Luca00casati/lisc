@@ -22,6 +22,7 @@ struct Global {
     llvm::Value *value = nullptr;   // Function, GlobalVariable, or Constant
     Form *form = nullptr;           // Const without a type: its expression, compiled at each use
     Form *def = nullptr;            // Func: the defn form (null for externs)
+    bool imported = false;          // from (c-include ...): a definition of the program replaces it
 };
 
 class Compiler {

@@ -459,6 +459,7 @@ struct Compiler::Impl : MetaHost {
                 if (!untyped(f->at(i))) return false;
             return true;
         }
+        if (f->is_call("if") && f->size() == 4) return untyped(f->at(2)) && untyped(f->at(3));  // (if c 1.0 -1.0)
         return f->is_call("sizeof") || f->is_call("alignof");  // constants, like literals
     }
     // the type an untyped form gets when nothing is expected
@@ -475,6 +476,7 @@ struct Compiler::Impl : MetaHost {
         }
         if (f->kind == Form::Sym) return default_type(lookup_global(f->text)->form);
         if (f->is_call("sizeof") || f->is_call("alignof")) return t_int(64, false);
+        if (f->is_call("if")) return default_type(mk_list(f->loc, {mk_sym(f->loc, "+"), f->at(2), f->at(3)}));
         Type *t = t_int(32, true);
         for (size_t i = 1; i < f->size(); i++) {
             Type *u = default_type(f->at(i));
@@ -800,6 +802,17 @@ struct Compiler::Impl : MetaHost {
         }
         *found = !match.empty();
         if (match.empty()) return {};
+        if (match.size() > 1) {
+            // a float literal prefers a float parameter, an integer literal an integer one
+            std::vector<Global *> pref;
+            for (Global *g : match) {
+                bool ok = true;
+                for (size_t i = 0; i < xs.size() && ok; i++)
+                    if (!xs[i].v.v) ok = default_type(xs[i].f)->is_float() == g->type->params[i]->is_float();
+                if (ok) pref.push_back(g);
+            }
+            if (!pref.empty()) match = pref;
+        }
         if (match.size() > 1) fatal(at, "(%s ...) matches %zu definitions; give the literals a type", op.c_str(), match.size());
         Global *g = match[0];
         std::vector<Val> args;
@@ -1424,7 +1437,8 @@ struct Compiler::Impl : MetaHost {
     }
 
     void define(Form *name, Global g) {
-        if (c.globals_.count(name->text)) fatal(name->loc, "'%s' is already defined", name->text.c_str());
+        auto it = c.globals_.find(name->text);
+        if (it != c.globals_.end() && !it->second.imported) fatal(name->loc, "'%s' is already defined", name->text.c_str());
         c.globals_[name->text] = g;
     }
 
@@ -1495,7 +1509,8 @@ struct Compiler::Impl : MetaHost {
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
         const std::string &name = f->at(1)->text;
         auto link = name == "main" ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
-        llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
+        // (a name taken by a C import gets a suffix in the module; the import stays as it was)
+        llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, mod.getNamedValue(name) ? name + ".lisc" : name, mod);
         fn0->setAttributes(fn_abi(ft).attrs);
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }
@@ -1573,22 +1588,26 @@ void Compiler::add_extern_fn(const std::string &name, Type *fn) {
         f->setAttributes(impl_->fn_abi(fn).attrs);
     }
     globals_[name] = Global{Global::Func, fn, f};
+    globals_[name].imported = true;
 }
 
 void Compiler::add_extern_var(const std::string &name, Type *t) {
     if (globals_.count(name)) return;
     auto *gv = new llvm::GlobalVariable(*mod_, impl_->ll(t), false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
     globals_[name] = Global{Global::Var, t, gv};
+    globals_[name].imported = true;
 }
 
 void Compiler::add_const_int(const std::string &name, Type *t, uint64_t v) {
     if (globals_.count(name)) return;
     globals_[name] = Global{Global::Const, t, llvm::ConstantInt::get(impl_->ll(t), v)};
+    globals_[name].imported = true;
 }
 
 void Compiler::add_const_float(const std::string &name, Type *t, double v) {
     if (globals_.count(name)) return;
     globals_[name] = Global{Global::Const, t, llvm::ConstantFP::get(impl_->ll(t), v)};
+    globals_[name].imported = true;
 }
 
 void Compiler::add_const_str(const std::string &name, const std::string &s) {
@@ -1596,4 +1615,5 @@ void Compiler::add_const_str(const std::string &name, const std::string &s) {
     llvm::Constant *init = llvm::ConstantDataArray::getString(*ctx_, s);
     auto *gv = new llvm::GlobalVariable(*mod_, init->getType(), true, llvm::GlobalValue::PrivateLinkage, init, name);
     globals_[name] = Global{Global::Const, t_ptr(t_int(8, true)), gv};
+    globals_[name].imported = true;
 }

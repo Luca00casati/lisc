@@ -17,6 +17,11 @@
 //   (. x field ...)  (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)
 //   (sizeof T)  (alignof T)  (make T [:field e ...] | [e ...])
 //
+// Everything starts as zero: let bindings without a value, globals, the
+// fields and elements make does not set. `null` is the zero value of the type
+// wanted (the null pointer, 0, 0.0, false, an all-zero struct); `undefined`
+// opts out: (let ((buf (array u8 4096) undefined)) ...) leaves memory as it is.
+//
 // Literals are untyped until used: 1.5 becomes an f32 where an f32 is
 // expected (rounded straight from the decimal text, like C's 1.5f), and an
 // f64 otherwise. Mixing typed operands of different types is an error; use
@@ -918,9 +923,13 @@ struct Compiler::Impl : MetaHost {
     Val symbol(Form *f, Type *want) {
         const std::string &n = f->text;
         if (n == "true" || n == "false") return {b.getInt1(n == "true"), t_bool()};
-        if (n == "null") {
-            Type *t = want && want->is_ptr() ? want : t_ptr(t_void());
-            return {llvm::ConstantPointerNull::get(b.getPtrTy()), t};
+        if (n == "null") {  // the zero value of the wanted type; a (ptr void) without one
+            Type *t = want && want != t_void() && want->kind != Type::Fn ? want : t_ptr(t_void());
+            return {llvm::Constant::getNullValue(ll(t)), t};
+        }
+        if (n == "undefined") {  // no value at all: the memory is left as it is
+            if (!want || want == t_void()) fatal(f->loc, "undefined needs a type: (x T undefined)");
+            return {llvm::UndefValue::get(ll(want)), want};
         }
         Val l = lookup_local(key(f));
         if (l.v) return {load(l), l.t};
@@ -1288,13 +1297,16 @@ struct Compiler::Impl : MetaHost {
             else if (is_type_form(bd->at(1))) t = parse_type(bd->at(1));
             else init = bd->at(1);
             Val v;
-            if (init) {
+            bool undef = init && init->is_sym("undefined");
+            if (undef && !t) fatal(init->loc, "undefined needs a type: (%s T undefined)", name.c_str());
+            if (init && !undef) {
                 v = value_for(init, t, "initializer");
                 t = v.t;
                 if (t == t_void()) fatal(init->loc, "'%s' would have type void", name.c_str());
             }
             llvm::AllocaInst *a = alloca_(t, name);
-            store({a, t}, init ? v.v : llvm::Constant::getNullValue(ll(t)));
+            // everything starts as zero, unless explicitly undefined
+            if (!undef) store({a, t}, init ? v.v : llvm::Constant::getNullValue(ll(t)));
             scopes.back()[key(bd->at(0))] = {a, t};
         }
         Val r = body(f, 2, want);
@@ -1501,6 +1513,7 @@ struct Compiler::Impl : MetaHost {
                 Form *k = f->at(i);
                 if (k->kind != Form::Sym || k->text.size() < 2 || k->text[0] != ':') fatal(k->loc, "expected :field");
                 Val fa = field_addr({a, t}, mk_sym(k->loc, k->text.substr(1)));
+                if (f->at(i + 1)->is_sym("undefined")) continue;  // (it stays zero: make zeroes first)
                 store(fa, value_for(f->at(i + 1), fa.t, "field").v);
             }
         } else if (t->kind == Type::Array) {
@@ -1770,8 +1783,8 @@ struct Compiler::Impl : MetaHost {
     void def_global(Form *f) {
         if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(def name T [init])");
         Type *t = parse_type(f->at(2));
-        llvm::Constant *init = llvm::Constant::getNullValue(ll(t));
-        if (f->size() == 4) init = constant(f->at(3), t);
+        llvm::Constant *init = llvm::Constant::getNullValue(ll(t));  // zero unless given (or undefined)
+        if (f->size() == 4) init = f->at(3)->is_sym("undefined") ? llvm::UndefValue::get(ll(t)) : constant(f->at(3), t);
         auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, def_key(f->at(1)));
         gv->setAlignment(llvm::Align(align_of(t)));
         define(f->at(1), Global{Global::Var, t, gv});

@@ -62,8 +62,16 @@ Expressions — everything is one; statements have type `void`:
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
-    "strings" are (ptr i8);  true false null
+    "strings" are (ptr i8);  true false
+    null — the zero value of the wanted type;  undefined — no value at all
     (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
+
+Everything starts as zero: `let` bindings without a value, globals, and the
+fields and elements `make` doesn't set. `null` is the zero value of the
+type wanted — the null pointer, `0`, `0.0`, `false`, an all-zero struct or
+array — so `(set v null)` resets a struct. `undefined` opts out:
+`(let ((buf (array u8 4096) undefined)) ...)` leaves the memory as it is, for
+code that fills it before reading.
 
 Typing rules:
 

@@ -828,7 +828,8 @@ struct Compiler::Impl : MetaHost {
         if (!a.v.v) a.v = expr(a.f, t);
         if (!x.v.v) x.v = expr(x.f, t->is_ptr() && !is_compare ? t_int(64, true) : t);
         if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
-        if (!t->is_ptr() && a.v.t != x.v.t) type_error(at, op.c_str(), a.v.t, x.v.t);
+        bool shift = op == "<<" || op == ">>";  // as in C, the count may be any integer type
+        if (!t->is_ptr() && a.v.t != x.v.t && !(shift && a.v.t->is_int() && x.v.t->is_int())) type_error(at, op.c_str(), a.v.t, x.v.t);
         if (!t->is_num() && !t->is_ptr()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(a.v.t).c_str(), type_name(x.v.t).c_str());
         return {binop(op, a.v, x.v, at), nullptr};
     }

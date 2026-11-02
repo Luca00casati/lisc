@@ -6,7 +6,7 @@
 //   (struct name (field T) ...)      also (union name ...)
 //   (const NAME expr)                a compile-time constant; untyped if expr is
 //   (def name T [init])              a global variable
-//   (defn name ((a T) ...) R body...)
+//   (defn name ((a T) ...) R [:noinline|:inline|:cold] body...)
 //   (extern name (T ... [...]) R)    a C function by hand
 //
 // Expressions (everything is an expression; statements have type void):
@@ -709,9 +709,11 @@ struct Compiler::Impl : MetaHost {
 
     // a struct value as its register pieces
     void coerce_out(const ArgAbi &abi, Val v, std::vector<llvm::Value *> &out) {
-        Val m = spill(v);
+        llvm::AllocaInst *m = temp(v.t);
+        store({m, v.t}, v.v);
         for (size_t i = 0; i < abi.parts.size(); i++)
-            out.push_back(b.CreateAlignedLoad(abi.parts[i], at_offset(m.v, 8 * i), llvm::Align(std::min<uint64_t>(8, align_of(v.t)))));
+            out.push_back(b.CreateAlignedLoad(abi.parts[i], at_offset(m, 8 * i), llvm::Align(std::min<uint64_t>(8, align_of(v.t)))));
+        done(v.t, m);
     }
     // register pieces stored into a struct's memory
     void coerce_in(const ArgAbi &abi, const std::vector<llvm::Value *> &parts, llvm::Value *mem, Type *t) {
@@ -1026,6 +1028,19 @@ struct Compiler::Impl : MetaHost {
         }
         fatal(f->loc, "%s is not a place", show(f).c_str());
     }
+
+    // Temporaries used up at once (make, struct arguments and results) borrow
+    // a stack slot from a per-function pool and give it back, so a function
+    // making thousands of struct values doesn't get thousands of slots.
+    std::map<Type *, std::vector<llvm::AllocaInst *>> temp_pool;
+    llvm::AllocaInst *temp(Type *t) {
+        auto &free = temp_pool[t];
+        if (free.empty()) return alloca_(t, "tmp");
+        llvm::AllocaInst *a = free.back();
+        free.pop_back();
+        return a;
+    }
+    void done(Type *t, llvm::AllocaInst *a) { temp_pool[t].push_back(a); }
 
     // a value in memory, for taking addresses of temporaries
     Val spill(Val v) {
@@ -1997,7 +2012,7 @@ struct Compiler::Impl : MetaHost {
     Val make(Form *f) {
         if (f->size() < 2) fatal(f->loc, "(make T ...)");
         Type *t = parse_type(f->at(1));
-        llvm::AllocaInst *a = alloca_(t, "make");
+        llvm::AllocaInst *a = temp(t);  // (a make inside a field's value gets another)
         store({a, t}, llvm::Constant::getNullValue(ll(t)));
         if (t->kind == Type::Struct) {
             ensure_layout(t->st, f->loc);
@@ -2016,7 +2031,9 @@ struct Compiler::Impl : MetaHost {
                 store({p, t->elem}, value_for(f->at(i), t->elem, "element").v);
             }
         } else fatal(f->loc, "make needs a struct or array type");
-        return {load({a, t}), t};
+        Val r{load({a, t}), t};
+        done(t, a);
+        return r;
     }
 
     Val call(Form *f) {
@@ -2071,7 +2088,7 @@ struct Compiler::Impl : MetaHost {
         FnAbi &abi = fn_abi(ft);
         std::vector<llvm::Value *> args;
         llvm::Value *sret = nullptr;
-        if (abi.ret.kind == ArgAbi::Memory) args.push_back(sret = alloca_(ft->elem, "sret"));
+        if (abi.ret.kind == ArgAbi::Memory) args.push_back(sret = temp(ft->elem));
         for (size_t i = 0; i < fixed.size(); i++) {
             const ArgAbi &pa = abi.params[i];
             if (pa.kind == ArgAbi::Direct) args.push_back(fixed[i].v);
@@ -2085,15 +2102,21 @@ struct Compiler::Impl : MetaHost {
         switch (abi.ret.kind) {
         case ArgAbi::Direct: return {ci, rt};
         case ArgAbi::Ignore: return {llvm::Constant::getNullValue(ll(rt)), rt};
-        case ArgAbi::Memory: return {load({sret, rt}), rt};
+        case ArgAbi::Memory: {
+            Val r{load({sret, rt}), rt};
+            done(rt, llvm::cast<llvm::AllocaInst>(sret));
+            return r;
+        }
         case ArgAbi::Coerce: {
-            llvm::AllocaInst *m = alloca_(rt, "ret");
+            llvm::AllocaInst *m = temp(rt);
             std::vector<llvm::Value *> parts;
             if (abi.ret.parts.size() == 1) parts.push_back(ci);
             else
                 for (unsigned i = 0; i < abi.ret.parts.size(); i++) parts.push_back(b.CreateExtractValue(ci, i));
             coerce_in(abi.ret, parts, m, rt);
-            return {load({m, rt}), rt};
+            Val r{load({m, rt}), rt};
+            done(rt, m);
+            return r;
         }
         }
         return {};
@@ -2415,6 +2438,13 @@ struct Compiler::Impl : MetaHost {
         return k;
     }
 
+    // a defn's first body form: after the name, parameters, result type and options
+    static size_t body_start(Form *f) {
+        size_t i = 4;
+        while (i < f->size() && f->at(i)->kind == Form::Sym && f->at(i)->text.size() > 1 && f->at(i)->text[0] == ':') i++;
+        return i;
+    }
+
     void declare_fn(Form *f) {
         if (f->size() < 4 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(defn name ((a T) ...) R body...)");
         std::vector<Type *> ps;
@@ -2429,12 +2459,21 @@ struct Compiler::Impl : MetaHost {
         auto link = entry ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
         llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
         fn0->setAttributes(fn_abi(ft).attrs);
+        // options after the result type: :noinline :inline :cold
+        for (size_t i = 4; i < body_start(f); i++) {
+            Form *o = f->at(i);
+            if (o->is_sym(":noinline")) fn0->addFnAttr(llvm::Attribute::NoInline);
+            else if (o->is_sym(":inline")) fn0->addFnAttr(llvm::Attribute::AlwaysInline);
+            else if (o->is_sym(":cold")) fn0->addFnAttr(llvm::Attribute::Cold);
+            else fatal(o->loc, "function options are :noinline :inline :cold");
+        }
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }
 
     // after an error in a function body: drop what was built, reset the state
     void abandon_fn() {
         if (fn) fn->deleteBody();
+        temp_pool.clear();
         scopes.clear();
         loops.clear();
         type_memo.clear();
@@ -2451,6 +2490,7 @@ struct Compiler::Impl : MetaHost {
         fn_ret = g.type->elem;
         cur_ft = g.type;
         type_memo.clear();
+        temp_pool.clear();
         FnAbi &abi = fn_abi(g.type);
         b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
         dsp = nullptr;
@@ -2494,7 +2534,7 @@ struct Compiler::Impl : MetaHost {
             scopes.back()[key(f->at(2)->at(i)->at(0))] = {a, t};
             if (dsp) declare_var(a, name, t, f->at(2)->at(i)->loc, i + 1);
         }
-        Val v = body(f, 4, fn_ret == t_void() ? nullptr : fn_ret);
+        Val v = body(f, body_start(f), fn_ret == t_void() ? nullptr : fn_ret);
         if (open()) {
             if (fn_ret == t_void()) b.CreateRetVoid();
             else {

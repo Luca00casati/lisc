@@ -1,7 +1,7 @@
 // main.cpp — the lisc driver: source → LLVM IR → optimised native object →
 // executable (linked by the system C compiler, against libc and libm).
 //
-//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-w] [--checks] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
+//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-w] [--checks] [--time] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 //
 // Other input files go to the linker (cc), so C code can be linked in.
 // import-c searches the source file's directory and -I directories for headers.
@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <chrono>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,8 +31,17 @@
 
 namespace {
 
+// --time: how long each phase took
+bool timing = false;
+auto t_last = std::chrono::steady_clock::now();
+void phase(const char *name) {
+    auto now = std::chrono::steady_clock::now();
+    if (timing) fprintf(stderr, "lisc: %-12s %7.3f s\n", name, std::chrono::duration<double>(now - t_last).count());
+    t_last = now;
+}
+
 [[noreturn]] void usage() {
-    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-w] [--checks] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
+    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-w] [--checks] [--time] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
     exit(1);
 }
 
@@ -88,6 +99,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(s, "-g")) debug = true;
         else if (!strcmp(s, "-w")) warnings = false;
         else if (!strcmp(s, "--checks")) checks = true;
+        else if (!strcmp(s, "--time")) timing = true;
         else if (!strcmp(s, "-c")) object_only = true;
         else if (!strncmp(s, "-l", 2) && s[2]) libs.push_back(s);
         else if (s[0] == '-' || in) usage();
@@ -113,7 +125,9 @@ int main(int argc, char **argv) {
     }
     c.debug = debug;
     c.checks = checks;
+    phase("start");
     c.compile(read_file(in));
+    phase("front end");
     llvm::Module &m = c.module();
 
     llvm::InitializeNativeTarget();
@@ -127,10 +141,13 @@ int main(int argc, char **argv) {
         for (auto &f : host) features += (features.empty() ? "" : ",") + std::string(f.second ? "+" : "-") + f.first().str();
     llvm::TargetMachine *tm = target->createTargetMachine(triple, llvm::sys::getHostCPUName(), features, llvm::TargetOptions(),
                                                           llvm::Reloc::PIC_, std::nullopt,
-                                                          opt >= 2 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::Default);
+                                                          opt == 0 ? llvm::CodeGenOptLevel::None : opt == 1 ? llvm::CodeGenOptLevel::Less
+                                                          : opt == 2 ? llvm::CodeGenOptLevel::Default : llvm::CodeGenOptLevel::Aggressive);
     m.setDataLayout(tm->createDataLayout());
     m.setTargetTriple(triple);
+    phase("setup");
     optimize(m, tm, opt);
+    phase("optimise");
 
     std::error_code ec;
     if (emit_llvm) {
@@ -149,11 +166,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         pm.run(m);
+        phase("codegen");
     }
     if (object_only) return 0;
     std::vector<std::string> link = {"cc", "-o", out, obj, "-lm"};
     link.insert(link.end(), libs.begin(), libs.end());
     int r = run(link);
+    phase("link");
     unlink(obj.c_str());
     return r;
 }

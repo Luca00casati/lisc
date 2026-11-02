@@ -30,6 +30,9 @@ Errors in function bodies are all reported (up to 20), not just the first.
 Warnings: a variable that is never read (name it `_x` to say that is meant),
 and code after a `return`/`break`/`continue`; `-w` turns them off.
 
+`--time` reports how long each phase took (front end, optimiser, code
+generation, link); `-O0` builds fastest.
+
 `--checks` builds with run-time checks that stop the program with the source
 location: indexing arrays, slices and strs out of bounds, integer casts that
 lose the value (narrowing, or a negative into unsigned), float-to-integer
@@ -61,7 +64,7 @@ Top level:
 | `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
-| `(defn name ((a T) ...) R body...)` | function; the last expression is the result |
+| `(defn name ((a T) ...) R [:noinline\|:inline\|:cold] body...)` | function; the last expression is the result |
 | `(extern name (T ... [...]) R)` | a C function by hand |
 | `(defop op ((a T) ...) R body...)` | an operator for these operand types |
 | `(defmacro name (params...) body...)` | a macro (see below) |

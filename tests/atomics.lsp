@@ -5,7 +5,7 @@
 (def flag i32 0)
 
 (defn work ((arg (ptr void))) (ptr void)
-  (for (i 0 100000) (atomic-add counter 1 :relaxed))
+  (for (_i 0 100000) (atomic-add counter 1 :relaxed))
   null)
 
 (defn main () i32

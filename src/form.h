@@ -29,6 +29,10 @@ struct Expansion {
 extern jmp_buf *error_trap;
 extern int error_count;
 
+// "file:line:col: warning: ..." (unless warnings are off: lisc -w)
+void warn(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+extern bool warnings;
+
 struct Form {
     enum Kind { Int, Float, Sym, Str, List, Fn } kind;  // Fn: a compile-time closure (macro.cpp)
     Loc loc;

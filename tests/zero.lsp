@@ -6,7 +6,7 @@
 (def scratch (array u8 1024) undefined)        ; left as the loader gives it (bss anyway)
 
 (defn main () i32
-  (let ((a i32) (v p3) (arr (array f64 4)) (q (ptr p3)))       ; zero, without a value
+  (let ((a i32) (v p3) (arr (array f64 4)))       ; zero, without a value
     (printf c"zero: %d %g %g %d %p %g %d\n" a (cast f64 v.x) (cast f64 v.y) v.n (cast (ptr void) v.next) (aref arr 3) g.n))
   (let ((v (make p3 :x 1.5 :n 7)))
     (set v null)                                ; back to all zero

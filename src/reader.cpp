@@ -31,6 +31,19 @@ void fatal(Loc at, const char *fmt, ...) {
 
 jmp_buf *error_trap = nullptr;
 int error_count = 0;
+bool warnings = true;
+
+void warn(Loc at, const char *fmt, ...) {
+    if (!warnings) return;
+    fprintf(stderr, "%s:%d:%d: warning: ", at.file, at.line, at.col);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    for (const Expansion *e = at.via; e; e = e->at.via)
+        fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
+}
 
 Form *mk_sym(Loc at, const std::string &name) {
     Form *f = new Form{Form::Sym, at};

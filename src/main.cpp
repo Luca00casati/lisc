@@ -1,7 +1,7 @@
 // main.cpp — the lisc driver: source → LLVM IR → optimised native object →
 // executable (linked by the system C compiler, against libc and libm).
 //
-//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
+//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-w] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 //
 // Other input files go to the linker (cc), so C code can be linked in.
 // import-c searches the source file's directory and -I directories for headers.
@@ -30,7 +30,7 @@
 namespace {
 
 [[noreturn]] void usage() {
-    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
+    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-w] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
     exit(1);
 }
 
@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
         else if (s[0] == '-' && s[1] == 'O' && s[2] >= '0' && s[2] <= '3' && !s[3]) opt = s[2] - '0';
         else if (!strcmp(s, "--emit-llvm")) emit_llvm = true;
         else if (!strcmp(s, "-g")) debug = true;
+        else if (!strcmp(s, "-w")) warnings = false;
         else if (!strcmp(s, "-c")) object_only = true;
         else if (!strncmp(s, "-l", 2) && s[2]) libs.push_back(s);
         else if (s[0] == '-' || in) usage();

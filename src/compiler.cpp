@@ -113,6 +113,8 @@ struct Compiler::Impl : MetaHost {
         std::map<std::string, Val> vars;
         std::vector<std::string> usings;
         std::vector<Form *> defers;  // (defer ...) in this block, in order
+        std::vector<Form *> declared;  // let/for names bound here, for the unused-variable warning
+        std::set<std::string> used;
         Val &operator[](const std::string &k) { return vars[k]; }
     };
     std::vector<Scope> scopes;
@@ -838,7 +840,10 @@ struct Compiler::Impl : MetaHost {
     Val lookup_local(const std::string &n) {
         for (auto s = scopes.rbegin(); s != scopes.rend(); ++s) {
             auto it = s->vars.find(n);
-            if (it != s->vars.end()) return it->second;
+            if (it != s->vars.end()) {
+                s->used.insert(n);
+                return it->second;
+            }
         }
         return {};
     }
@@ -1225,17 +1230,31 @@ struct Compiler::Impl : MetaHost {
         return call(f);
     }
 
+    // warnings for a scope that ends: its variables nobody read
+    void end_scope() {
+        Scope &s = scopes.back();
+        for (Form *name : s.declared)
+            if (!s.used.count(key(name)) && name->text[0] != '_' && !name->mark && !name->loc.via)
+                warn(name->loc, "'%s' is never used", name->text.c_str());
+        scopes.pop_back();
+    }
+
     // a block: its own scope (for using and defer); the last form is its value,
     // computed before the block's defers run
     Val body(Form *f, size_t from, Type *want) {
         scopes.emplace_back();
         Val last{nullptr, t_void()};
+        bool warned = false;
         for (size_t i = from; i < f->size(); i++) {
+            if (!open() && !warned && !f->at(i)->loc.via) {  // after a return, break or continue
+                warn(f->at(i)->loc, "unreachable code");
+                warned = true;
+            }
             ensure_open();
             last = expr(f->at(i), i + 1 == f->size() ? want : nullptr);
         }
         if (open()) run_defers(scopes.size() - 1);
-        scopes.pop_back();
+        end_scope();
         return last;
     }
     // one form as a block (an if branch)
@@ -1533,10 +1552,11 @@ struct Compiler::Impl : MetaHost {
             // everything starts as zero, unless explicitly undefined
             if (!undef) store({a, t}, init ? v.v : llvm::Constant::getNullValue(ll(t)));
             scopes.back()[key(bd->at(0))] = {a, t};
+            scopes.back().declared.push_back(bd->at(0));
             if (dsp) declare_var(a, name, t, bd->at(0)->loc);
         }
         Val r = body(f, 2, want);
-        scopes.pop_back();
+        end_scope();
         return r;
     }
 
@@ -1842,6 +1862,7 @@ struct Compiler::Impl : MetaHost {
         llvm::AllocaInst *iv = alloca_(t, spec->at(0)->text);
         store({iv, t}, start.v);
         scopes.back()[key(spec->at(0))] = {iv, t};
+        scopes.back().declared.push_back(spec->at(0));
         if (dsp) declare_var(iv, spec->at(0)->text, t, spec->at(0)->loc);
         BasicBlock *cond = BasicBlock::Create(ctx, "for", fn), *bodyb = BasicBlock::Create(ctx, "body", fn);
         BasicBlock *step = BasicBlock::Create(ctx, "step", fn), *done = BasicBlock::Create(ctx, "endfor", fn);
@@ -1860,7 +1881,7 @@ struct Compiler::Impl : MetaHost {
         store({iv, t}, b.CreateAdd(load({iv, t}), by.v));
         b.CreateBr(cond);
         b.SetInsertPoint(done);
-        scopes.pop_back();
+        end_scope();
         return {nullptr, t_void()};
     }
 

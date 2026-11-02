@@ -12,7 +12,7 @@
   (set counter (+ counter 1)))
 
 (defn sum-to ((n i64)) i64
-  (let ((s 0) (i i64 1))          ; s is i64: it takes the type of what it is added to? no: i32 default
+  (let ((i i64 1))
     (let ((acc i64 0))
       (while (<= i n)
         (set acc (+ acc i))

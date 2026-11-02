@@ -26,6 +26,10 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
     make test
     ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 
+Errors in function bodies are all reported (up to 20), not just the first.
+Warnings: a variable that is never read (name it `_x` to say that is meant),
+and code after a `return`/`break`/`continue`; `-w` turns them off.
+
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a
 macro produced belongs to the line of the macro call. Extra `.c`/`.o` inputs

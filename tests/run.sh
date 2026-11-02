@@ -24,5 +24,15 @@ for src in errors/*.lsp; do
     *) fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$got'" ;;
     esac
 done
+# Each tests/warnings/NAME.lsp must compile with the warning in its first line.
+for src in warnings/*.lsp; do
+    [ -e "$src" ] || continue
+    want=$(head -1 "$src" | sed 's/^; warning: //')
+    got=$(../lisc "$src" -o out/warn 2>&1)
+    case "$got" in
+    *"warning: $want"*) pass=$((pass + 1)) ;;
+    *) fail=$((fail + 1)); echo "FAIL $src: want warning '$want', got '$got'" ;;
+    esac
+done
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

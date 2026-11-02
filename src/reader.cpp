@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdarg>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,12 +36,15 @@ bool warnings = true;
 
 void warn(Loc at, const char *fmt, ...) {
     if (!warnings) return;
-    fprintf(stderr, "%s:%d:%d: warning: ", at.file, at.line, at.col);
+    char msg[1024];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    // once per place (a generic's body is compiled for each of its instances)
+    static std::set<std::string> said;
+    if (!said.insert(std::string(at.file) + ":" + std::to_string(at.line) + ":" + std::to_string(at.col) + msg).second) return;
+    fprintf(stderr, "%s:%d:%d: warning: %s\n", at.file, at.line, at.col, msg);
     for (const Expansion *e = at.via; e; e = e->at.via)
         fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
 }

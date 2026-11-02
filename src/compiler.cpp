@@ -532,6 +532,8 @@ struct Compiler::Impl : MetaHost {
 
     void mark_private(Form *f) {
         if (f->is_list() && f->size() >= 2 && f->at(1)->kind == Form::Sym) priv_names.insert(f->at(1));
+        else if (f->is_list() && f->size() >= 2 && f->at(1)->is_list() && f->at(1)->size() && f->at(1)->at(0)->kind == Form::Sym)
+            priv_names.insert(f->at(1)->at(0));  // a generic's name
     }
     void note_private(Form *name, const std::string &key) {
         if (priv_names.count(name)) priv.insert(key);
@@ -785,9 +787,170 @@ struct Compiler::Impl : MetaHost {
         fatal(at, "struct %s is used before its fields are known", st->name.c_str());
     }
 
+    /* ------------------------------------------------------ generics --- */
+
+    // (struct (name T ...) fields...) and (defn (name T ...) params R body...):
+    // specialised for each list of types they are used with. Inside, T is
+    // bound to the type itself (not its name), so the body sees the same type
+    // whatever module it was named in.
+    struct Generic {
+        Form *def;
+        ModInfo *mod;
+        std::string key;                  // module::name
+        std::vector<std::string> params;  // T ...
+        std::map<std::vector<Type *>, Type *> structs;
+    };
+    std::map<std::string, Generic> generic_structs, generic_fns;
+    std::map<StructInfo *, std::pair<Generic *, std::vector<Type *>>> instance_of;
+    std::map<std::string, Type *> tbind;  // the type parameters where code is being compiled
+    struct PendingFn {
+        Form *def;
+        std::string key, shown;
+        ModInfo *mod;
+        std::map<std::string, Type *> bind;
+        Loc at;  // where it was first used
+    };
+    std::vector<PendingFn> pending_fns;  // instances declared, bodies to compile
+    bool structs_ready = false;          // pass 1 is over: instances can be laid out when made
+    std::vector<std::pair<StructInfo *, Loc>> pending_layout;
+
+    void register_generic(Form *f, bool is_fn) {
+        Form *n = f->at(1);
+        if (n->size() < 2 || n->at(0)->kind != Form::Sym)
+            fatal(n->loc, is_fn ? "(defn (name T ...) ((a T) ...) R body...)" : "(struct (name T ...) (field T) ...)");
+        Generic g{f, cur, def_key(n->at(0)), {}, {}};
+        for (size_t i = 1; i < n->size(); i++) {
+            if (n->at(i)->kind != Form::Sym) fatal(n->at(i)->loc, "a type parameter is a name");
+            for (auto &p : g.params)
+                if (p == n->at(i)->text) fatal(n->at(i)->loc, "type parameter %s is there twice", p.c_str());
+            g.params.push_back(n->at(i)->text);
+        }
+        auto &table = is_fn ? generic_fns : generic_structs;
+        if (table.count(g.key) || (is_fn ? c.globals_.count(g.key) : c.types_.count(g.key)))
+            fatal(n->loc, "'%s' is already defined", n->at(0)->text.c_str());
+        table[g.key] = g;
+        note_private(n->at(0), g.key);
+    }
+    std::string generic_key(Form *sym, std::map<std::string, Generic> &table) {
+        if (sym->kind != Form::Sym) return "";
+        return resolve(sym, [&](const std::string &k) { return table.count(k) != 0; });
+    }
+    static std::string bare(const std::string &key) { return key.substr(key.find("::") == std::string::npos ? 0 : key.rfind("::") + 2); }
+    std::string instance_name(Generic &g, const std::vector<Type *> &args) {
+        std::string s = "(" + bare(g.key);
+        for (Type *t : args) s += " " + type_name(t);
+        return s + ")";
+    }
+    std::map<std::string, Type *> binding(Generic &g, const std::vector<Type *> &args) {
+        std::map<std::string, Type *> b;
+        for (size_t i = 0; i < args.size(); i++) b[g.params[i]] = args[i];
+        return b;
+    }
+    // compile something of a generic's: in its module, with its parameters bound,
+    // apart from the function being compiled where it is used
+    template <class F> void inside(Generic &g, const std::map<std::string, Type *> &bind, F fn) {
+        ModInfo *saved_cur = cur;
+        std::map<std::string, Type *> saved_bind = bind;
+        std::swap(saved_bind, tbind);
+        std::vector<Scope> saved_scopes;
+        std::swap(saved_scopes, scopes);
+        cur = g.mod;
+        fn();
+        cur = saved_cur;
+        std::swap(saved_bind, tbind);
+        std::swap(saved_scopes, scopes);
+    }
+    std::vector<Type *> type_args(Generic &g, Form *f) {  // (name T ...) written out
+        if (f->size() - 1 != g.params.size())
+            fatal(f->loc, "%s takes %zu type%s, got %zu", bare(g.key).c_str(), g.params.size(), g.params.size() == 1 ? "" : "s", f->size() - 1);
+        std::vector<Type *> args;
+        for (size_t i = 1; i < f->size(); i++) args.push_back(parse_type(f->at(i)));
+        return args;
+    }
+
+    Type *instantiate_struct(Generic &g, const std::vector<Type *> &args, Loc at) {
+        auto it = g.structs.find(args);
+        if (it != g.structs.end()) return it->second;
+        auto *st = new StructInfo;
+        st->name = instance_name(g, args);
+        st->is_union = g.def->is_call("union");
+        Type *t = t_struct(st);
+        g.structs[args] = t;  // (before its fields: they may point to it)
+        instance_of[st] = {&g, args};
+        inside(g, binding(g, args), [&] {
+            std::vector<std::pair<Form *, StructInfo *>> one{{g.def, st}};
+            std::vector<ModInfo *> ms{g.mod};
+            add_fields(one, ms);
+        });
+        if (structs_ready) lay_out(st, at);
+        else pending_layout.push_back({st, at});
+        return t;
+    }
+
+    Global *instantiate_fn(Generic &g, const std::vector<Type *> &args, Loc at) {
+        std::string key = g.key + "(";
+        for (size_t i = 0; i < args.size(); i++) key += (i ? " " : "") + type_name(args[i]);
+        key += ")";
+        auto it = c.globals_.find(key);
+        if (it != c.globals_.end()) return &it->second;
+        std::string shown = instance_name(g, args);
+        auto bind = binding(g, args);
+        inside(g, bind, [&] { declare_fn(g.def, key); });
+        pending_fns.push_back({g.def, key, shown, g.mod, bind, at});
+        return &c.globals_[key];
+    }
+
+    // the type parameters a call's arguments imply: each parameter's type is
+    // matched against its argument's (literals and null don't count; they
+    // then take the type that was found)
+    void match(Generic &g, Form *pat, Type *t, std::map<std::string, Type *> &b, Form *arg) {
+        if (pat->kind == Form::Sym) {
+            if (std::find(g.params.begin(), g.params.end(), pat->text) == g.params.end()) return;
+            auto it = b.find(pat->text);
+            if (it == b.end()) b[pat->text] = t;
+            else if (it->second != t)
+                fatal(arg->loc, "%s is %s here but %s in an earlier argument", pat->text.c_str(), type_name(t).c_str(), type_name(it->second).c_str());
+            return;
+        }
+        if (!pat->is_list() || pat->size() < 2 || pat->at(0)->kind != Form::Sym) return;
+        if ((pat->is_call("ptr") && t->is_ptr()) || (pat->is_call("array") && t->kind == Type::Array)) return match(g, pat->at(1), t->elem, b, arg);
+        if (t->kind != Type::Struct) return;
+        if (pat->is_call("slice") && t->st->slice_of) return match(g, pat->at(1), t->st->slice_of, b, arg);
+        std::string gk = generic_key(pat->at(0), generic_structs);
+        auto inst = instance_of.find(t->st);
+        if (gk.empty() || inst == instance_of.end() || inst->second.first != &generic_structs[gk]) return;
+        for (size_t j = 1; j < pat->size() && j - 1 < inst->second.second.size(); j++) match(g, pat->at(j), inst->second.second[j - 1], b, arg);
+    }
+    Global *infer_fn(Generic &g, Form *call) {
+        Form *ps = g.def->at(2);
+        size_t n = call->size() - 1;
+        if (n != ps->size()) fatal(call->loc, "%s takes %zu argument%s, got %zu", bare(g.key).c_str(), ps->size(), ps->size() == 1 ? "" : "s", n);
+        std::map<std::string, Type *> b;
+        for (size_t i = 0; i < n; i++) {
+            Form *a = call->at(i + 1);
+            if (untyped(a) || a->is_sym("null")) continue;
+            if (ps->at(i)->is_list() && ps->at(i)->size() == 2) match(g, ps->at(i)->at(1), type_of(a), b, a);
+        }
+        // a parameter only literals stand for: their own type ((max 1 2) is for i32)
+        for (size_t i = 0; i < n; i++) {
+            Form *a = call->at(i + 1), *pt = ps->at(i)->is_list() && ps->at(i)->size() == 2 ? ps->at(i)->at(1) : nullptr;
+            if (pt && pt->kind == Form::Sym && untyped(a) && !b.count(pt->text) &&
+                std::find(g.params.begin(), g.params.end(), pt->text) != g.params.end())
+                b[pt->text] = default_type(a);
+        }
+        std::vector<Type *> args;
+        for (auto &p : g.params) {
+            if (!b.count(p)) fatal(call->loc, "the arguments don't tell what %s is: write ((%s %s ...) ...)", p.c_str(), bare(g.key).c_str(), "T");
+            args.push_back(b[p]);
+        }
+        return instantiate_fn(g, args, call->loc);
+    }
+
     Type *parse_type(Form *f) override {
         f = expand(f);
         if (f->kind == Form::Sym) {
+            auto tb = tbind.find(f->text);
+            if (tb != tbind.end()) return tb->second;
             static const std::map<std::string, Type *> builtin = {
                 {"void", t_void()}, {"bool", t_bool()},
                 {"i8", t_int(8, true)}, {"i16", t_int(16, true)}, {"i32", t_int(32, true)}, {"i64", t_int(64, true)},
@@ -817,6 +980,13 @@ struct Compiler::Impl : MetaHost {
                 else ps.push_back(parse_type(p));
             }
             return t_fn(parse_type(f->at(2)), ps, variadic);
+        }
+        if (f->is_list() && f->size() >= 2) {  // (name T ...): a generic struct for these types
+            std::string gk = generic_key(f->at(0), generic_structs);
+            if (!gk.empty()) {
+                Generic &g = generic_structs[gk];
+                return instantiate_struct(g, type_args(g, f), f->loc);
+            }
         }
         fatal(f->loc, "bad type %s", show(f).c_str());
     }
@@ -1638,8 +1808,10 @@ struct Compiler::Impl : MetaHost {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str"};
             for (const char *n : names)
                 if (f->text == n) return true;
+            if (tbind.count(f->text) && !lookup_local(key(f)).v) return true;
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
+        if (f->is_list() && f->size() >= 2 && !generic_key(f->at(0), generic_structs).empty()) return true;
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice");
     }
 
@@ -2054,11 +2226,22 @@ struct Compiler::Impl : MetaHost {
         Form *head = f->at(0);
         Val callee;
         Type *ft = nullptr;
+        Global *g = nullptr;
         if (head->kind == Form::Sym && !lookup_local(key(head)).v) {
-            Global *g = lookup_global(head);
+            g = lookup_global(head);
+            if (!g) {  // a generic function: for the types of the arguments
+                std::string gk = generic_key(head, generic_fns);
+                if (!gk.empty()) g = infer_fn(generic_fns[gk], f);
+            }
             if (!g) fatal(head->loc, "unknown function '%s'", head->text.c_str());
-            if (g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
+        } else if (head->is_list() && head->size() >= 2 && head->at(0)->kind == Form::Sym && !lookup_local(key(head->at(0))).v) {
+            std::string gk = generic_key(head->at(0), generic_fns);  // ((name T ...) args...)
+            if (!gk.empty()) {
+                Generic &gen = generic_fns[gk];
+                g = instantiate_fn(gen, type_args(gen, head), head->loc);
+            }
         }
+        if (g && g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
         if (!ft) {
             callee = expr(head, nullptr);
             if (!callee.t->is_ptr() || callee.t->elem->kind != Type::Fn) fatal(head->loc, "%s is not a function", show(head).c_str());
@@ -2183,6 +2366,7 @@ struct Compiler::Impl : MetaHost {
         each(all, [&](Form *f) {
             if (f->is_call("enum")) return define_enum(f);
             if (!f->is_call("struct") && !f->is_call("union")) return;
+            if (f->size() >= 2 && f->at(1)->is_list()) return register_generic(f, false);
             if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(struct name (field T) ...)");
             auto *st = new StructInfo;
             st->name = f->at(1)->text;
@@ -2212,6 +2396,9 @@ struct Compiler::Impl : MetaHost {
         std::vector<std::pair<Form *, StructInfo *>> more;
         std::vector<ModInfo *> more_mods;
         each(all, [&](Form *f) {
+            if ((f->is_call("struct") || f->is_call("union")) && f->size() >= 2 && f->at(1)->is_list() && f->at(1)->size() &&
+                !generic_structs.count(def_key(f->at(1)->at(0))))
+                return register_generic(f, false);  // (made by a macro)
             if ((!f->is_call("struct") && !f->is_call("union")) || f->size() < 2 || f->at(1)->kind != Form::Sym) return;
             std::string k = def_key(f->at(1));
             if (c.types_.count(k) && c.types_[k]->kind == Type::Struct && c.types_[k]->st->complete) return;
@@ -2225,6 +2412,9 @@ struct Compiler::Impl : MetaHost {
         });
         add_fields(more, more_mods);
         for (auto &s : more) lay_out(s.second, s.first->loc);
+        for (size_t i = 0; i < pending_layout.size(); i++) lay_out(pending_layout[i].first, pending_layout[i].second);
+        pending_layout.clear();
+        structs_ready = true;
         // defop: a function named after the operator and its types
         std::vector<std::pair<std::string, std::string>> ops;  // operator, qualified function name
         for (auto &item : all) {
@@ -2256,7 +2446,8 @@ struct Compiler::Impl : MetaHost {
             } else if (!strcmp(h, "def")) {
                 def_global(f);
             } else if (!strcmp(h, "defn")) {
-                declare_fn(f);
+                if (f->size() >= 2 && f->at(1)->is_list()) register_generic(f, true);
+                else declare_fn(f);
             } else if (!strcmp(h, "extern")) {
                 if (f->size() != 4 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(extern name (T ...) R)");
                 Type *ft = parse_type(mk_list(f->loc, {mk_sym(f->loc, "fn"), f->at(2), f->at(3)}));
@@ -2289,13 +2480,13 @@ struct Compiler::Impl : MetaHost {
         cur = nullptr;
         // pass 3: function bodies. An error in one is reported and the next is
         // compiled anyway (up to 20 errors); the program is not produced.
-        each(all, [&](Form *f) {
-            if (!f->is_call("defn")) return;
+        auto guarded = [&](auto body, const PendingFn *inst) {
             jmp_buf here;
             if (setjmp(here) == 0) {
                 error_trap = &here;
-                define_fn(f);
+                body();
             } else {
+                if (inst) fprintf(stderr, "%s:%d:%d: note: in %s, used here\n", inst->at.file, inst->at.line, inst->at.col, inst->shown.c_str());
                 abandon_fn();
                 if (error_count >= 20) {
                     fprintf(stderr, "lisc: too many errors, stopping\n");
@@ -2303,7 +2494,20 @@ struct Compiler::Impl : MetaHost {
                 }
             }
             error_trap = nullptr;
+        };
+        each(all, [&](Form *f) {
+            if (!f->is_call("defn") || (f->size() >= 2 && f->at(1)->is_list())) return;
+            guarded([&] { define_fn(f); }, nullptr);
         });
+        // the generic functions' instances; compiling one can ask for more
+        for (size_t i = 0; i < pending_fns.size(); i++) {
+            PendingFn p = pending_fns[i];
+            cur = p.mod;
+            tbind = p.bind;
+            guarded([&] { define_fn(p.def, p.key, p.shown); }, &p);
+            tbind.clear();
+            cur = nullptr;
+        }
         if (error_count) {
             fprintf(stderr, "lisc: %d error%s\n", error_count, error_count == 1 ? "" : "s");
             exit(1);
@@ -2459,8 +2663,9 @@ struct Compiler::Impl : MetaHost {
         return i;
     }
 
-    void declare_fn(Form *f) {
-        if (f->size() < 4 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(defn name ((a T) ...) R body...)");
+    // (ikey: a generic's instance, by its table key)
+    void declare_fn(Form *f, const std::string &ikey = "") {
+        if (f->size() < 4 || (ikey.empty() && f->at(1)->kind != Form::Sym) || !f->at(2)->is_list()) fatal(f->loc, "(defn name ((a T) ...) R body...)");
         std::vector<Type *> ps;
         for (Form *p : f->at(2)->items) {
             if (!p->is_list() || p->size() != 2 || p->at(0)->kind != Form::Sym) fatal(p->loc, "parameter must be (name T)");
@@ -2468,8 +2673,8 @@ struct Compiler::Impl : MetaHost {
         }
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
         // the program's main (in the first module) is the C entry point; everything else is internal
-        bool entry = f->at(1)->text == "main" && cur == root;
-        std::string name = entry ? "main" : def_key(f->at(1));
+        bool entry = ikey.empty() && f->at(1)->text == "main" && cur == root;
+        std::string name = entry ? "main" : !ikey.empty() ? ikey : def_key(f->at(1));
         auto link = entry ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
         llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
         fn0->setAttributes(fn_abi(ft).attrs);
@@ -2484,12 +2689,14 @@ struct Compiler::Impl : MetaHost {
                 fn0->addFnAttr(llvm::Attribute::NoInline);
             } else fatal(o->loc, "function options are :noinline :inline :cold :optnone");
         }
-        define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
+        if (!ikey.empty()) c.globals_[ikey] = Global{Global::Func, ft, fn0, nullptr, f};
+        else define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }
 
     // after an error in a function body: drop what was built, reset the state
     void abandon_fn() {
         if (fn) fn->deleteBody();
+        tbind.clear();
         temp_pool.clear();
         scopes.clear();
         loops.clear();
@@ -2501,8 +2708,9 @@ struct Compiler::Impl : MetaHost {
         meta.reset();
     }
 
-    void define_fn(Form *f) {
-        Global &g = c.globals_[def_key(f->at(1))];
+    void define_fn(Form *f, const std::string &ikey = "", const std::string &shown = "") {
+        Global &g = c.globals_[ikey.empty() ? def_key(f->at(1)) : ikey];
+        const std::string fname = shown.empty() ? f->at(1)->text : shown;
         fn = llvm::cast<llvm::Function>(g.value);
         fn_ret = g.type->elem;
         cur_ft = g.type;
@@ -2518,7 +2726,7 @@ struct Compiler::Impl : MetaHost {
             auto *sty = llvm::cast<llvm::DISubroutineType>(ditype(g.type));
             auto flags = llvm::DISubprogram::SPFlagDefinition;
             if (fn->hasInternalLinkage()) flags |= llvm::DISubprogram::SPFlagLocalToUnit;
-            dsp = dib->createFunction(file, f->at(1)->text, fn->getName(), file, at.line, sty, at.line,
+            dsp = dib->createFunction(file, fname, fn->getName(), file, at.line, sty, at.line,
                                       llvm::DINode::FlagPrototyped, flags);
             fn->setSubprogram(dsp);
             set_loc(f->loc);
@@ -2555,7 +2763,7 @@ struct Compiler::Impl : MetaHost {
         if (open()) {
             if (fn_ret == t_void()) b.CreateRetVoid();
             else {
-                if (v.t == t_void()) fatal(f->loc, "%s must end with a %s value or return", f->at(1)->text.c_str(), type_name(fn_ret).c_str());
+                if (v.t == t_void()) fatal(f->loc, "%s must end with a %s value or return", fname.c_str(), type_name(fn_ret).c_str());
                 emit_ret(coerce(v, fn_ret, f->at(f->size() - 1)->loc, "result"));
             }
         }

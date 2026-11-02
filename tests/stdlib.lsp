@@ -3,9 +3,9 @@
 (import "std/str")
 (import "std/mem")
 (import "std/vec")
-(using libc)
+(using libc vec)
 
-(vec::define ints i32)
+(struct named (name str) (n i32))
 
 (defn main () i32
   (let ((s "teapot.lsp") (buf (array i8 16)))
@@ -17,10 +17,16 @@
     (set (aref xs 3) 2.5)
     (printf c"mem::new %g %g\n" (cast f64 (aref xs 0)) (cast f64 (aref xs 3)))
     (mem::free xs))
-  (let ((v (make ints)) (sum 0))
-    (for (i 0 100) (ints-push (addr v) (* i i)))
-    (let ((all (ints-slice (addr v))))
+  (let ((v (make (vec i32))) (sum 0))
+    (for (i 0 100) (push (addr v) (* i i)))
+    (let ((all (items (addr v))))
       (for (i u64 0 all.len) (+= sum (aref all i))))
-    (printf c"vec: %lu items, sum %d, last %d\n" v.len sum (ints-pop (addr v)))
-    (ints-free (addr v)))
+    (printf c"vec: %lu items, sum %d, last %d\n" v.len sum (pop (addr v)))
+    (release (addr v)))
+  (let ((ns (make (vec named))))                   ; a type of this program's, in std/vec's code
+    (push (addr ns) (make named :name "teapot" :n 1))
+    (push (addr ns) (make named :name "kettle" :n 2))
+    (let ((last (pop (addr ns))))
+      (printf c"%.*s %d, %lu left\n" (cast i32 last.name.len) last.name.data last.n ns.len))
+    (release (addr ns)))
   0)

@@ -16,3 +16,6 @@
 (defmacro doubled (e)
   `(do (set calls (+ calls 1)) (scale-by ,e 2.0)))
 (defn call-count () i32 calls)
+
+; a private generic (tests/errors/generic-private.lsp)
+(defn- (hidden T) ((x T)) T x)

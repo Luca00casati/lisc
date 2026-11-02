@@ -143,6 +143,29 @@ Typing rules:
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
+## Generics
+
+A struct or function with a list for its name takes type parameters, and is
+specialised (compiled anew) for each list of types it is used with:
+
+```lisp
+(struct (vec T) (data (ptr T)) (len u64) (cap u64))
+
+(defn (push T) ((v (ptr (vec T))) (x T)) void ...)
+(defn (biggest T) ((a T) (b T)) T (if (> a b) a b))
+
+(let ((v (make (vec i32))))     ; (vec i32) is a type wherever types go
+  (push (addr v) 42)             ; T from the arguments' types: push for i32
+  ((push i32) (addr v) 42)       ; or written out
+  (biggest 2.5 1.0))             ; only literals: their own type (f64)
+```
+
+Inside, a parameter is the type itself, not its name: `(sizeof T)`,
+`(cast (ptr T) p)`, `(let ((s T null)) ...)` and macros' `type-of` all see the
+instance's types, whichever module they come from. An error in an instance
+says which one and where it was used. A generic that is never used is never
+compiled, so its body is only checked once something uses it.
+
 ## Modules
 
 Every file is a module, named after the file. `(import "scene")` (path
@@ -195,7 +218,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 |---|---|
 | `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
 | `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
-| `std/vec` | `(vec::define name T)` — a growable array `name` with `name-push` `name-pop` `name-clear` `name-free` `name-slice` |
+| `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 
 ## Operators
 
@@ -251,4 +274,4 @@ with `,'it`. `gensym` still exists for names a macro builds itself.
 
 Done: reader, typed core, LLVM code generation and optimisation, modules
 (with C headers as modules), the C calling convention, bit fields, macros with type queries, and
-operator overloading. Next: porting the teapot ray tracer to lisc.
+operator overloading, generics. The teapot ray tracer is written in lisc.

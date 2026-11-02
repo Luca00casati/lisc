@@ -830,6 +830,7 @@ struct Compiler::Impl : MetaHost {
         std::string key;                  // module::name
         std::vector<std::string> params;  // T ...
         std::map<std::vector<Type *>, Type *> structs;
+        std::vector<std::vector<std::string>> needs;  // per parameter: the operators it must have, from (T < =)
     };
     std::map<std::string, Generic> generic_structs, generic_fns;
     std::map<StructInfo *, std::pair<Generic *, std::vector<Type *>>> instance_of;
@@ -842,6 +843,9 @@ struct Compiler::Impl : MetaHost {
         Loc at;  // where it was first used
     };
     std::vector<PendingFn> pending_fns;  // instances declared, bodies to compile
+    std::map<std::string, std::vector<Generic *>> generic_ops;  // operator → its generic defops
+    std::vector<std::pair<std::string, std::string>> generic_op_keys;
+    int generic_op_count = 0;
     bool structs_ready = false;          // pass 1 is over: instances can be laid out when made
     std::vector<std::pair<StructInfo *, Loc>> pending_layout;
 
@@ -849,12 +853,20 @@ struct Compiler::Impl : MetaHost {
         Form *n = f->at(1);
         if (n->size() < 2 || n->at(0)->kind != Form::Sym)
             fatal(n->loc, is_fn ? "(defn (name T ...) ((a T) ...) R body...)" : "(struct (name T ...) (field T) ...)");
-        Generic g{f, cur, def_key(n->at(0)), {}, {}};
+        Generic g{f, cur, def_key(n->at(0)), {}, {}, {}};
         for (size_t i = 1; i < n->size(); i++) {
-            if (n->at(i)->kind != Form::Sym) fatal(n->at(i)->loc, "a type parameter is a name");
-            for (auto &p : g.params)
-                if (p == n->at(i)->text) fatal(n->at(i)->loc, "type parameter %s is there twice", p.c_str());
-            g.params.push_back(n->at(i)->text);
+            // T, or (T op ...): T must have these operators
+            Form *p = n->at(i), *name = p->is_list() && p->size() >= 2 ? p->at(0) : p;
+            if (name->kind != Form::Sym) fatal(p->loc, "a type parameter is a name, or (name operator ...)");
+            for (auto &q : g.params)
+                if (q == name->text) fatal(p->loc, "type parameter %s is there twice", q.c_str());
+            g.params.push_back(name->text);
+            g.needs.emplace_back();
+            if (p->is_list())
+                for (size_t j = 1; j < p->size(); j++) {
+                    if (p->at(j)->kind != Form::Sym) fatal(p->at(j)->loc, "(T operator ...): operators are names like < = +");
+                    g.needs.back().push_back(p->at(j)->text);
+                }
         }
         auto &table = is_fn ? generic_fns : generic_structs;
         if (table.count(g.key) || (is_fn ? c.globals_.count(g.key) : c.types_.count(g.key)))
@@ -868,7 +880,8 @@ struct Compiler::Impl : MetaHost {
     }
     static std::string bare(const std::string &key) { return key.substr(key.find("::") == std::string::npos ? 0 : key.rfind("::") + 2); }
     std::string instance_name(Generic &g, const std::vector<Type *> &args) {
-        std::string s = "(" + bare(g.key);
+        std::string b = bare(g.key);
+        std::string s = "(" + b.substr(0, b.find('#'));  // (a generic defop's name is op#N)
         for (Type *t : args) s += " " + type_name(t);
         return s + ")";
     }
@@ -899,9 +912,38 @@ struct Compiler::Impl : MetaHost {
         return args;
     }
 
+    // does (op t t) mean something: built in for numbers, or defined with defop?
+    bool supports(const std::string &op, Type *t, Loc at) {
+        static const std::set<std::string> arith = {"+", "-", "*", "/", "%"}, order = {"<", ">", "<=", ">="},
+                                           eq = {"=", "!="}, bits = {"&", "|", "^", "<<", ">>"};
+        if (arith.count(op) && t->is_num()) return true;
+        if (order.count(op) && (t->is_num() || t->is_ptr())) return true;
+        if (eq.count(op) && t->is_scalar()) return true;
+        if (bits.count(op) && t->is_int()) return true;
+        auto it = overloads.find(op);
+        if (it != overloads.end())
+            for (Global *g : it->second) {
+                bool ok = !g->type->params.empty();
+                for (Type *p : g->type->params) ok = ok && p == t;
+                if (ok) return true;
+            }
+        std::vector<Opnd> xs(2, Opnd{Val{llvm::UndefValue::get(ll(t)), t}, nullptr});
+        std::vector<Global *> found;
+        generic_overloads(op, xs, at, found);
+        return !found.empty();
+    }
+    void check_needs(Generic &g, const std::vector<Type *> &args, Loc at) {
+        for (size_t i = 0; i < args.size(); i++)
+            for (auto &op : g.needs[i])
+                if (!supports(op, args[i], at))
+                    fatal(at, "%s needs (%s %s %s), and there is none for %s = %s: define it with defop", bare(g.key).c_str(), op.c_str(),
+                          g.params[i].c_str(), g.params[i].c_str(), g.params[i].c_str(), type_name(args[i]).c_str());
+    }
+
     Type *instantiate_struct(Generic &g, const std::vector<Type *> &args, Loc at) {
         auto it = g.structs.find(args);
         if (it != g.structs.end()) return it->second;
+        check_needs(g, args, at);
         auto *st = new StructInfo;
         st->name = instance_name(g, args);
         st->is_union = g.def->is_call("union");
@@ -924,6 +966,7 @@ struct Compiler::Impl : MetaHost {
         key += ")";
         auto it = c.globals_.find(key);
         if (it != c.globals_.end()) return &it->second;
+        check_needs(g, args, at);
         std::string shown = instance_name(g, args);
         auto bind = binding(g, args);
         inside(g, bind, [&] { declare_fn(g.def, key); });
@@ -952,6 +995,38 @@ struct Compiler::Impl : MetaHost {
         if (gk.empty() || inst == instance_of.end() || inst->second.first != &generic_structs[gk]) return;
         for (size_t j = 1; j < pat->size() && j - 1 < inst->second.second.size(); j++) match(g, pat->at(j), inst->second.second[j - 1], b, arg);
     }
+    // a generic function as a value: (name T ...) written out, or a bare name
+    // where a function pointer is wanted (its types tell what T is)
+    Global *generic_value(Form *f, Type *want) {
+        if (f->is_list() && f->size() >= 2 && f->at(0)->kind == Form::Sym && !lookup_local(key(f->at(0))).v) {
+            std::string gk = generic_key(f->at(0), generic_fns);
+            if (gk.empty()) return nullptr;
+            Generic &g = generic_fns[gk];
+            return instantiate_fn(g, type_args(g, f), f->loc);
+        }
+        std::string gk = f->kind == Form::Sym ? generic_key(f, generic_fns) : "";
+        if (gk.empty()) return nullptr;
+        Generic &g = generic_fns[gk];
+        Form *ps = g.def->at(2);
+        std::map<std::string, Type *> b;
+        if (want && want->is_ptr() && want->elem->kind == Type::Fn && want->elem->params.size() == ps->size()) {
+            Type *ft = want->elem;
+            for (size_t i = 0; i < ps->size(); i++)
+                if (ps->at(i)->is_list() && ps->at(i)->size() == 2) match(g, ps->at(i)->at(1), ft->params[i], b, f);
+            match(g, g.def->at(3), ft->elem, b, f);
+        }
+        std::vector<Type *> args;
+        for (auto &p : g.params) {
+            if (!b.count(p)) fatal(f->loc, "%s is generic: write (addr (%s %s ...)) to say for which types", f->text.c_str(), f->text.c_str(), p.c_str());
+            args.push_back(b[p]);
+        }
+        return instantiate_fn(g, args, f->loc);
+    }
+
+    bool bare_generic(Form *a) {
+        return a->kind == Form::Sym && !lookup_local(key(a)).v && !lookup_global(a) && !generic_key(a, generic_fns).empty();
+    }
+
     Global *infer_fn(Generic &g, Form *call) {
         Form *ps = g.def->at(2);
         size_t n = call->size() - 1;
@@ -959,7 +1034,7 @@ struct Compiler::Impl : MetaHost {
         std::map<std::string, Type *> b;
         for (size_t i = 0; i < n; i++) {
             Form *a = call->at(i + 1);
-            if (untyped(a) || a->is_sym("null")) continue;
+            if (untyped(a) || a->is_sym("null") || bare_generic(a)) continue;  // (these get their type from the parameter)
             if (ps->at(i)->is_list() && ps->at(i)->size() == 2) match(g, ps->at(i)->at(1), type_of(a), b, a);
         }
         // a parameter only literals stand for: their own type ((max 1 2) is for i32)
@@ -978,6 +1053,7 @@ struct Compiler::Impl : MetaHost {
     }
 
     Type *parse_type(Form *f) override {
+        if (f->kind == Form::Sym && f->type) return const_cast<Type *>(f->type);  // (from type-of)
         f = expand(f);
         if (f->kind == Form::Sym) {
             auto tb = tbind.find(f->text);
@@ -1371,6 +1447,7 @@ struct Compiler::Impl : MetaHost {
         Val l = lookup_local(key(f));
         if (l.v) return {load(l), l.t};
         Global *g = lookup_global(f);
+        if (!g) g = generic_value(f, want);
         if (!g) fatal(f->loc, at_top_typeof ? "unknown name '%s' (type-of in a top-level macro knows types and C declarations, not the program's functions, globals and constants: they are declared after)" : "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
@@ -1439,10 +1516,12 @@ struct Compiler::Impl : MetaHost {
         }
         if (hs == "addr") {
             if (f->size() != 2) fatal(f->loc, "(addr place)");
-            if (f->at(1)->kind == Form::Sym) {
+            if (f->at(1)->kind == Form::Sym && !lookup_local(key(f->at(1))).v) {
                 Global *g = lookup_global(f->at(1));
-                if (g && g->kind == Global::Func && !lookup_local(key(f->at(1))).v) return {g->value, t_ptr(g->type)};
+                if (!g) g = generic_value(f->at(1), want);
+                if (g && g->kind == Global::Func) return {g->value, t_ptr(g->type)};
             }
+            if (Global *g = generic_value(f->at(1), want)) return {g->value, t_ptr(g->type)};  // (addr (name T ...))
             Val a = place(f->at(1));
             if (a.bwidth) fatal(f->at(1)->loc, "cannot take the address of a bit field");
             return {a.v, t_ptr(a.t)};
@@ -1628,6 +1707,64 @@ struct Compiler::Impl : MetaHost {
     }
 
     // the defop matching these operands, called; found = false if none matches
+    // the generic defops of op that fit these operands, as instances. Only for
+    // operands that include a struct: numbers keep their built-in operators,
+    // whatever a (defop (+ T) ((a T) (b T)) T ...) would say.
+    void generic_overloads(const std::string &op, std::vector<Opnd> &xs, Loc at, std::vector<Global *> &out) {
+        auto it = generic_ops.find(op);
+        if (it == generic_ops.end()) return;
+        bool any_struct = false;
+        for (auto &x : xs) any_struct |= x.v.v && x.v.t->kind == Type::Struct;
+        if (!any_struct) return;
+        for (Generic *g : it->second) {
+            Form *ps = g->def->at(2);
+            if (ps->size() != xs.size()) continue;
+            std::map<std::string, Type *> b;
+            bool ok = true;
+            for (size_t i = 0; i < xs.size() && ok; i++) {
+                if (!xs[i].v.v) continue;
+                Form *pt = ps->at(i)->is_list() && ps->at(i)->size() == 2 ? ps->at(i)->at(1) : nullptr;
+                if (pt) ok = fits(*g, pt, xs[i].v.t, b);
+            }
+            for (size_t i = 0; i < xs.size() && ok; i++) {  // literals: a parameter that is just T takes their type
+                Form *pt = ps->at(i)->is_list() && ps->at(i)->size() == 2 ? ps->at(i)->at(1) : nullptr;
+                if (!xs[i].v.v && pt && pt->kind == Form::Sym && !b.count(pt->text) &&
+                    std::find(g->params.begin(), g->params.end(), pt->text) != g->params.end())
+                    b[pt->text] = default_type(xs[i].f);
+            }
+            std::vector<Type *> args;
+            for (auto &p : g->params) {
+                if (!b.count(p)) { ok = false; break; }
+                args.push_back(b[p]);
+            }
+            if (!ok) continue;
+            Global *inst = instantiate_fn(*g, args, at);
+            for (size_t i = 0; i < xs.size() && ok; i++)  // (what the pattern didn't pin down must still agree)
+                ok = xs[i].v.v ? inst->type->params[i] == xs[i].v.t : inst->type->params[i]->is_num();
+            if (ok) out.push_back(inst);
+        }
+    }
+    // does a parameter's type pattern fit this type? (binds the parameters it meets)
+    bool fits(Generic &g, Form *pat, Type *t, std::map<std::string, Type *> &b) {
+        if (pat->kind == Form::Sym) {
+            if (std::find(g.params.begin(), g.params.end(), pat->text) == g.params.end()) return true;
+            auto it = b.find(pat->text);
+            if (it == b.end()) b[pat->text] = t;
+            return it == b.end() || it->second == t;
+        }
+        if (!pat->is_list() || pat->size() < 2 || pat->at(0)->kind != Form::Sym) return true;
+        if (pat->is_call("ptr")) return t->is_ptr() && fits(g, pat->at(1), t->elem, b);
+        if (pat->is_call("array")) return t->kind == Type::Array && fits(g, pat->at(1), t->elem, b);
+        if (pat->is_call("slice")) return t->kind == Type::Struct && t->st->slice_of && fits(g, pat->at(1), t->st->slice_of, b);
+        std::string gk = generic_key(pat->at(0), generic_structs);
+        if (gk.empty()) return true;
+        auto inst = t->kind == Type::Struct ? instance_of.find(t->st) : instance_of.end();
+        if (inst == instance_of.end() || inst->second.first != &generic_structs[gk]) return false;
+        for (size_t j = 1; j < pat->size() && j - 1 < inst->second.second.size(); j++)
+            if (!fits(g, pat->at(j), inst->second.second[j - 1], b)) return false;
+        return true;
+    }
+
     Val overload(const std::string &op, std::vector<Opnd> xs, Loc at, bool *found) {
         std::vector<Global *> match;
         for (Global *g : overloads[op]) {
@@ -1637,6 +1774,7 @@ struct Compiler::Impl : MetaHost {
                 ok = xs[i].v.v ? g->type->params[i] == xs[i].v.t : g->type->params[i]->is_num();
             if (ok) match.push_back(g);
         }
+        if (match.empty()) generic_overloads(op, xs, at, match);
         *found = !match.empty();
         if (match.empty()) return {};
         if (match.size() > 1) {
@@ -1854,6 +1992,7 @@ struct Compiler::Impl : MetaHost {
 
     // (x T) in a let: is the second item a type rather than an initializer?
     bool is_type_form(Form *f) {
+        if (f->kind == Form::Sym && f->type) return true;
         f = expand(f);
         if (f->kind == Form::Sym) {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str",
@@ -2484,6 +2623,18 @@ struct Compiler::Impl : MetaHost {
             Form *&f = item.first;
             cur = item.second;
             if (!f->is_call("defop")) continue;
+            if (f->size() >= 5 && f->at(1)->is_list() && f->at(1)->size() >= 2 && f->at(1)->at(0)->kind == Form::Sym) {
+                // (defop (op T ...) params R body...): a generic function under a name of its own
+                std::vector<Form *> items = f->items, name = f->at(1)->items;
+                std::string op = name[0]->text;
+                name[0] = mk_sym(name[0]->loc, op + "#" + std::to_string(++generic_op_count));
+                name[0]->mod = f->at(1)->at(0)->mod;
+                items[0] = mk_sym(f->loc, "defn");
+                items[1] = mk_list(f->at(1)->loc, name);
+                f = mk_list(f->loc, items);
+                generic_op_keys.push_back({op, def_key(name[0])});
+                continue;
+            }
             if (f->size() < 5 || f->at(1)->kind != Form::Sym || !f->at(2)->is_list()) fatal(f->loc, "(defop op ((a T) ...) R body...)");
             std::string name = f->at(1)->text + "(";
             for (size_t i = 0; i < f->at(2)->size(); i++) {
@@ -2524,6 +2675,10 @@ struct Compiler::Impl : MetaHost {
             }
         });
         for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second]);
+        for (auto &o : generic_op_keys) {
+            generic_ops[o.first].push_back(&generic_fns[o.second]);
+            overloads[o.first];  // (so the operator looks for overloads at all)
+        }
         // (export name ...): these functions and globals keep their own name, for C
         for (auto &e : exports) {
             cur = e.second;

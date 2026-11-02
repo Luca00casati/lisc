@@ -170,6 +170,25 @@ instance's types, whichever module they come from. An error in an instance
 says which one and where it was used. A generic that is never used is never
 compiled, so its body is only checked once something uses it.
 
+A parameter can say which operators its type must have, `(T op ...)`; using
+the generic with a type that lacks one is an error at the use, naming it:
+
+```lisp
+(defn (sort (T <)) ((s (slice T))) void ...)    ; numbers, or a struct with a (defop < ...)
+```
+
+A generic function is a value too: `(addr (inc i64))`, or just `inc` where a
+function pointer is wanted (its type says what T is): `(apply-twice inc 2.5)`.
+
+Operators can be generic, for every instance of a generic struct:
+
+```lisp
+(defop (+ T) ((a (vec2 T)) (b (vec2 T))) (vec2 T) (v2 (+ a.x b.x) (+ a.y b.y)))
+```
+
+A generic `defop` applies only when an operand is a struct, so numbers keep
+their own operators.
+
 ## Modules
 
 Every file is a module, named after the file. `(import "scene")` (path
@@ -223,6 +242,8 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
 | `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
+| `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a `(ptr (fn (T T) bool))` |
+| `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each (k v m) ...)`; keys by value, strs by contents, structs by bytes |
 
 ## Operators
 

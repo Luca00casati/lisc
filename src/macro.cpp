@@ -264,9 +264,12 @@ Form *Meta::type_form(Type *t, Loc at) {
     }
     case Type::Struct:
         if (t->st->slice_of) return mk_list(at, {mk_sym(at, "slice"), type_form(t->st->slice_of, at)});
-        return mk_sym(at, type_name(t));
-    default: return mk_sym(at, type_name(t));
+        break;
+    default: break;
     }
+    Form *s = mk_sym(at, type_name(t));  // (named for people and eq; parse_type takes the type itself)
+    s->type = t;
+    return s;
 }
 
 // bind a parameter pattern to a value: a name binds it, a list destructures

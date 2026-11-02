@@ -18,11 +18,14 @@
     (for (i u64 0 v.len) (+= s (aref v.data i)))
     s))
 
-(defn (biggest T) ((a T) (b T)) T (if (> a b) a b))
+(defn (biggest (T >)) ((a T) (b T)) T (if (> a b) a b))   ; T must have >
 (defn (swap A B) ((p (pair A B))) (pair B A) (make (pair B A) :a p.b :b p.a))
 (defn (size-of T) () u64 (sizeof T))
 (defn (length T) ((n (ptr (node T)))) i32       ; recursive, and calling itself by inference
   (if (= n null) 0 (+ 1 (length n.next))))
+
+(defn (apply-twice T) ((f (ptr (fn (T) T))) (x T)) T (f (f x)))
+(defn (inc T) ((x T)) T (+ x 1))
 
 (struct point (x f32) (y f32))
 (defop + ((p point) (q point)) point (make point :x (+ p.x q.x) :y (+ p.y q.y)))
@@ -43,4 +46,7 @@
     (printf c"%g %d %lu %lu\n" q.a q.b (sizeof (pair i32 f64)) ((size-of (pair u8 (vec u8))))))
   (let ((c (make (node i32) :value 3)) (b (make (node i32) :value 2 :next (addr c))) (a (make (node i32) :value 1 :next (addr b))))
     (printf c"%d\n" (length (addr a))))
+  ; generic functions as values: written out, or told by the pointer type wanted
+  (let ((f (addr (inc i64))) (g (ptr (fn (f32) f32)) inc))
+    (printf c"%ld %g %d %g\n" (f 41) (cast f64 (g 0.5)) (apply-twice (addr (inc i32)) 5) (apply-twice inc 2.5)))
   0)

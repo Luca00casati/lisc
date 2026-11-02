@@ -49,6 +49,9 @@ struct Form {
     // Sym: the module whose source the symbol was read from (or whose macro
     // template it was copied from); null for symbols the compiler made up
     const char *mod = nullptr;
+    // Sym: the type itself, for a symbol type-of made: it means this type
+    // wherever it lands, whatever its name would resolve to there
+    const struct Type *type = nullptr;
     // creation order: forms newer than an expansion's start were made by it
     uint64_t id = next_id++;
     static inline uint64_t next_id = 0;

@@ -8,8 +8,9 @@
   ; printf's real declaration: variadic, const char *
   (printf "pi %.6f  sqrtf(2) %.7f  INT_MAX %d  UINT32_MAX %u\n" M_PI (cast f64 (sqrtf 2.0)) INT_MAX UINT32_MAX)
   ; malloc / strlen / memcpy / free with C's types (size_t is u64)
-  (let ((s "lisc talks to libc") (n (strlen s)) (buf (cast (ptr i8) (malloc (+ n 1)))))
-    (memcpy buf s (+ n 1))
+  (let ((s "lisc talks to libc") (n s.len) (buf (cast (ptr i8) (malloc (+ n 1)))))   ; a str knows its size
+    (memcpy buf s.data n)
+    (set (aref buf n) 0)                        ; C wants a terminator: add it
     (set (aref buf 0) 76)                       ; 'L'
     (printf "%s (%lu bytes)\n" buf n)
     (free buf))

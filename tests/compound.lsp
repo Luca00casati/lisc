@@ -20,7 +20,7 @@
     (+= v (make v2 :x 0.5 :y 0.5))                 ; through the defop
     (+= f.lo 1) (-= f.hi 10)                       ; bit fields
     (printf "v %g %g  flags %u %u\n" (cast f64 v.x) (cast f64 v.y) f.lo f.hi))
-  (let ((s "abcdef") (p s))
+  (let ((p (ptr i8) "abcdef"))
     (+= p 2)                                       ; pointer arithmetic
     (printf "p %s\n" p))
   0)

@@ -1,0 +1,4 @@
+banana split: 3 a's; tail "split" (5 bytes)
+a zero byte inside: len 3, last 0x62
+C sees: teapot 3, long
+sizeof str 16

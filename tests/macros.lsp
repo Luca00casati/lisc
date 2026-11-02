@@ -10,16 +10,17 @@
   `(do ,@(map (lambda (i) `(let ((,var ,i)) ,@body)) (range n))))
 
 (defmeta format-of (t)                   ; a compile-time helper function
-  (cond ((eq t 'f32) "%g") ((eq t 'f64) "%g") ((eq t '(ptr i8)) "%s")
+  (cond ((eq t 'f32) "%g") ((eq t 'f64) "%g") ((eq t '(ptr i8)) "%s") ((eq t 'str) "%.*s")
         ((eq (type-kind t) 'int) "%ld")
         (else (error "show: no format for " t))))
 
 (defmacro show (x)                       ; dispatch on the argument's type
   (let ((t (type-of x)))
     `(printf ,(str (str x) " = " (format-of t) "\n")
-             ,(cond ((eq t 'f32) `(cast f64 ,x))
-                    ((eq (type-kind t) 'int) `(cast i64 ,x))
-                    (else x)))))
+             ,@(cond ((eq t 'f32) `((cast f64 ,x)))
+                     ((eq (type-kind t) 'int) `((cast i64 ,x)))
+                     ((eq t 'str) `((cast i32 (. ,x len)) (. ,x data)))   ; a str: its size, then its bytes
+                     (else (list x))))))
 
 (defn main () i32
   (let ((a 1) (b 2))

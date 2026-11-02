@@ -49,6 +49,8 @@
 
 using llvm::BasicBlock;
 
+Type *t_str();
+
 namespace {
 
 struct Val {
@@ -630,7 +632,7 @@ struct Compiler::Impl : MetaHost {
                 {"i8", t_int(8, true)}, {"i16", t_int(16, true)}, {"i32", t_int(32, true)}, {"i64", t_int(64, true)},
                 {"u8", t_int(8, false)}, {"u16", t_int(16, false)}, {"u32", t_int(32, false)}, {"u64", t_int(64, false)},
                 {"isize", t_int(64, true)}, {"usize", t_int(64, false)},
-                {"f32", t_float(32)}, {"f64", t_float(64)},
+                {"f32", t_float(32)}, {"f64", t_float(64)}, {"str", t_str()},
             };
             auto it = builtin.find(f->text);
             if (it != builtin.end()) return it->second;
@@ -837,9 +839,11 @@ struct Compiler::Impl : MetaHost {
             Val base;
             if (is_place(f->at(1))) {
                 base = place(f->at(1));
+                if (base.t == t_str()) base = field_addr(base, mk_sym(f->loc, "data"));  // a str's bytes
                 if (base.t->kind == Type::Ptr) base = {load(base), base.t};
             } else {
                 base = expr(f->at(1), nullptr);
+                if (base.t == t_str()) base = {b.CreateExtractValue(base.v, 0), t_ptr(t_int(8, false))};
                 if (base.t->kind == Type::Array) base = spill(base);
             }
             Val i = expr(f->at(2), t_int(64, true));
@@ -926,6 +930,36 @@ struct Compiler::Impl : MetaHost {
         return float_const(f->text, want && want->is_float() ? want : t_float(64));
     }
 
+    // A string literal is a str: its bytes and their count, no terminator. The
+    // bytes are stored with a zero after them (outside len), so where C wants a
+    // pointer — a (ptr i8), (ptr u8) or (ptr void) parameter, field or variable,
+    // or a variadic argument — the literal is that pointer, and C sees a C string.
+    std::map<std::string, llvm::GlobalVariable *> strings;  // one copy of each literal
+    Val string(const std::string &text, Type *want) {
+        llvm::GlobalVariable *&g = strings[text];
+        if (!g) {
+            llvm::Constant *bytes = llvm::ConstantDataArray::getString(ctx, text, true);
+            g = new llvm::GlobalVariable(mod, bytes->getType(), true, llvm::GlobalValue::PrivateLinkage, bytes, "str");
+            g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+            g->setAlignment(llvm::Align(1));
+        }
+        if (want && want->is_ptr() && (want->elem == t_void() || (want->elem->is_int() && want->elem->bits == 8)))
+            return {g, want};
+        auto *st = llvm::cast<llvm::StructType>(ll(t_str()));
+        llvm::Constant *parts[] = {g, llvm::ConstantInt::get(b.getInt64Ty(), text.size())};
+        llvm::Constant *v = llvm::ConstantStruct::get(st, parts);
+        return {v, t_str()};
+    }
+    // a string literal, or an if choosing between two
+    bool is_string_lit(Form *f) {
+        f = expand(f);
+        if (f->kind == Form::Sym && !lookup_local(key(f)).v) {  // a constant naming a literal (-D NAME=text)
+            Global *g = lookup_global(f);
+            return g && g->kind == Global::Const && g->form && is_string_lit(g->form);
+        }
+        return f->kind == Form::Str || (f->is_call("if") && f->size() == 4 && is_string_lit(f->at(2)) && is_string_lit(f->at(3)));
+    }
+
     // rounded once, from the text: like C's 1.5f / 1.5
     Val float_const(const std::string &text, Type *t) {
         if (t->bits == 32) return {llvm::ConstantFP::get(b.getFloatTy(), strtof(text.c_str(), nullptr)), t};
@@ -961,10 +995,7 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         switch (f->kind) {
         case Form::Int: case Form::Float: return literal(f, want);
-        case Form::Str: {
-            llvm::Constant *s = b.CreateGlobalStringPtr(f->text, "str", 0, &mod);
-            return {s, t_ptr(t_int(8, true))};
-        }
+        case Form::Str: return string(f->text, want);
         case Form::Sym: return symbol(f, want);
         case Form::Fn: fatal(f->loc, "a compile-time function (from a macro) cannot be used in code");
         case Form::List: break;
@@ -1334,7 +1365,7 @@ struct Compiler::Impl : MetaHost {
     bool is_type_form(Form *f) {
         f = expand(f);
         if (f->kind == Form::Sym) {
-            static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64"};
+            static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str"};
             for (const char *n : names)
                 if (f->text == n) return true;
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
@@ -1639,7 +1670,12 @@ struct Compiler::Impl : MetaHost {
                 fixed.push_back(value_for(a, ft->params[i], "argument"));
                 continue;
             }
-            // variadic: C's default promotions; arrays decay to a pointer to their first element
+            // variadic: C's default promotions; arrays decay to a pointer to their first
+            // element; a string literal is a C string (printf's "%s")
+            if (is_string_lit(a)) {
+                var.push_back(expr(a, t_ptr(t_int(8, true))));
+                continue;
+            }
             if (is_place(a)) {
                 Val p = place(a);
                 if (p.t->kind == Type::Array) {
@@ -1995,6 +2031,20 @@ struct Compiler::Impl : MetaHost {
 };
 
 Compiler::Compiler() : ctx_(new llvm::LLVMContext), mod_(new llvm::Module("lisc", *ctx_)), impl_(new Impl(*this)) {}
+
+// str: a string with a size, not NUL-terminated: (data (ptr u8)) (len u64)
+Type *t_str() {
+    static Type *t = [] {
+        auto *st = new StructInfo;
+        st->name = "str";
+        st->fields = {{"data", t_ptr(t_int(8, false)), 0}, {"len", t_int(64, false), 8}};
+        st->size = 16;
+        st->align = 8;
+        st->complete = true;
+        return t_struct(st);
+    }();
+    return t;
+}
 Compiler::~Compiler() = default;
 
 void Compiler::compile(const std::vector<Form *> &forms) {

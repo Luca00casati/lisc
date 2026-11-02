@@ -31,7 +31,7 @@ directory and `-I` directories, then the system ones.
 
 ## Language
 
-Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void`,
+Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void str`,
 `(ptr T)`, `(array T N)`, `(fn (A B ...) R)`, struct/union names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
@@ -65,7 +65,7 @@ Expressions — everything is one; statements have type `void`:
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
-    "strings" are (ptr i8);  true false
+    "strings" are str;  true false
     null — the zero value of the wanted type;  undefined — no value at all
     (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
 
@@ -75,6 +75,15 @@ type wanted — the null pointer, `0`, `0.0`, `false`, an all-zero struct or
 array — so `(set v null)` resets a struct. `undefined` opts out:
 `(let ((buf (array u8 4096) undefined)) ...)` leaves the memory as it is, for
 code that fills it before reading.
+
+Strings are UTF-8 (source files must be valid UTF-8; `\u{1F600}` writes a
+code point, `\xHH` a raw byte). A string is a `str`: `data` (a `(ptr u8)`) and
+`len` (its size in bytes, a `u64`), not NUL-terminated — a `\0` inside is just
+a byte. `(aref s i)` is a byte. A string literal's bytes are stored with a zero
+after them (not part of the string), so where C wants a pointer — a `(ptr i8)`,
+`(ptr u8)` or `(ptr void)` parameter, field or variable, or a variadic
+argument like printf's `%s` — the literal is that pointer. A str made at run
+time has no such zero: to give one to C, make sure there is one.
 
 Typing rules:
 

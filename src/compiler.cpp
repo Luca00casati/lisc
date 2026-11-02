@@ -2167,10 +2167,27 @@ struct Compiler::Impl : MetaHost {
             }
         }
         cur = nullptr;
-        // pass 3: function bodies
+        // pass 3: function bodies. An error in one is reported and the next is
+        // compiled anyway (up to 20 errors); the program is not produced.
         each(all, [&](Form *f) {
-            if (f->is_call("defn")) define_fn(f);
+            if (!f->is_call("defn")) return;
+            jmp_buf here;
+            if (setjmp(here) == 0) {
+                error_trap = &here;
+                define_fn(f);
+            } else {
+                abandon_fn();
+                if (error_count >= 20) {
+                    fprintf(stderr, "lisc: too many errors, stopping\n");
+                    exit(1);
+                }
+            }
+            error_trap = nullptr;
         });
+        if (error_count) {
+            fprintf(stderr, "lisc: %d error%s\n", error_count, error_count == 1 ? "" : "s");
+            exit(1);
+        }
     }
 
     std::vector<std::pair<Form *, ModInfo *>> exports;
@@ -2330,6 +2347,19 @@ struct Compiler::Impl : MetaHost {
         llvm::Function *fn0 = llvm::Function::Create(fn_abi(ft).ty, link, name, mod);
         fn0->setAttributes(fn_abi(ft).attrs);
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
+    }
+
+    // after an error in a function body: drop what was built, reset the state
+    void abandon_fn() {
+        if (fn) fn->deleteBody();
+        scopes.clear();
+        loops.clear();
+        type_memo.clear();
+        in_defer = false;
+        dsp = nullptr;
+        b.ClearInsertionPoint();
+        b.SetCurrentDebugLocation(llvm::DebugLoc());
+        meta.reset();
     }
 
     void define_fn(Form *f) {

@@ -54,6 +54,8 @@ public:
     bool is_macro(const std::string &key) const { return macros_.count(key) != 0; }
     // expand one macro call (its head names the macro `key`)
     Form *expand(Form *call, const std::string &key);
+    // after an error broke off an expansion
+    void reset() { mark_ = 0; call_at_ = Loc(); }
 
     struct Env;
     struct Closure;

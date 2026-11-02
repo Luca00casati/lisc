@@ -1,6 +1,7 @@
 // form.h — source forms (s-expressions) and error reporting.
 #pragma once
 
+#include <csetjmp>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,8 +22,12 @@ struct Expansion {
 };
 
 // Print "file:line:col: error: ...", plus "in expansion of" lines for code a
-// macro produced, and exit. The compiler stops at the first error.
+// macro produced, and exit — or, while error_trap is set (compiling a
+// function body), count it and jump there, so the next function is compiled.
 [[noreturn]] void fatal(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+extern jmp_buf *error_trap;
+extern int error_count;
 
 struct Form {
     enum Kind { Int, Float, Sym, Str, List, Fn } kind;  // Fn: a compile-time closure (macro.cpp)

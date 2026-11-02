@@ -1,0 +1,2 @@
+counter 400000
+swap old 1  cas 1 0  now 9

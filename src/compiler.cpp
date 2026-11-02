@@ -14,6 +14,8 @@
 //   (set place e)  (if c a [b])  (when c body...)  (unless c body...)
 //   (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
 //   (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...) (or ...) (not x)
+//   (+= place e) ... (>>= place e): the place's address computed once
+//   (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
 //   (. x field ...)  (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)
 //   (sizeof T)  (alignof T)  (make T [:field e ...] | [e ...])
 //
@@ -238,7 +240,14 @@ struct Compiler::Impl : MetaHost {
                        [&](const std::string &a, const std::string &b) {
                            Global &x = c.globals_[a], &y = c.globals_[b];
                            if (!x.imported || !y.imported || x.kind != y.kind) return false;
-                           if (x.value || y.value) return x.value == y.value || (x.kind == Global::Const && x.type == y.type);
+                           if (x.value || y.value) {
+                               if (x.value == y.value) return true;
+                               auto *gx = llvm::dyn_cast_or_null<llvm::GlobalVariable>(x.value);
+                               auto *gy = llvm::dyn_cast_or_null<llvm::GlobalVariable>(y.value);
+                               // C string constants: one name if the strings are the same
+                               return x.kind == Global::Const && gx && gy && gx->hasInitializer() && gy->hasInitializer() &&
+                                      gx->getInitializer() == gy->getInitializer();
+                           }
                            return x.form && y.form && x.form->kind == y.form->kind && x.form->text == y.form->text;
                        });
     }
@@ -381,8 +390,11 @@ struct Compiler::Impl : MetaHost {
 
     // the type of an expression where it stands, without emitting code: it is
     // compiled into a scratch block that is thrown away
+    std::map<Form *, Type *> type_memo;  // type-of results in the function being compiled
     Type *type_of(Form *f) override {
         if (!fn) fatal(f->loc, "type-of works only inside functions");
+        auto memo = type_memo.find(f);
+        if (memo != type_memo.end()) return memo->second;
         llvm::IRBuilderBase::InsertPoint ip = b.saveIP();
         size_t nblocks = fn->size();
         b.SetInsertPoint(BasicBlock::Create(ctx, "typeof", fn));
@@ -394,7 +406,7 @@ struct Compiler::Impl : MetaHost {
         for (BasicBlock *bb : made) bb->dropAllReferences();
         for (BasicBlock *bb : made) bb->eraseFromParent();
         b.restoreIP(ip);
-        return t;
+        return type_memo[f] = t;
     }
 
     /* --------------------------------------------------------- types --- */
@@ -966,6 +978,10 @@ struct Compiler::Impl : MetaHost {
         if (hs == "do") return body(f, 1, want);
         if (hs == "let") return let(f, want);
         if (hs == "set") return set(f);
+        if (hs.size() >= 2 && hs.back() == '=' && hs != "=" && hs != "!=" && hs != "<=" && hs != ">=" &&
+            is_arith(hs.substr(0, hs.size() - 1).c_str()))
+            return compound(f, hs.substr(0, hs.size() - 1));
+        if (hs.compare(0, 7, "atomic-") == 0 || hs == "fence") return atomic(f, hs);
         if (hs == "if") return if_(f, want);
         if (hs == "when" || hs == "unless") return when(f, hs == "unless");
         if (hs == "while") return while_(f);
@@ -1332,6 +1348,79 @@ struct Compiler::Impl : MetaHost {
         Val v = value_for(f->at(2), a.t, "assignment");
         store(a, v.v);
         return {nullptr, t_void()};
+    }
+
+    // (+= place e) and the other compound assignments: the place's address is
+    // computed once; the operator is the built-in one or a defop
+    Val compound(Form *f, const std::string &op) {
+        if (f->size() != 3) fatal(f->loc, "(%s= place value)", op.c_str());
+        Val a = place(f->at(1));
+        Opnd x{{load(a), a.t}, nullptr};
+        Opnd y{untyped(f->at(2)) ? Val{} : expr(f->at(2), nullptr), f->at(2)};
+        Val r;
+        bool found = false;
+        if (overloads.count(op)) r = overload(op, {x, y}, f->loc, &found);
+        if (!found) {
+            if (op == "<<" || op == ">>") {  // the count may be any integer type
+                if (!y.v.v) y.v = expr(y.f, a.t);
+                r = binop(op, x.v, y.v, f->at(2)->loc);
+            } else r = builtin_pair(op, x, y, f->at(2)->loc, false).v;
+        }
+        store(a, coerce(r, a.t, f->at(2)->loc, (op + "=").c_str()).v);
+        return {nullptr, t_void()};
+    }
+
+    // atomics on a place of integer, pointer (or, for load/store, float) type;
+    // an optional last :relaxed :acquire :release :acq-rel :seq-cst (the default)
+    Val atomic(Form *f, const std::string &hs) {
+        using AO = llvm::AtomicOrdering;
+        size_t n = f->size();
+        AO order = AO::SequentiallyConsistent;
+        Form *last = n > 1 ? f->at(n - 1) : nullptr;
+        if (last && last->kind == Form::Sym && last->text[0] == ':') {
+            const std::string &o = last->text;
+            order = o == ":relaxed" ? AO::Monotonic : o == ":acquire" ? AO::Acquire : o == ":release" ? AO::Release
+                  : o == ":acq-rel" ? AO::AcquireRelease : o == ":seq-cst" ? AO::SequentiallyConsistent
+                  : (fatal(last->loc, "unknown ordering %s (:relaxed :acquire :release :acq-rel :seq-cst)", o.c_str()), order);
+            n--;
+        }
+        if (hs == "fence") {
+            if (n != 1) fatal(f->loc, "(fence [ordering])");
+            b.CreateFence(order);
+            return {nullptr, t_void()};
+        }
+        std::string op = hs.substr(7);
+        size_t want_args = op == "load" ? 2 : op == "cas" ? 4 : 3;
+        if (n != want_args) fatal(f->loc, "(%s place%s [ordering])", hs.c_str(), op == "load" ? "" : op == "cas" ? " expected new" : " value");
+        Val a = place(f->at(1));
+        if (a.bwidth) fatal(f->at(1)->loc, "a bit field cannot be atomic");
+        bool flt_ok = op == "load" || op == "store";
+        if (!a.t->is_int() && !a.t->is_ptr() && !(flt_ok && a.t->is_float()))
+            fatal(f->at(1)->loc, "%s needs an integer or pointer place, got %s", hs.c_str(), type_name(a.t).c_str());
+        llvm::Align al(align_of(a.t));
+        if (op == "load") {
+            llvm::LoadInst *l = b.CreateAlignedLoad(ll(a.t), a.v, al);
+            l->setAtomic(order);
+            return {l, a.t};
+        }
+        Val v = value_for(f->at(2), a.t, "value");
+        if (op == "store") {
+            llvm::StoreInst *st = b.CreateAlignedStore(v.v, a.v, al);
+            st->setAtomic(order);
+            return {nullptr, t_void()};
+        }
+        if (op == "cas") {  // true if the place held `expected` and now holds `new`
+            Val nv = value_for(f->at(3), a.t, "value");
+            AO fail = order == AO::AcquireRelease ? AO::Acquire : order == AO::Release ? AO::Monotonic : order;
+            llvm::Value *r = b.CreateAtomicCmpXchg(a.v, v.v, nv.v, al, order, fail);
+            return {b.CreateExtractValue(r, 1), t_bool()};
+        }
+        using RMW = llvm::AtomicRMWInst::BinOp;
+        RMW k = op == "swap" ? RMW::Xchg : op == "add" ? RMW::Add : op == "sub" ? RMW::Sub : op == "and" ? RMW::And
+              : op == "or" ? RMW::Or : op == "xor" ? RMW::Xor
+              : (fatal(f->loc, "unknown %s (atomic-load store swap add sub and or xor cas, fence)", hs.c_str()), RMW::Xchg);
+        if (a.t->is_ptr() && k != RMW::Xchg) fatal(f->loc, "%s needs an integer place", hs.c_str());
+        return {b.CreateAtomicRMW(k, a.v, v.v, al, order), a.t};  // the old value
     }
 
     Val if_(Form *f, Type *want) {
@@ -1859,6 +1948,7 @@ struct Compiler::Impl : MetaHost {
         fn = llvm::cast<llvm::Function>(g.value);
         fn_ret = g.type->elem;
         cur_ft = g.type;
+        type_memo.clear();
         FnAbi &abi = fn_abi(g.type);
         b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
         scopes.assign(1, {});

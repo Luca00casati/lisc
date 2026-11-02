@@ -5,12 +5,23 @@
 #include <string>
 #include <vector>
 
+struct Expansion;
+
 struct Loc {
     const char *file = "?";
     int line = 0, col = 0;
+    // code a macro produced: the expansion it came from (for error messages)
+    const Expansion *via = nullptr;
 };
 
-// Print "file:line:col: error: ..." and exit. The compiler stops at the first error.
+// a macro call that produced code: the macro, and where it was called
+struct Expansion {
+    std::string macro;
+    Loc at;
+};
+
+// Print "file:line:col: error: ...", plus "in expansion of" lines for code a
+// macro produced, and exit. The compiler stops at the first error.
 [[noreturn]] void fatal(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 struct Form {
@@ -27,6 +38,9 @@ struct Form {
     // Sym: the module whose source the symbol was read from (or whose macro
     // template it was copied from); null for symbols the compiler made up
     const char *mod = nullptr;
+    // creation order: forms newer than an expansion's start were made by it
+    uint64_t id = next_id++;
+    static inline uint64_t next_id = 0;
 
     bool is_sym(const char *s) const { return kind == Sym && text == s; }
     bool is_list() const { return kind == List; }

@@ -281,10 +281,20 @@ Form *Meta::expand(Form *call, const std::string &key) {
     call_at_ = call->loc;
     mark_ = ++marks_;  // a fresh mark per expansion
     std::vector<Form *> args(call->items.begin() + 1, call->items.end());  // unevaluated: macros get forms
+    uint64_t start = Form::next_id;
     Form *r = call_closure(m, args, call->loc);
     call_at_ = saved;
     mark_ = saved_mark;
+    // the forms this expansion made remember it, so errors in them can say so
+    auto *e = new Expansion{m->name, call->loc};
+    stamp(r, start, e);
     return r;
+}
+
+void Meta::stamp(Form *f, uint64_t start, const Expansion *e) {
+    if (f->id < start || f->loc.via == e) return;  // older: the macro's arguments or its template's atoms
+    if (!f->loc.via) f->loc.via = e;
+    for (Form *x : f->items) stamp(x, start, e);
 }
 
 static void bind_params(Form *pat, Form *val, Meta::Env *env, const std::string &fn, Loc at) {
@@ -334,7 +344,12 @@ Form *Meta::quasi(Form *f, Env *env, int depth) {
         m->mod = f->mod;  // still resolved in the macro's module
         return m;
     }
-    if (f->kind != Form::List) return f;
+    if (f->kind != Form::List) {
+        if (!mark_ || f->kind == Form::Fn) return f;
+        Form *c = new Form(*f);  // a fresh copy, so errors in it point to this expansion
+        c->id = Form::next_id++;
+        return c;
+    }
     if (f->is_call("unquote") && f->size() == 2) {
         if (depth == 1) return eval(f->at(1), env);
         return mk_list(f->loc, {f->at(0), quasi(f->at(1), env, depth - 1)});

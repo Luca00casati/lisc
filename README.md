@@ -59,6 +59,9 @@ Expressions — everything is one; statements have type `void`:
     (if c a [b])  (when c body...)  (unless c body...)
     (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
     (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...)  (or ...)  (not x)
+    (+= place e) ... (>>= place e) — the place's address is computed once; defops apply
+    (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
+      — each with an optional :relaxed :acquire :release :acq-rel :seq-cst (default)
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero

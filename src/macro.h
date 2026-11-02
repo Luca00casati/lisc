@@ -64,6 +64,7 @@ private:
     Form *call_closure(Closure *c, const std::vector<Form *> &args, Loc at);
     Form *quasi(Form *f, Env *env, int depth);
     Form *type_form(Type *t, Loc at);
+    void stamp(Form *f, uint64_t start, const Expansion *e);
 
     MetaHost &host_;
     std::map<std::string, Closure *> macros_, metas_;

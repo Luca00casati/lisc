@@ -1,6 +1,6 @@
 // reader.cpp — text → forms.
 //
-//   ; comment            (a b c)             "string\n"
+//   ; comment            (a b c)             "string\n"  (UTF-8; \u{1F600}, \xHH raw byte)
 //   123  -5  0x1f        1.5  2e-3  -0.5     symbols: anything else
 //   'x  `x  ,x  ,@x  →  (quote x) (quasiquote x) (unquote x) (unquote-splicing x)
 //   a.b.c  →  (. a b c)  field access (a symbol with inner dots)
@@ -21,6 +21,8 @@ void fatal(Loc at, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    for (const Expansion *e = at.via; e; e = e->at.via)
+        fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
     exit(1);
 }
 
@@ -111,10 +113,25 @@ struct Reader {
                 case 'r': c = '\r'; break;
                 case '0': c = 0; break;
                 case '\\': case '"': break;
-                case 'x': {
+                case 'x': {  // a raw byte
                     char h[3] = {(char)next(), (char)next(), 0};
                     c = (int)strtol(h, nullptr, 16);
                     break;
+                }
+                case 'u': {  // \u{1F600}: a code point, written as UTF-8
+                    Loc u = loc();
+                    if (next() != '{') fatal(u, "\\u needs braces: \\u{1F600}");
+                    std::string hex;
+                    while (peek() >= 0 && peek() != '}') hex += (char)next();
+                    next();
+                    char *end;
+                    unsigned long cp = strtoul(hex.c_str(), &end, 16);
+                    if (hex.empty() || *end || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) fatal(u, "bad code point \\u{%s}", hex.c_str());
+                    if (cp < 0x80) f->text += (char)cp;
+                    else if (cp < 0x800) { f->text += (char)(0xC0 | cp >> 6); f->text += (char)(0x80 | (cp & 0x3F)); }
+                    else if (cp < 0x10000) { f->text += (char)(0xE0 | cp >> 12); f->text += (char)(0x80 | (cp >> 6 & 0x3F)); f->text += (char)(0x80 | (cp & 0x3F)); }
+                    else { f->text += (char)(0xF0 | cp >> 18); f->text += (char)(0x80 | (cp >> 12 & 0x3F)); f->text += (char)(0x80 | (cp >> 6 & 0x3F)); f->text += (char)(0x80 | (cp & 0x3F)); }
+                    continue;
                 }
                 default: fatal(loc(), "unknown escape '\\%c'", c);
                 }
@@ -165,6 +182,25 @@ struct Reader {
 
 }  // namespace
 
+// lisc source is UTF-8 (so string literals are UTF-8 too)
+static void check_utf8(const char *path, const std::string &s) {
+    int line = 1, col = 1;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        bool ok = n && i + n <= s.size();
+        for (size_t k = 1; ok && k < n; k++) ok = ((unsigned char)s[i + k] >> 6) == 2;
+        if (ok && n > 1) {  // no overlong forms, surrogates or values past U+10FFFF
+            uint32_t cp = n == 2 ? c & 0x1F : n == 3 ? c & 0x0F : c & 0x07;
+            for (size_t k = 1; k < n; k++) cp = cp << 6 | ((unsigned char)s[i + k] & 0x3F);
+            ok = cp >= (n == 2 ? 0x80u : n == 3 ? 0x800u : 0x10000u) && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+        }
+        if (!ok) fatal({path, line, col}, "the source is not valid UTF-8 here");
+        if (c == '\n') { line++; col = 1; } else col++;
+        i += n;
+    }
+}
+
 std::vector<Form *> read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) fatal({path, 0, 0}, "cannot open: %s", strerror(errno));
@@ -173,6 +209,7 @@ std::vector<Form *> read_file(const char *path) {
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) r.src.append(buf, n);
     fclose(f);
+    check_utf8(path, r.src);
     std::vector<Form *> forms;
     for (;;) {
         r.skip_space();

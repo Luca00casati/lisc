@@ -8,14 +8,14 @@
 (using drm)
 
 (defn main () i32
-  (let ((fd (open "/dev/dri/renderD128" O_RDWR)))
+  (let ((fd (open c"/dev/dri/renderD128" O_RDWR)))
     (when (< fd 0)
-      (perror "/dev/dri/renderD128")
+      (perror c"/dev/dri/renderD128")
       (return 1))
     (let ((id i32 0)
           (gp (make drm_i915_getparam :param I915_PARAM_CHIPSET_ID :value (addr id))))
       (if (= (ioctl fd DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
-          (printf "i915 chip id 0x%04x\n" id)
-          (perror "I915_GETPARAM")))
+          (printf c"i915 chip id 0x%04x\n" id)
+          (perror c"I915_GETPARAM")))
     (close fd))
   0)

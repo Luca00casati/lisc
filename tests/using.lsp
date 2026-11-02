@@ -8,8 +8,8 @@
   (sqrtf (+ (* a a) (* b b))))
 
 (defn main () i32
-  (libc::printf "qualified: %g %ld\n" (math::cos 0.0) (libc::strlen "four"))
+  (libc::printf c"qualified: %g %ld\n" (math::cos 0.0) (libc::strlen c"four"))
   (let ((gp (make i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID)))
     (using libc)                          ; in this let block
-    (printf "block: %g %d %lx\n" (cast f64 (hyp 3.0 4.0)) gp.param i915::DRM_IOCTL_I915_GETPARAM))
+    (printf c"block: %g %d %lx\n" (cast f64 (hyp 3.0 4.0)) gp.param i915::DRM_IOCTL_I915_GETPARAM))
   0)

@@ -5,5 +5,5 @@
 (defn main () i32
   (let ((n 20))
     (inc! n)
-    (printf "%d\n" (twice n)))
+    (printf c"%d\n" (twice n)))
   0)

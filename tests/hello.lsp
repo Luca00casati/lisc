@@ -2,5 +2,5 @@
 (extern puts ((ptr i8)) i32)
 
 (defn main () i32
-  (puts "hello from lisc")
+  (puts c"hello from lisc")
   0)

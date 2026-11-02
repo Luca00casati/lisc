@@ -2,6 +2,6 @@
 (import "libc")
 (using libc)
 (defn main () i32
-  (printf "%d %s %d %d\n" WIDTH NAME (cast i32 (defined FAST)) (cast i32 (defined SLOW)))
-  (if-defined SLOW (printf "%d\n" SLOW-ONLY-NAME) (printf "no SLOW\n"))
+  (printf c"%d %s %d %d\n" WIDTH NAME (cast i32 (defined FAST)) (cast i32 (defined SLOW)))
+  (if-defined SLOW (printf c"%d\n" SLOW-ONLY-NAME) (printf c"no SLOW\n"))
   0)

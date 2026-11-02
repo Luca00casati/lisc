@@ -10,5 +10,5 @@
 (defop * ((a box) (k u32)) box (make box :v a.v :n (* a.n k)))
 (defn main () i32
   (let ((b (floor (* (* (make box :v 1.75 :n 3) 2.0) 7))))
-    (printf "%g %u %g\n" (cast f64 b.v) b.n (floorf 2.5)))
+    (printf c"%g %u %g\n" (cast f64 b.v) b.n (floorf 2.5)))
   0)

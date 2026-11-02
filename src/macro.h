@@ -16,7 +16,7 @@
 //   parameters destructure: (defmacro m ((name n) &body body) ...)
 //   tests:   symbol? list? int? float? string? eq (structural)  = != < <= > >= (numbers)
 //   numbers: + - * / %
-//   names:   (sym a b ...) → symbol from pieces   (str a b ...) → string   gensym   symbol-name
+//   names:   (sym a b ...) → symbol from pieces   (str a b ...) → string, (cstr ...) → c"..."   gensym   symbol-name
 //   types:   (type-of e) — the type e has where the macro is used, e.g. f32 or (ptr v3)
 //            (type-kind T) → void bool int float ptr array struct fn
 //            (type-elem T) (type-len T) (type-fields T) → ((name T) ...)   (type-size T)

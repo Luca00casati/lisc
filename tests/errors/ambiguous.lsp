@@ -2,4 +2,4 @@
 (import "../mods/geom")
 (import "../mods/util")
 (using geom util)
-(defn main () i32 (len "x") 0)
+(defn main () i32 (len c"x") 0)

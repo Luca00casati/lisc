@@ -792,6 +792,7 @@ struct Compiler::Impl : MetaHost {
         if (v.t == to) return v;
         if (v.t->is_ptr() && to->is_ptr() && (v.t->elem == t_void() || to->elem == t_void())) return {v.v, to};
         if (widens(v.t, to) || (v.t->is_float() && to->is_float() && to->bits > v.t->bits)) return cast(v, to, at);
+        if (v.t == t_str() && to->is_ptr()) fatal(at, "%s: a str is not a C string (no terminator): use a c\"...\" literal, or s.data with a terminator you add", what);
         type_error(at, what, to, v.t);
     }
 
@@ -930,34 +931,34 @@ struct Compiler::Impl : MetaHost {
         return float_const(f->text, want && want->is_float() ? want : t_float(64));
     }
 
-    // A string literal is a str: its bytes and their count, no terminator. The
-    // bytes are stored with a zero after them (outside len), so where C wants a
-    // pointer — a (ptr i8), (ptr u8) or (ptr void) parameter, field or variable,
-    // or a variadic argument — the literal is that pointer, and C sees a C string.
-    std::map<std::string, llvm::GlobalVariable *> strings;  // one copy of each literal
-    Val string(const std::string &text, Type *want) {
-        llvm::GlobalVariable *&g = strings[text];
+    // "..." is a str: exactly its bytes and their count. c"..." is a C string:
+    // the bytes and a terminating zero, a (ptr i8) (or (ptr u8), (ptr void)
+    // where one is wanted) — the only kind of literal C functions get.
+    std::map<std::pair<std::string, bool>, llvm::GlobalVariable *> strings;  // one copy of each literal
+    Val string(Form *f, Type *want) {
+        llvm::GlobalVariable *&g = strings[{f->text, f->cstr}];
         if (!g) {
-            llvm::Constant *bytes = llvm::ConstantDataArray::getString(ctx, text, true);
-            g = new llvm::GlobalVariable(mod, bytes->getType(), true, llvm::GlobalValue::PrivateLinkage, bytes, "str");
+            llvm::Constant *bytes = llvm::ConstantDataArray::getString(ctx, f->text, f->cstr);
+            g = new llvm::GlobalVariable(mod, bytes->getType(), true, llvm::GlobalValue::PrivateLinkage, bytes, f->cstr ? "cstr" : "str");
             g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
             g->setAlignment(llvm::Align(1));
         }
-        if (want && want->is_ptr() && (want->elem == t_void() || (want->elem->is_int() && want->elem->bits == 8)))
-            return {g, want};
+        bool byte_ptr = want && want->is_ptr() && (want->elem == t_void() || (want->elem->is_int() && want->elem->bits == 8));
+        if (f->cstr) return {g, byte_ptr ? want : t_ptr(t_int(8, true))};
+        if (byte_ptr) fatal(f->loc, "a str is not a C string: write this literal as c\"...\" (or pass s.len and s.data)");
         auto *st = llvm::cast<llvm::StructType>(ll(t_str()));
-        llvm::Constant *parts[] = {g, llvm::ConstantInt::get(b.getInt64Ty(), text.size())};
-        llvm::Constant *v = llvm::ConstantStruct::get(st, parts);
-        return {v, t_str()};
+        llvm::Constant *parts[] = {g, llvm::ConstantInt::get(b.getInt64Ty(), f->text.size())};
+        return {llvm::ConstantStruct::get(st, parts), t_str()};
     }
-    // a string literal, or an if choosing between two
-    bool is_string_lit(Form *f) {
+    // a C-string literal, an if choosing between two, or a constant naming one
+    bool is_cstring_lit(Form *f) {
         f = expand(f);
-        if (f->kind == Form::Sym && !lookup_local(key(f)).v) {  // a constant naming a literal (-D NAME=text)
+        if (f->kind == Form::Sym && !lookup_local(key(f)).v) {
             Global *g = lookup_global(f);
-            return g && g->kind == Global::Const && g->form && is_string_lit(g->form);
+            return g && g->kind == Global::Const && g->form && is_cstring_lit(g->form);
         }
-        return f->kind == Form::Str || (f->is_call("if") && f->size() == 4 && is_string_lit(f->at(2)) && is_string_lit(f->at(3)));
+        return (f->kind == Form::Str && f->cstr) ||
+               (f->is_call("if") && f->size() == 4 && is_cstring_lit(f->at(2)) && is_cstring_lit(f->at(3)));
     }
 
     // rounded once, from the text: like C's 1.5f / 1.5
@@ -995,7 +996,7 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         switch (f->kind) {
         case Form::Int: case Form::Float: return literal(f, want);
-        case Form::Str: return string(f->text, want);
+        case Form::Str: return string(f, want);
         case Form::Sym: return symbol(f, want);
         case Form::Fn: fatal(f->loc, "a compile-time function (from a macro) cannot be used in code");
         case Form::List: break;
@@ -1672,9 +1673,8 @@ struct Compiler::Impl : MetaHost {
                 fixed.push_back(value_for(a, ft->params[i], "argument"));
                 continue;
             }
-            // variadic: C's default promotions; arrays decay to a pointer to their first
-            // element; a string literal is a C string (printf's "%s")
-            if (is_string_lit(a)) {
+            // variadic: C's default promotions; arrays decay to a pointer to their first element
+            if (is_cstring_lit(a)) {
                 var.push_back(expr(a, t_ptr(t_int(8, true))));
                 continue;
             }
@@ -1689,6 +1689,7 @@ struct Compiler::Impl : MetaHost {
             if (v.t->is_float() && v.t->bits < 64) v = cast(v, t_float(64), a->loc);
             else if (v.t->is_int() && v.t->bits < 32) v = cast(v, t_int(32, v.t->sign), a->loc);
             else if (v.t->kind == Type::Bool) v = cast(v, t_int(32, true), a->loc);
+            else if (v.t == t_str()) fatal(a->loc, "cannot pass a str to a variadic function: for printf, \"%%.*s\" with (cast i32 s.len) and s.data, or a c\"...\" literal");
             else if (v.t->kind == Type::Struct || v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
             var.push_back(v);
         }
@@ -2067,6 +2068,7 @@ void Compiler::define_const(const std::string &name, const std::string &value) {
     bool number = !value.empty() && !*end;
     Form *lit = new Form{number ? (value.find_first_of(".eE") == std::string::npos ? Form::Int : Form::Float) : Form::Str, {"<-D>", 0, 0}};
     lit->text = value;
+    lit->cstr = true;  // command-line text is for C, like a C macro
     if (lit->kind == Form::Int) lit->ival = strtoull(value.c_str(), nullptr, 0);
     globals_[name] = Global{Global::Const, nullptr, nullptr, lit};
 }

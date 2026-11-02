@@ -29,16 +29,16 @@
   ; the user's own `tmp` is swapped, not confused with the macro's
   (let ((tmp 1) (other 2))
     (swap! tmp other)
-    (printf "swap %d %d\n" tmp other))
+    (printf c"swap %d %d\n" tmp other))
   ; a local named `scale` does not change what the macro means
   (let ((scale 3))
-    (printf "scaled %d (local scale %d)\n" (scaled 2) scale))
+    (printf c"scaled %d (local scale %d)\n" (scaled 2) scale))
   ; the argument mentions the user's `acc`: it is not the macro's `acc`
   (let ((acc 5))
-    (printf "sum-twice %d\n" (sum-twice acc)))
-  (printf "aif %d %d\n" (aif (* 6 7) (+ it 1) -1) (aif 0 (+ it 1) -1))
-  (printf "counter %d\n" (with-counter n (set n (+ n 4)) (set n (* n 10))))
+    (printf c"sum-twice %d\n" (sum-twice acc)))
+  (printf c"aif %d %d\n" (aif (* 6 7) (+ it 1) -1) (aif 0 (+ it 1) -1))
+  (printf c"counter %d\n" (with-counter n (set n (+ n 4)) (set n (* n 10))))
   (let ((x 1) (y 2) (z 3))
     (rotate! x y z)
-    (printf "rotate %d %d %d\n" x y z))
+    (printf c"rotate %d %d %d\n" x y z))
   0)

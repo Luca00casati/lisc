@@ -35,6 +35,8 @@ struct Form {
     // expansion's mark; it is bound and looked up as a different name from
     // the same symbol without the mark (see key() in compiler.cpp).
     unsigned mark = 0;
+    // Str: c"..." — a C string (NUL-terminated, a pointer) rather than a str
+    bool cstr = false;
     // Sym: the module whose source the symbol was read from (or whose macro
     // template it was copied from); null for symbols the compiler made up
     const char *mod = nullptr;

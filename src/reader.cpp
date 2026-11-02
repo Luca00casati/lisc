@@ -1,6 +1,7 @@
 // reader.cpp — text → forms.
 //
 //   ; comment            (a b c)             "string\n"  (UTF-8; \u{1F600}, \xHH raw byte)
+//   c"C string"  (NUL-terminated, for C)
 //   123  -5  0x1f        1.5  2e-3  -0.5     symbols: anything else
 //   'x  `x  ,x  ,@x  →  (quote x) (quasiquote x) (unquote x) (unquote-splicing x)
 //   a.b.c  →  (. a b c)  field access (a symbol with inner dots)
@@ -93,6 +94,12 @@ struct Reader {
             return mk_list(at, {mk_sym(at, name), read()});
         }
         if (c == '"') return read_string(at);
+        if (c == 'c' && pos + 1 < src.size() && src[pos + 1] == '"') {  // c"...": a C string
+            next();
+            Form *f = read_string(at);
+            f->cstr = true;
+            return f;
+        }
         std::string tok;
         while (!delimiter(peek())) tok += (char)next();
         return atom(at, tok);
@@ -222,7 +229,7 @@ std::vector<Form *> read_file(const char *path) {
 std::string show(const Form *f) {
     switch (f->kind) {
     case Form::Int: case Form::Float: case Form::Sym: return f->text;
-    case Form::Str: return "\"" + f->text + "\"";
+    case Form::Str: return (f->cstr ? "c\"" : "\"") + f->text + "\"";
     case Form::Fn: return "<fn>";
     case Form::List: {
         std::string s = "(";

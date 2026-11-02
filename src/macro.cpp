@@ -192,6 +192,13 @@ Meta::Meta(MetaHost &host) : host_(host) {
         for (Form *x : a) s += x->kind == Form::List ? show(x) : piece(x, at);
         return mk_str(at, s);
     };
+    B["cstr"] = [](std::vector<Form *> &a, Loc at) {  // the same, as a c"..." literal
+        std::string s;
+        for (Form *x : a) s += x->kind == Form::List ? show(x) : piece(x, at);
+        Form *f = mk_str(at, s);
+        f->cstr = true;
+        return f;
+    };
     B["symbol-name"] = [need](std::vector<Form *> &a, Loc at) {
         need(a, 1, at, "symbol-name");
         if (a[0]->kind != Form::Sym) fatal(at, "symbol-name of %s", show(a[0]).c_str());

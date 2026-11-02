@@ -12,11 +12,11 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
 (using libc posix io)
 
 (defn main () i32
-  (let ((fd (open "/dev/dri/renderD128" O_RDWR))
+  (let ((fd (open c"/dev/dri/renderD128" O_RDWR))
         (id i32 0)
         (gp (make i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID :value (addr id))))
     (when (= (ioctl fd i915::DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
-      (printf "i915 chip id 0x%04x\n" id)))
+      (printf c"i915 chip id 0x%04x\n" id)))
   0)
 ```
 
@@ -65,7 +65,7 @@ Expressions — everything is one; statements have type `void`:
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
-    "strings" are str;  true false
+    "text" is a str;  c"text" is a C string;  true false
     null — the zero value of the wanted type;  undefined — no value at all
     (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
 
@@ -78,12 +78,19 @@ code that fills it before reading.
 
 Strings are UTF-8 (source files must be valid UTF-8; `\u{1F600}` writes a
 code point, `\xHH` a raw byte). A string is a `str`: `data` (a `(ptr u8)`) and
-`len` (its size in bytes, a `u64`), not NUL-terminated — a `\0` inside is just
-a byte. `(aref s i)` is a byte. A string literal's bytes are stored with a zero
-after them (not part of the string), so where C wants a pointer — a `(ptr i8)`,
-`(ptr u8)` or `(ptr void)` parameter, field or variable, or a variadic
-argument like printf's `%s` — the literal is that pointer. A str made at run
-time has no such zero: to give one to C, make sure there is one.
+`len` (its size in bytes, a `u64`). It is exactly its bytes — no terminator, a
+`\0` inside is just a byte — and `(aref s i)` is a byte.
+
+C strings are written `c"..."`: the bytes and a terminating zero, a `(ptr i8)`
+(or a `(ptr u8)` / `(ptr void)` where one is wanted). That is the only kind of
+literal C functions take, so the terminator is always visible in the source:
+
+    (printf c"%d items\n" n)
+    (printf c"%.*s\n" (cast i32 s.len) s.data)   ; a str, given to C with its size
+    (fopen "out.ppm" c"wb")                      ; error: a str is not a C string
+
+`-D NAME=text` values are C strings (they are for C, like C macros); in macros,
+`(cstr ...)` builds a `c"..."` literal as `(str ...)` builds a plain one.
 
 Typing rules:
 

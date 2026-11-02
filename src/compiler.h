@@ -31,6 +31,7 @@ public:
     ~Compiler();
     // compile a whole program; stops with an error message on the first problem
     void compile(const std::vector<Form *> &forms);
+    bool debug = false;  // -g: DWARF debug info
     llvm::Module &module() { return *mod_; }
 
     // where import-c looks for headers first (then the system directories)

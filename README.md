@@ -26,7 +26,10 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
     make test
     ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 
-Extra `.c`/`.o` inputs are linked in. `import-c` searches the source file's
+`-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
+prints variables (structs, arrays, enums with their member names); code a
+macro produced belongs to the line of the macro call. Extra `.c`/`.o` inputs
+are linked in. `import-c` searches the source file's
 directory and `-I` directories, then the system ones.
 
 ## Language

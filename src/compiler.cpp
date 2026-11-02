@@ -41,6 +41,7 @@
 #include <set>
 
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -122,6 +123,125 @@ struct Compiler::Impl : MetaHost {
     std::map<std::string, std::vector<Global *>> overloads;
 
     Impl(Compiler &c) : c(c), ctx(*c.ctx_), mod(*c.mod_), b(ctx) {}
+
+    /* ---------------------------------------------------- debug info --- */
+    // lisc -g: DWARF for gdb. The program is described as C (so gdb's print
+    // uses C expressions); code a macro produced is at the macro call's line.
+
+    std::unique_ptr<llvm::DIBuilder> dib;
+    llvm::DICompileUnit *cu = nullptr;
+    llvm::DISubprogram *dsp = nullptr;  // the function being compiled
+    std::map<std::string, llvm::DIFile *> difiles;
+    std::map<Type *, llvm::DIType *> ditypes;
+
+    static bool real_file(const char *f) { return f && f[0] && f[0] != '<' && f[0] != '?'; }
+
+    void debug_init(const char *main_file) {
+        dib.reset(new llvm::DIBuilder(mod));
+        cu = dib->createCompileUnit(llvm::dwarf::DW_LANG_C99, difile(main_file), "lisc", false, "", 0);
+        mod.addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+        mod.addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+    }
+
+    llvm::DIFile *difile(const char *path) {
+        llvm::DIFile *&f = difiles[path];
+        if (!f) {
+            char real[4096];
+            std::string p = realpath(path, real) ? real : path;
+            size_t s = p.rfind('/');
+            f = dib->createFile(s == std::string::npos ? p : p.substr(s + 1), s == std::string::npos ? "." : p.substr(0, s));
+        }
+        return f;
+    }
+
+    llvm::DIType *ditype(Type *t) {
+        auto it = ditypes.find(t);
+        if (it != ditypes.end()) return it->second;
+        llvm::DIType *d = nullptr;
+        llvm::DIFile *f0 = cu->getFile();
+        switch (t->kind) {
+        case Type::Void: return nullptr;
+        case Type::Bool: d = dib->createBasicType("bool", 8, llvm::dwarf::DW_ATE_boolean); break;
+        case Type::Int:
+            if (t->en) {
+                std::vector<llvm::Metadata *> es;
+                for (auto &v : t->en->values) es.push_back(dib->createEnumerator(t->en->name + "." + v.first, v.second, !t->sign));
+                Type *base = t_int(t->bits, t->sign);
+                d = dib->createEnumerationType(cu, t->en->name, f0, 0, t->bits, t->bits, dib->getOrCreateArray(es), ditype(base));
+            } else {
+                d = dib->createBasicType(type_name(t), t->bits, t->sign ? llvm::dwarf::DW_ATE_signed : llvm::dwarf::DW_ATE_unsigned);
+            }
+            break;
+        case Type::Float: d = dib->createBasicType(type_name(t), t->bits, llvm::dwarf::DW_ATE_float); break;
+        case Type::Ptr: d = dib->createPointerType(t->elem == t_void() ? nullptr : ditype(t->elem), 64); break;
+        case Type::Array: {
+            llvm::Metadata *sub[] = {dib->getOrCreateSubrange(0, (int64_t)t->n)};
+            d = dib->createArrayType(size_of(t) * 8, align_of(t) * 8, ditype(t->elem), dib->getOrCreateArray(sub));
+            break;
+        }
+        case Type::Fn: {
+            std::vector<llvm::Metadata *> ps{ditype(t->elem)};
+            for (Type *p : t->params) ps.push_back(ditype(p));
+            d = dib->createSubroutineType(dib->getOrCreateTypeArray(ps));
+            break;
+        }
+        case Type::Struct: {
+            StructInfo *st = t->st;
+            auto tag = st->is_union ? llvm::dwarf::DW_TAG_union_type : llvm::dwarf::DW_TAG_structure_type;
+            if (!st->complete) {  // opaque: only behind pointers
+                d = dib->createForwardDecl(tag, st->name, cu, f0, 0);
+                break;
+            }
+            // (through a placeholder first: a struct may point to itself)
+            llvm::DICompositeType *fwd = dib->createReplaceableCompositeType(tag, st->name, cu, f0, 0, 0, st->size * 8, st->align * 8);
+            ditypes[t] = fwd;
+            std::vector<llvm::Metadata *> ms;
+            for (auto &fd : st->fields) {
+                if (fd.bit_width)
+                    ms.push_back(dib->createBitFieldMemberType(fwd, fd.name, f0, 0, fd.bit_width, fd.bit_off, fd.offset * 8,
+                                                               llvm::DINode::FlagZero, ditype(fd.type)));
+                else
+                    ms.push_back(dib->createMemberType(fwd, fd.name, f0, 0, size_of(fd.type) * 8, align_of(fd.type) * 8, fd.offset * 8,
+                                                       llvm::DINode::FlagZero, ditype(fd.type)));
+            }
+            llvm::DICompositeType *real =
+                st->is_union ? dib->createUnionType(cu, st->name, f0, 0, st->size * 8, st->align * 8, llvm::DINode::FlagZero, dib->getOrCreateArray(ms))
+                             : dib->createStructType(cu, st->name, f0, 0, st->size * 8, st->align * 8, llvm::DINode::FlagZero, nullptr,
+                                                     dib->getOrCreateArray(ms));
+            dib->replaceTemporary(llvm::TempDIType(fwd), real);
+            d = real;
+            break;
+        }
+        }
+        return ditypes[t] = d;
+    }
+
+    // where generated code is: the outermost macro call, for code macros made
+    static Loc user_loc(Loc l) {
+        while (l.via) l = l.via->at;
+        return l;
+    }
+    // the scope for a line in `file`: the function, or the function seen from another file
+    llvm::DIScope *dscope_in(const char *file) {
+        if (dsp->getFile() == difile(file)) return dsp;
+        return dib->createLexicalBlockFile(dsp, difile(file));
+    }
+    void set_loc(Loc at) {
+        if (!dsp) return;
+        at = user_loc(at);
+        if (!real_file(at.file) || at.line <= 0) return;
+        b.SetCurrentDebugLocation(llvm::DILocation::get(ctx, at.line, at.col, dscope_in(at.file)));
+    }
+    void declare_var(llvm::Value *addr, const std::string &name, Type *t, Loc at, unsigned argno = 0) {
+        if (!dsp || !ditype(t)) return;
+        at = user_loc(at);
+        if (!real_file(at.file)) at = {dsp->getFile()->getFilename().data(), (int)dsp->getLine(), 0};
+        llvm::DIScope *sc = real_file(at.file) ? dscope_in(at.file) : dsp;
+        llvm::DIFile *file = real_file(at.file) ? difile(at.file) : dsp->getFile();
+        llvm::DILocalVariable *v = argno ? dib->createParameterVariable(sc, name, argno, file, at.line, ditype(t), true)
+                                         : dib->createAutoVariable(sc, name, file, at.line, ditype(t), true);
+        dib->insertDeclare(addr, v, dib->createExpression(), llvm::DILocation::get(ctx, at.line, at.col, sc), b.GetInsertBlock());
+    }
 
     /* ------------------------------------------------------- modules --- */
     // A module is a file. Its top-level names are stored as "module::name" in
@@ -999,6 +1119,7 @@ struct Compiler::Impl : MetaHost {
 
     Val expr(Form *f, Type *want) {
         f = expand(f);
+        if (dsp && f->kind == Form::List) set_loc(f->loc);
         switch (f->kind) {
         case Form::Int: case Form::Float: return literal(f, want);
         case Form::Str: return string(f, want);
@@ -1412,6 +1533,7 @@ struct Compiler::Impl : MetaHost {
             // everything starts as zero, unless explicitly undefined
             if (!undef) store({a, t}, init ? v.v : llvm::Constant::getNullValue(ll(t)));
             scopes.back()[key(bd->at(0))] = {a, t};
+            if (dsp) declare_var(a, name, t, bd->at(0)->loc);
         }
         Val r = body(f, 2, want);
         scopes.pop_back();
@@ -1720,6 +1842,7 @@ struct Compiler::Impl : MetaHost {
         llvm::AllocaInst *iv = alloca_(t, spec->at(0)->text);
         store({iv, t}, start.v);
         scopes.back()[key(spec->at(0))] = {iv, t};
+        if (dsp) declare_var(iv, spec->at(0)->text, t, spec->at(0)->loc);
         BasicBlock *cond = BasicBlock::Create(ctx, "for", fn), *bodyb = BasicBlock::Create(ctx, "body", fn);
         BasicBlock *step = BasicBlock::Create(ctx, "step", fn), *done = BasicBlock::Create(ctx, "endfor", fn);
         b.CreateBr(cond);
@@ -2138,6 +2261,9 @@ struct Compiler::Impl : MetaHost {
         llvm::Constant *init = llvm::Constant::getNullValue(ll(t));  // zero unless given (or undefined)
         if (f->size() == 4) init = f->at(3)->is_sym("undefined") ? llvm::UndefValue::get(ll(t)) : constant(f->at(3), t);
         auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, def_key(f->at(1)));
+        if (dib && real_file(f->loc.file) && ditype(t))
+            gv->addDebugInfo(dib->createGlobalVariableExpression(cu, f->at(1)->text, gv->getName(), difile(f->loc.file),
+                                                                 f->loc.line, ditype(t), true));
         gv->setAlignment(llvm::Align(align_of(t)));
         define(f->at(1), Global{Global::Var, t, gv});
     }
@@ -2214,6 +2340,19 @@ struct Compiler::Impl : MetaHost {
         type_memo.clear();
         FnAbi &abi = fn_abi(g.type);
         b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
+        dsp = nullptr;
+        if (dib) {
+            Loc at = user_loc(f->loc);
+            if (!real_file(at.file)) at = {cu->getFile()->getFilename().data(), 1, 0};
+            llvm::DIFile *file = real_file(at.file) ? difile(at.file) : cu->getFile();
+            auto *sty = llvm::cast<llvm::DISubroutineType>(ditype(g.type));
+            auto flags = llvm::DISubprogram::SPFlagDefinition;
+            if (fn->hasInternalLinkage()) flags |= llvm::DISubprogram::SPFlagLocalToUnit;
+            dsp = dib->createFunction(file, f->at(1)->text, fn->getName(), file, at.line, sty, at.line,
+                                      llvm::DINode::FlagPrototyped, flags);
+            fn->setSubprogram(dsp);
+            set_loc(f->loc);
+        }
         scopes.assign(1, {});
         auto arg = fn->arg_begin();
         cur_sret = abi.ret.kind == ArgAbi::Memory ? &*arg++ : nullptr;
@@ -2223,7 +2362,9 @@ struct Compiler::Impl : MetaHost {
             const ArgAbi &pa = abi.params[i];
             if (pa.kind == ArgAbi::Memory) {  // byval: the copy is ours to use as the variable
                 arg->setName(name);
-                scopes.back()[key(f->at(2)->at(i)->at(0))] = {&*arg++, t};
+                scopes.back()[key(f->at(2)->at(i)->at(0))] = {&*arg, t};
+                if (dsp) declare_var(&*arg, name, t, f->at(2)->at(i)->loc, i + 1);
+                arg++;
                 continue;
             }
             llvm::AllocaInst *a = alloca_(t, name);
@@ -2238,6 +2379,7 @@ struct Compiler::Impl : MetaHost {
                 store({a, t}, llvm::Constant::getNullValue(ll(t)));
             }
             scopes.back()[key(f->at(2)->at(i)->at(0))] = {a, t};
+            if (dsp) declare_var(a, name, t, f->at(2)->at(i)->loc, i + 1);
         }
         Val v = body(f, 4, fn_ret == t_void() ? nullptr : fn_ret);
         if (open()) {
@@ -2254,6 +2396,8 @@ struct Compiler::Impl : MetaHost {
                 b.CreateUnreachable();
             }
         scopes.clear();
+        dsp = nullptr;
+        b.SetCurrentDebugLocation(llvm::DebugLoc());
     }
 };
 
@@ -2275,7 +2419,9 @@ Type *t_str() {
 Compiler::~Compiler() = default;
 
 void Compiler::compile(const std::vector<Form *> &forms) {
+    if (debug && !forms.empty()) impl_->debug_init(forms[0]->loc.file);
     impl_->top(forms);
+    if (impl_->dib) impl_->dib->finalize();
     std::string err;
     llvm::raw_string_ostream os(err);
     if (llvm::verifyModule(*mod_, &os)) {

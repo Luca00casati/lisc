@@ -89,43 +89,89 @@ struct Reader {
     }
 
     static bool delimiter(int c) {
-        return c < 0 || strchr(" \t\r\n()\";'`,", c) != nullptr;
+        return c < 0 || strchr(" \t\r\n()[]{}\";'`,", c) != nullptr;
     }
 
+    // the forms up to `close`, after `open` at `at`
+    std::vector<Form *> read_until(Loc at, char open, char close) {
+        std::vector<Form *> items;
+        for (;;) {
+            skip_space();
+            int c = peek();
+            if (c < 0) fatal(at, "unclosed '%c'", open);
+            if (c == close) { next(); return items; }
+            if (c == ')' || c == ']' || c == '}') fatal(loc(), "'%c' at %d:%d closed by '%c'", open, at.line, at.col, c);
+            items.push_back(read());
+        }
+    }
+
+    // a form, then any a[i] indexing and .field access written right after it:
+    // v.data[i] → (aref (. v data) i), a[i][j].x → (. (aref (aref a i) j) x)
     Form *read() {
+        Form *f = primary();
+        bool indexed = false;
+        for (;;) {
+            Loc at = loc();
+            if (peek() == '[' && (f->kind == Form::Sym || (f->is_list() && !f->bracket))) {
+                next();
+                std::vector<Form *> ix = read_until(at, '[', ']');
+                if (ix.size() != 1) fatal(at, "an index takes one form: a[i]");
+                f = mk_list(at, {mk_sym(at, "aref"), f, ix[0]});
+                indexed = true;
+            } else if (peek() == '.' && indexed) {
+                next();
+                std::vector<Form *> items{mk_sym(at, "."), f};
+                for (;;) {
+                    std::string name;
+                    while (!delimiter(peek()) && peek() != '.') name += (char)next();
+                    if (name.empty()) fatal(at, "a field name must follow '.'");
+                    items.push_back(mk_sym(at, name));
+                    if (peek() != '.') break;
+                    next();
+                }
+                f = mk_list(at, std::move(items));
+            } else return f;
+        }
+    }
+
+    Form *primary() {
         skip_space();
         Loc at = loc();
         int c = peek();
         if (c < 0) fatal(at, "unexpected end of file");
-        if (c == ')') fatal(at, "unexpected ')'");
+        if (c == ')' || c == ']' || c == '}') fatal(at, "unexpected '%c'", c);
+        Form *f;
         if (c == '(') {
             next();
-            std::vector<Form *> items;
-            for (;;) {
-                skip_space();
-                if (peek() < 0) fatal(at, "unclosed '('");
-                if (peek() == ')') { next(); break; }
-                items.push_back(read());
-            }
-            return mk_list(at, std::move(items));
-        }
-        if (c == '\'' || c == '`' || c == ',') {
+            f = mk_list(at, read_until(at, '(', ')'));
+        } else if (c == '[') {  // [x T init]: a binding
+            next();
+            f = mk_list(at, read_until(at, '[', ']'));
+            f->bracket = true;
+        } else if (c == '{') {  // {T :field v ...} = (make T :field v ...)
+            next();
+            std::vector<Form *> items = read_until(at, '{', '}');
+            if (items.empty()) fatal(at, "{} needs a type: {point :x 1.0 :y 2.0}");
+            items.insert(items.begin(), mk_sym(at, "make"));
+            f = mk_list(at, std::move(items));
+        } else if (c == '\'' || c == '`' || c == ',') {
             next();
             const char *name = c == '\'' ? "quote" : c == '`' ? "quasiquote" : "unquote";
             if (c == ',' && peek() == '@') { next(); name = "unquote-splicing"; }
-            return mk_list(at, {mk_sym(at, name), read()});
-        }
-        if (c == '"') return read_string(at);
-        if (c == '#' && pos + 1 < src.size() && src[pos + 1] == '\\') return read_char(at);
-        if (c == 'c' && pos + 1 < src.size() && src[pos + 1] == '"') {  // c"...": a C string
+            Form *inner = primary();  // ,v[i] is (aref ,v i)
+            f = mk_list(at, {mk_sym(at, name), inner});
+        } else if (c == '"') f = read_string(at);
+        else if (c == '#' && pos + 1 < src.size() && src[pos + 1] == '\\') f = read_char(at);
+        else if (c == 'c' && pos + 1 < src.size() && src[pos + 1] == '"') {  // c"...": a C string
             next();
-            Form *f = read_string(at);
+            f = read_string(at);
             f->cstr = true;
-            return f;
+        } else {
+            std::string tok;
+            while (!delimiter(peek())) tok += (char)next();
+            f = atom(at, tok);
         }
-        std::string tok;
-        while (!delimiter(peek())) tok += (char)next();
-        return atom(at, tok);
+        return f;
     }
 
     // #\a #\é #\space #\newline #\tab #\nul #\return #\escape: the code point,
@@ -280,15 +326,31 @@ std::vector<Form *> read_file(const char *path) {
     return forms;
 }
 
+Form *unbracket(Form *f, size_t i) {
+    if (f->size() <= i || !f->at(i)->bracket) return f;
+    size_t j = i;
+    while (j < f->size() && f->at(j)->bracket) j++;
+    std::vector<Form *> bs(f->items.begin() + i, f->items.begin() + j);
+    if (bs.size() == 1 && bs[0]->items.empty()) bs.clear();
+    for (Form *b : bs)
+        if (b->items.empty()) fatal(b->loc, "[] stands alone, for no bindings at all");
+    std::vector<Form *> items(f->items.begin(), f->items.begin() + i);
+    items.push_back(mk_list(f->at(i)->loc, bs));
+    items.insert(items.end(), f->items.begin() + j, f->items.end());
+    Form *r = new Form(*f);  // (the same form otherwise: its place, its id)
+    r->items = std::move(items);
+    return r;
+}
+
 std::string show(const Form *f) {
     switch (f->kind) {
     case Form::Int: case Form::Float: case Form::Sym: return f->text;
     case Form::Str: return (f->cstr ? "c\"" : "\"") + f->text + "\"";
     case Form::Fn: return "<fn>";
     case Form::List: {
-        std::string s = "(";
+        std::string s = f->bracket ? "[" : "(";
         for (size_t i = 0; i < f->items.size(); i++) s += (i ? " " : "") + show(f->items[i]);
-        return s + ")";
+        return s + (f->bracket ? "]" : ")");
     }
     }
     return "?";

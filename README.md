@@ -11,10 +11,10 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
 (import-c "drm/i915_drm.h" :as i915)
 (using libc posix io)
 
-(defn main () i32
-  (let ((fd (open c"/dev/dri/renderD128" O_RDWR))
-        (id i32 0)
-        (gp (make i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID :value (addr id))))
+(defn main [] i32
+  (let [fd (open c"/dev/dri/renderD128" O_RDWR)]
+       [id i32 0]
+       [gp {i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID :value (addr id)}]
     (when (= (ioctl fd i915::DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
       (printf c"i915 chip id 0x%04x\n" id)))
   0)
@@ -71,23 +71,23 @@ Top level:
 | `(import-c "h" ... [:as m])` | C headers as a module `m` (by default the first header's name) |
 | `(using m ...)` | `m`'s names unqualified, in the whole file — or, inside a function, until the block ends |
 | `(include "file.lsp" ...)` | another file's forms as part of this module |
-| `(struct name [:packed] [:align N] (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
+| `(struct name [:packed] [:align N] [field T] ...)` `(union ...)` | C layout; `[field T :bits N]` is a bit field |
 | `(enum name T a b (c 5) ...)` | a distinct integer type; members are `name.a` ... |
 | `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
-| `(defn name ((a T) ...) R [:noinline\|:inline\|:cold\|:optnone] body...)` | function; the last expression is the result |
+| `(defn name [a T] ... R [:noinline\|:inline\|:cold\|:optnone] body...)` | function (`[]`: no parameters); the last expression is the result |
 | `(extern name (T ... [...]) R)` | a C function by hand |
-| `(defop op ((a T) ...) R body...)` | an operator for these operand types |
+| `(defop op [a T] ... R body...)` | an operator for these operand types |
 | `(defmacro name (params...) body...)` | a macro (see below) |
 | `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
 | `(defn- ...)` `(def- ...)` `(const- ...)` `(struct- ...)` `(defmacro- ...)` `(private form ...)` | names only their module can use |
 
 Expressions — everything is one; statements have type `void`:
 
-    (do e...)  (let ((x init) (y T init) (z T)) body...)  (set place e)
+    (do e...)  (let [x init] [y T init] [z T] body...)  (set place e)
     (if c a [b])  (when c body...)  (unless c body...)
-    (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
+    (while c body...)  (for [i [T] start end [step]] body...)  (break)  (continue)  (return [e])
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
     (slice-of a [from [to]]) — an array as a (slice T), or part of an array, slice or str
@@ -96,23 +96,39 @@ Expressions — everything is one; statements have type `void`:
     (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
       — each with an optional :relaxed :acquire :release :acq-rel :seq-cst (default)
     (. x field ...) — also written x.field.sub; pointers are followed automatically
-    (aref a i)  (deref p)  (addr place)  (cast T e)  (truncate T e)  (bitcast T e)  (sizeof T)  (alignof T)
-    (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
+    a[i] = (aref a i)  (deref p)  (addr place)  (cast T e)  (truncate T e)  (bitcast T e)  (sizeof T)  (alignof T)
+    {T :field e ...} = (make T :field e ...)  {(array T N) e ...}  — the rest is zero
     "text" is a str;  c"text" is a C string;  #\a #\é #\newline — a character's code point;  true false
     null — the zero value of the wanted type;  undefined — no value at all
     (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
+
+Three kinds of brackets:
+
+- `[ ... ]` is a binding: a parameter `[a T]`, a `let` binding `[x T init]`, a
+  `for` header `[i 0 n]`, a struct field `[x f32]`. They stand one after
+  another, `(let [x 1] [y 2] body...)`, where the old spelling had one list
+  of them, `(let ((x 1) (y 2)) body...)`, which still works. `[]` alone is
+  no parameters. A `[...]` anywhere else is an error, not a call.
+- `{T :field e ...}` is `(make T :field e ...)`.
+- `a[i]`, written right after a name, `a.b`, `(...)` or another index, is
+  `(aref a i)`: `v.data[v.len]`, `grid[y][x]`, `(f)[0]`. A `.field` may
+  follow an index: `pts[i].x`. In a macro template `,v[i]` is `(aref ,v i)`.
+
+Macro templates keep brackets as written, and compile-time code takes them in
+`let` too. `tools/brackets.py file.lsp ...` rewrites code in the old spelling
+(keeping comments and layout).
 
 Everything starts as zero: `let` bindings without a value, globals, and the
 fields and elements `make` doesn't set. `null` is the zero value of the
 type wanted — the null pointer, `0`, `0.0`, `false`, an all-zero struct or
 array — so `(set v null)` resets a struct. `undefined` opts out:
-`(let ((buf (array u8 4096) undefined)) ...)` leaves the memory as it is, for
+`(let [buf (array u8 4096) undefined] ...)` leaves the memory as it is, for
 code that fills it before reading.
 
 Strings are UTF-8 (source files must be valid UTF-8; `\u{1F600}` writes a
 code point, `\xHH` a raw byte). A string is a `str`: `data` (a `(ptr u8)`) and
 `len` (its size in bytes, a `u64`). It is exactly its bytes — no terminator, a
-`\0` inside is just a byte — and `(aref s i)` is a byte.
+`\0` inside is just a byte — and `s[i]` is a byte.
 
 C strings are written `c"..."`: the bytes and a terminating zero, a `(ptr i8)`
 (or a `(ptr u8)` / `(ptr void)` where one is wanted). That is the only kind of
@@ -153,19 +169,19 @@ A struct or function with a list for its name takes type parameters, and is
 specialised (compiled anew) for each list of types it is used with:
 
 ```lisp
-(struct (vec T) (data (ptr T)) (len u64) (cap u64))
+(struct (vec T) [data (ptr T)] [len u64] [cap u64])
 
-(defn (push T) ((v (ptr (vec T))) (x T)) void ...)
-(defn (biggest T) ((a T) (b T)) T (if (> a b) a b))
+(defn (push T) [v (ptr (vec T))] [x T] void ...)
+(defn (biggest T) [a T] [b T] T (if (> a b) a b))
 
-(let ((v (make (vec i32))))     ; (vec i32) is a type wherever types go
+(let [v {(vec i32)}]     ; (vec i32) is a type wherever types go
   (push (addr v) 42)             ; T from the arguments' types: push for i32
   ((push i32) (addr v) 42)       ; or written out
   (biggest 2.5 1.0))             ; only literals: their own type (f64)
 ```
 
 Inside, a parameter is the type itself, not its name: `(sizeof T)`,
-`(cast (ptr T) p)`, `(let ((s T null)) ...)` and macros' `type-of` all see the
+`(cast (ptr T) p)`, `(let [s T null] ...)` and macros' `type-of` all see the
 instance's types, whichever module they come from. An error in an instance
 says which one and where it was used. A generic that is never used is never
 compiled, so its body is only checked once something uses it.
@@ -174,7 +190,7 @@ A parameter can say which operators its type must have, `(T op ...)`; using
 the generic with a type that lacks one is an error at the use, naming it:
 
 ```lisp
-(defn (sort (T <)) ((s (slice T))) void ...)    ; numbers, or a struct with a (defop < ...)
+(defn (sort (T <)) [s (slice T)] void ...)    ; numbers, or a struct with a (defop < ...)
 ```
 
 A generic function is a value too: `(addr (inc i64))`, or just `inc` where a
@@ -183,7 +199,7 @@ function pointer is wanted (its type says what T is): `(apply-twice inc 2.5)`.
 Operators can be generic, for every instance of a generic struct:
 
 ```lisp
-(defop (+ T) ((a (vec2 T)) (b (vec2 T))) (vec2 T) (v2 (+ a.x b.x) (+ a.y b.y)))
+(defop (+ T) [a (vec2 T)] [b (vec2 T)] (vec2 T) (v2 (+ a.x b.x) (+ a.y b.y)))
 ```
 
 A generic `defop` applies only when an operand is a struct, so numbers keep
@@ -200,7 +216,7 @@ relative to the importing file, `.lsp` optional) makes its names reachable as
     (import "vec")
     (using vec)                  ; also dot, cross ... unqualified
 
-    (defn hyp ((a f32) (b f32)) f32
+    (defn hyp [a f32] [b f32] f32
       (using math)               ; just here: sqrtf
       (sqrtf (+ (* a a) (* b b))))
 
@@ -247,10 +263,10 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 
 ## Operators
 
-`(defop + ((a v3) (b v3)) v3 ...)` defines `+` for two `v3`s. An operator form
+`(defop + [a v3] [b v3] v3 ...)` defines `+` for two `v3`s. An operator form
 uses the definition whose parameter types match its operands exactly; a
 literal operand takes the type the definition wants (`(* 2.0 v)` with
-`(defop * ((k f32) (a v3)) ...)`). n-ary forms fold left: `(+ a b c)` is
+`(defop * [k f32] [a v3] ...)`). n-ary forms fold left: `(+ a b c)` is
 `(+ (+ a b) c)`. Unary `-` and the comparisons can be defined the same way.
 Definitions are ordinary functions, so the optimiser inlines them: there is no
 runtime cost.
@@ -271,12 +287,12 @@ field of a struct:
 
 ```lisp
 (defmacro derive-ops (T)                 ; + - * and = for any struct, field by field
-  (let ((fields (map first (type-fields T))))
+  (let [fields (map first (type-fields T))]
     `(do ,@(map (lambda (op)
-                  `(defop ,op ((a ,T) (b ,T)) ,T
-                     (make ,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields))))
+                  `(defop ,op [a ,T] [b ,T] ,T
+                     {,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields)}))
                 '(+ - *))
-         (defop = ((a ,T) (b ,T)) bool
+         (defop = [a ,T] [b ,T] bool
            (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
 
 (derive-ops v3)

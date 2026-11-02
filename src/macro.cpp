@@ -375,7 +375,9 @@ Form *Meta::quasi(Form *f, Env *env, int depth) {
             items.insert(items.end(), l->items.begin(), l->items.end());
         } else items.push_back(quasi(x, env, depth));
     }
-    return mk_list(f->loc, items);
+    Form *r = mk_list(f->loc, items);
+    r->bracket = f->bracket;
+    return r;
 }
 
 Form *Meta::eval(Form *f, Env *env) {
@@ -429,6 +431,7 @@ Form *Meta::eval(Form *f, Env *env) {
     }
     if (h == "do") return body(1, env);
     if (h == "let") {
+        f = unbracket(f, 1);  // (let [x 1] [y 2] ...)
         if (f->size() < 2 || !f->at(1)->is_list()) fatal(f->loc, "(let ((x e) ...) body...)");
         Env *e = new Env{{}, env};
         for (Form *b : f->at(1)->items) {

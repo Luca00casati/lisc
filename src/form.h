@@ -46,6 +46,9 @@ struct Form {
     unsigned mark = 0;
     // Str: c"..." — a C string (NUL-terminated, a pointer) rather than a str
     bool cstr = false;
+    // List: written [ ... ] — a binding: (let [x 1] [y 2] body), (defn f [a T] [b U] R body),
+    // (for [i 0 n] ...), (struct s [x f32] ...)
+    bool bracket = false;
     // Sym: the module whose source the symbol was read from (or whose macro
     // template it was copied from); null for symbols the compiler made up
     const char *mod = nullptr;
@@ -68,6 +71,10 @@ struct Form {
 // Forms live for the whole compilation and are never freed.
 Form *mk_sym(Loc at, const std::string &name);
 Form *mk_list(Loc at, std::vector<Form *> items);
+
+// f with the bracket forms [a T] [b U] ... starting at item i gathered into one
+// list ((a T) (b U)), as if written the old way; a lone [] is an empty list
+Form *unbracket(Form *f, size_t i);
 
 // all top-level forms of a file
 std::vector<Form *> read_file(const char *path);

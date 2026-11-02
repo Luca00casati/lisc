@@ -1470,6 +1470,7 @@ struct Compiler::Impl : MetaHost {
         case Form::List: break;
         }
         if (f->items.empty()) fatal(f->loc, "empty form ()");
+        if (f->bracket) fatal(f->loc, "[...] is a binding, as in (let [x 1] ...); a call is written (...)");
         const char *h = f->head();
         if (!*h) return call(f);
         std::string hs = h;
@@ -1959,11 +1960,12 @@ struct Compiler::Impl : MetaHost {
     }
 
     Val let(Form *f, Type *want) {
-        if (f->size() < 2 || !f->at(1)->is_list()) fatal(f->loc, "(let ((name [T] [init]) ...) body...)");
+        f = unbracket(f, 1);  // (let [x 1] [y T 2] body...)
+        if (f->size() < 2 || !f->at(1)->is_list()) fatal(f->loc, "(let [name T init] ... body...)");
         scopes.emplace_back();
         for (Form *bd : f->at(1)->items) {
             if (!bd->is_list() || bd->size() < 2 || bd->size() > 3 || bd->at(0)->kind != Form::Sym)
-                fatal(bd->loc, "binding must be (name init), (name T init) or (name T)");
+                fatal(bd->loc, "binding must be [name init], [name T init] or [name T]");
             const std::string &name = bd->at(0)->text;
             Type *t = nullptr;
             Form *init = nullptr;
@@ -2528,7 +2530,7 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         if (f->is_call("do")) {
             for (size_t i = 1; i < f->size(); i++) expand_top(f->at(i), out);
-        } else out.push_back(f);
+        } else out.push_back(f->is_call("defn") || f->is_call("defop") ? unbracket(f, 2) : f);  // (defn f [a T] [b U] R ...)
     }
 
     ModInfo *root = nullptr;  // the program's first file

@@ -28,7 +28,9 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
 
 Errors in function bodies are all reported (up to 20), not just the first.
 Warnings: a variable that is never read (name it `_x` to say that is meant),
-and code after a `return`/`break`/`continue`; `-w` turns them off.
+code after a `return`/`break`/`continue`, and the result of a lisc function
+dropped (write `(discard (f x))` when that is meant; C functions' results are
+often dropped on purpose and aren't warned about). `-w` turns them off.
 
 `:optnone` compiles a function as at `-O0` whatever the level: for code
 that runs once (setup, table builders) and is big enough to slow the build.
@@ -56,7 +58,8 @@ directory and `-I` directories, then the system ones.
 
 ## Language
 
-Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void str`,
+Types: `i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 isize usize f32 f64 f80 bool void str`
+(`f80` is C's `long double`, `i128` its `__int128`),
 `(ptr T)`, `(array T N)`, `(slice T)`, `(fn (A B ...) R)`, struct/union/enum names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
@@ -77,7 +80,7 @@ Top level:
 | `(extern name (T ... [...]) R)` | a C function by hand |
 | `(defop op ((a T) ...) R body...)` | an operator for these operand types |
 | `(defmacro name (params...) body...)` | a macro (see below) |
-| `(defmeta name (params...) body...)` | a compile-time helper function for macros |
+| `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
 | `(defn- ...)` `(def- ...)` `(const- ...)` `(struct- ...)` `(defmacro- ...)` `(private form ...)` | names only their module can use |
 
 Expressions — everything is one; statements have type `void`:
@@ -134,12 +137,13 @@ Typing rules:
 - `#define` and enum constants from C headers are untyped too, as in C.
 - Implicit conversions only: `(ptr void)` ↔ any pointer, arrays to a pointer to
   their first element, and C's default promotions for variadic arguments.
+  Structs pass through C's `...` by value too (as C passes them).
 - Conditions may be `bool`, integers or pointers.
 - Every function uses the C calling convention (x86-64 System V), lisc's own
   included: structs pass and return by value to and from C, and C can call
   lisc functions through function pointers.
-- Bit fields (imported or declared) read and write like other fields; only
-  `(addr ...)` of one is an error.
+- Bit fields (imported or declared) read and write like other fields, and can
+  be given in a global's constant `make`; only `(addr ...)` of one is an error.
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
@@ -256,6 +260,11 @@ field of a struct:
 
 (derive-ops v3)
 ```
+
+`type-of` works in top-level macros too, for types, literals and C
+declarations (`(type-of (libc::strlen c""))` is `u64`); the program's own
+functions, globals and constants are declared after top-level macros run, so
+it can't see those there.
 
 Macros are hygienic. Every symbol written in a template gets a mark unique to
 that expansion, so:

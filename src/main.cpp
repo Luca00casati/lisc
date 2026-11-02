@@ -20,6 +20,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
@@ -66,7 +67,11 @@ void optimize(llvm::Module &m, llvm::TargetMachine *tm, int level) {
     llvm::FunctionAnalysisManager fam;
     llvm::CGSCCAnalysisManager cgam;
     llvm::ModuleAnalysisManager mam;
-    llvm::PassBuilder pb(tm);
+    // the standard instrumentation is what makes passes skip optnone functions
+    llvm::PassInstrumentationCallbacks pic;
+    llvm::StandardInstrumentations si(m.getContext(), false);
+    si.registerCallbacks(pic, &mam);
+    llvm::PassBuilder pb(tm, llvm::PipelineTuningOptions(), std::nullopt, &pic);
     pb.registerModuleAnalyses(mam);
     pb.registerCGSCCAnalyses(cgam);
     pb.registerFunctionAnalyses(fam);

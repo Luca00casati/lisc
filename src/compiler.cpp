@@ -6,7 +6,7 @@
 //   (struct name (field T) ...)      also (union name ...)
 //   (const NAME expr)                a compile-time constant; untyped if expr is
 //   (def name T [init])              a global variable
-//   (defn name ((a T) ...) R [:noinline|:inline|:cold] body...)
+//   (defn name ((a T) ...) R [:noinline|:inline|:cold|:optnone] body...)
 //   (extern name (T ... [...]) R)    a C function by hand
 //
 // Expressions (everything is an expression; statements have type void):
@@ -2479,7 +2479,10 @@ struct Compiler::Impl : MetaHost {
             if (o->is_sym(":noinline")) fn0->addFnAttr(llvm::Attribute::NoInline);
             else if (o->is_sym(":inline")) fn0->addFnAttr(llvm::Attribute::AlwaysInline);
             else if (o->is_sym(":cold")) fn0->addFnAttr(llvm::Attribute::Cold);
-            else fatal(o->loc, "function options are :noinline :inline :cold");
+            else if (o->is_sym(":optnone")) {  // compiled as at -O0 (and never inlined)
+                fn0->addFnAttr(llvm::Attribute::OptimizeNone);
+                fn0->addFnAttr(llvm::Attribute::NoInline);
+            } else fatal(o->loc, "function options are :noinline :inline :cold :optnone");
         }
         define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
     }

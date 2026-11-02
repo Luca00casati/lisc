@@ -32,7 +32,7 @@ directory and `-I` directories, then the system ones.
 ## Language
 
 Types: `i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 bool void str`,
-`(ptr T)`, `(array T N)`, `(fn (A B ...) R)`, struct/union names, and every
+`(ptr T)`, `(array T N)`, `(slice T)`, `(fn (A B ...) R)`, struct/union/enum names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
 Top level:
@@ -43,7 +43,9 @@ Top level:
 | `(import-c "h" ... [:as m])` | C headers as a module `m` (by default the first header's name) |
 | `(using m ...)` | `m`'s names unqualified, in the whole file — or, inside a function, until the block ends |
 | `(include "file.lsp" ...)` | another file's forms as part of this module |
-| `(struct name (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
+| `(struct name [:packed] [:align N] (field T) ...)` `(union ...)` | C layout; `(field T :bits N)` is a bit field |
+| `(enum name T a b (c 5) ...)` | a distinct integer type; members are `name.a` ... |
+| `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
 | `(defn name ((a T) ...) R body...)` | function; the last expression is the result |
@@ -58,6 +60,9 @@ Expressions — everything is one; statements have type `void`:
     (do e...)  (let ((x init) (y T init) (z T)) body...)  (set place e)
     (if c a [b])  (when c body...)  (unless c body...)
     (while c body...)  (for (i [T] start end [step]) body...)  (break)  (continue)  (return [e])
+    (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
+    (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
+    (slice-of a [from [to]]) — an array as a (slice T), or part of an array, slice or str
     (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...)  (or ...)  (not x)
     (+= place e) ... (>>= place e) — the place's address is computed once; defops apply
     (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
@@ -65,7 +70,7 @@ Expressions — everything is one; statements have type `void`:
     (. x field ...) — also written x.field.sub; pointers are followed automatically
     (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
-    "text" is a str;  c"text" is a C string;  true false
+    "text" is a str;  c"text" is a C string;  #\a #\é #\newline — a character's code point;  true false
     null — the zero value of the wanted type;  undefined — no value at all
     (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
 

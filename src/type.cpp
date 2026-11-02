@@ -57,6 +57,29 @@ Type *t_struct(StructInfo *st) {
     return t;
 }
 
+Type *t_enum(EnumInfo *en, Type *base) {
+    Type *t = make({Type::Int, base->bits});
+    t->sign = base->sign;
+    t->en = en;
+    return t;
+}
+
+Type *t_slice(Type *elem) {
+    static std::map<Type *, Type *> m;
+    Type *&t = m[elem];
+    if (!t) {
+        auto *st = new StructInfo;
+        st->name = "(slice " + type_name(elem) + ")";
+        st->slice_of = elem;
+        st->fields = {{"data", t_ptr(elem), 0}, {"len", t_int(64, false), 8}};
+        st->size = 16;
+        st->align = 8;
+        st->complete = true;
+        t = t_struct(st);
+    }
+    return t;
+}
+
 uint64_t size_of(const Type *t) {
     switch (t->kind) {
     case Type::Void: return 1;
@@ -81,14 +104,14 @@ void layout_struct(StructInfo *st) {
     uint64_t bits = 0, align = 1;  // position in bits, so bit fields can share bytes
     auto up = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
     for (auto &f : st->fields) {
-        uint64_t a = align_of(f.type), unit = 8 * size_of(f.type);
+        uint64_t a = st->packed ? 1 : align_of(f.type), unit = 8 * size_of(f.type);
         if (a > align) align = a;
         if (st->is_union) {
             f.offset = f.bit_off = 0;
             bits = std::max(bits, f.bit_width ? up(f.bit_width, 8) : unit);
         } else if (f.bit_width) {
-            // a bit field never straddles a boundary of its type's size
-            if (bits / unit != (bits + f.bit_width - 1) / unit) bits = up(bits, unit);
+            // a bit field never straddles a boundary of its type's size (packed: it may)
+            if (!st->packed && bits / unit != (bits + f.bit_width - 1) / unit) bits = up(bits, unit);
             f.bit_off = bits;
             f.offset = bits / 8;
             bits += f.bit_width;
@@ -98,6 +121,7 @@ void layout_struct(StructInfo *st) {
             bits += unit;
         }
     }
+    if (st->min_align > align) align = st->min_align;
     st->align = align;
     st->size = up(up(bits, 8) / 8, align);
     st->complete = true;
@@ -107,7 +131,7 @@ std::string type_name(const Type *t) {
     switch (t->kind) {
     case Type::Void: return "void";
     case Type::Bool: return "bool";
-    case Type::Int: return (t->sign ? "i" : "u") + std::to_string(t->bits);
+    case Type::Int: return t->en ? t->en->name : (t->sign ? "i" : "u") + std::to_string(t->bits);
     case Type::Float: return "f" + std::to_string(t->bits);
     case Type::Ptr: return "(ptr " + type_name(t->elem) + ")";
     case Type::Array: return "(array " + type_name(t->elem) + " " + std::to_string(t->n) + ")";

@@ -262,6 +262,9 @@ Form *Meta::type_form(Type *t, Loc at) {
         if (t->variadic) ps.push_back(mk_sym(at, "..."));
         return mk_list(at, {mk_sym(at, "fn"), mk_list(at, ps), type_form(t->elem, at)});
     }
+    case Type::Struct:
+        if (t->st->slice_of) return mk_list(at, {mk_sym(at, "slice"), type_form(t->st->slice_of, at)});
+        return mk_sym(at, type_name(t));
     default: return mk_sym(at, type_name(t));
     }
 }

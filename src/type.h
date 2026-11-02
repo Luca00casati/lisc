@@ -24,6 +24,9 @@ struct Field {
 
 struct StructInfo {
     std::string name;
+    bool packed = false;       // (struct name :packed ...): no padding, alignment 1
+    uint64_t min_align = 1;    // (struct name :align N ...)
+    Type *slice_of = nullptr;  // (slice T): data (ptr T), len u64
     std::vector<Field> fields;
     uint64_t size = 0, align = 1;
     bool complete = false;
@@ -36,6 +39,12 @@ struct StructInfo {
     }
 };
 
+// (enum name T a b (c 5) ...): a distinct integer type with named values
+struct EnumInfo {
+    std::string name;
+    std::vector<std::pair<std::string, uint64_t>> values;
+};
+
 struct Type {
     enum Kind { Void, Bool, Int, Float, Ptr, Array, Struct, Fn } kind;
     unsigned bits = 0;   // Int, Float
@@ -45,6 +54,7 @@ struct Type {
     StructInfo *st = nullptr;
     std::vector<Type *> params;  // Fn
     bool variadic = false;       // Fn
+    EnumInfo *en = nullptr;      // Int: an enum (a type of its own, not the plain integer)
 
     bool is_int() const { return kind == Int; }
     bool is_float() const { return kind == Float; }
@@ -61,6 +71,8 @@ Type *t_ptr(Type *elem);
 Type *t_array(Type *elem, uint64_t n);
 Type *t_fn(Type *ret, const std::vector<Type *> &params, bool variadic);
 Type *t_struct(StructInfo *st);  // one Type per StructInfo
+Type *t_enum(EnumInfo *en, Type *base);  // a new integer type, distinct from base
+Type *t_slice(Type *elem);       // (slice T), one per element type
 
 uint64_t size_of(const Type *t);
 uint64_t align_of(const Type *t);

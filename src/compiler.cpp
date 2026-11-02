@@ -76,6 +76,7 @@ struct FnAbi {
 
 struct Loop {
     BasicBlock *cont, *brk;
+    size_t depth;  // scopes.size() outside the loop's body: break/continue run the defers inside
 };
 
 const char *const ARITH[] = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"};
@@ -110,6 +111,7 @@ struct Compiler::Impl : MetaHost {
     struct Scope {
         std::map<std::string, Val> vars;
         std::vector<std::string> usings;
+        std::vector<Form *> defers;  // (defer ...) in this block, in order
         Val &operator[](const std::string &k) { return vars[k]; }
     };
     std::vector<Scope> scopes;
@@ -641,6 +643,7 @@ struct Compiler::Impl : MetaHost {
             fatal(f->loc, "unknown type '%s'", f->text.c_str());
         }
         if (f->is_call("ptr") && f->size() == 2) return t_ptr(parse_type(f->at(1)));
+        if (f->is_call("slice") && f->size() == 2) return t_slice(parse_type(f->at(1)));
         if (f->is_call("array") && f->size() == 3) {
             Val n = expr(f->at(2), t_int(64, false));
             auto *k = llvm::dyn_cast<llvm::ConstantInt>(n.v);
@@ -779,7 +782,7 @@ struct Compiler::Impl : MetaHost {
     // Lossless widening, done implicitly (as Zig does): a smaller integer into a
     // bigger one of the same signedness, or an unsigned one into a bigger signed one
     static bool widens(Type *from, Type *to) {
-        return from->is_int() && to->is_int() && to->bits > from->bits && (from->sign == to->sign || to->sign);
+        return from->is_int() && to->is_int() && !from->en && !to->en && to->bits > from->bits && (from->sign == to->sign || to->sign);
     }
     // two operands of different integer types: both get the wider type, if one widens to the other
     bool unify(Val &a, Val &x, Loc at) {
@@ -840,11 +843,13 @@ struct Compiler::Impl : MetaHost {
             Val base;
             if (is_place(f->at(1))) {
                 base = place(f->at(1));
-                if (base.t == t_str()) base = field_addr(base, mk_sym(f->loc, "data"));  // a str's bytes
+                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of))
+                    base = field_addr(base, mk_sym(f->loc, "data"));  // a str's bytes, a slice's elements
                 if (base.t->kind == Type::Ptr) base = {load(base), base.t};
             } else {
                 base = expr(f->at(1), nullptr);
-                if (base.t == t_str()) base = {b.CreateExtractValue(base.v, 0), t_ptr(t_int(8, false))};
+                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of))
+                    base = {b.CreateExtractValue(base.v, 0), base.t->st->fields[0].type};
                 if (base.t->kind == Type::Array) base = spill(base);
             }
             Val i = expr(f->at(2), t_int(64, true));
@@ -1031,6 +1036,11 @@ struct Compiler::Impl : MetaHost {
             if (!v.t->is_int()) fatal(f->loc, "~ needs an integer");
             return {b.CreateNot(v.v), v.t};
         }
+        if (hs == "." && f->size() == 3 && f->at(1)->kind == Form::Sym && f->at(2)->kind == Form::Sym && !is_place(f->at(1)) &&
+            !lookup_global(f->at(1))) {
+            std::string tk = type_key(f->at(1));
+            if (!tk.empty() && c.types_[tk]->en) return enum_member(c.types_[tk], f->at(2));
+        }
         if (hs == "." || hs == "aref" || hs == "deref") {
             Val a = place(f);
             if (a.t->kind == Type::Array && want && want->is_ptr()) return {a.v, want};
@@ -1061,6 +1071,17 @@ struct Compiler::Impl : MetaHost {
             return {llvm::ConstantInt::get(ll(rt), hs == "sizeof" ? size_of(t) : align_of(t)), rt};
         }
         if (hs == "make") return make(f);
+        if (hs == "defer") {  // (defer e ...): run when this block exits, however it exits
+            if (scopes.empty()) fatal(f->loc, "defer outside a function");
+            if (in_defer) fatal(f->loc, "defer inside a defer");
+            std::vector<Form *> items = f->items;
+            items[0] = mk_sym(f->loc, "do");
+            scopes.back().defers.push_back(mk_list(f->loc, items));
+            return {nullptr, t_void()};
+        }
+        if (hs == "case") return case_(f, want);
+        if (hs == "cond") return cond(f, want);
+        if (hs == "slice-of") return slice_of(f);
         if (hs == "using") {  // (using m ...) in a block: m's names unqualified until the block ends
             if (scopes.empty()) fatal(f->loc, "using outside a function");
             for (size_t i = 1; i < f->size(); i++) {
@@ -1083,13 +1104,46 @@ struct Compiler::Impl : MetaHost {
         return call(f);
     }
 
+    // a block: its own scope (for using and defer); the last form is its value,
+    // computed before the block's defers run
     Val body(Form *f, size_t from, Type *want) {
+        scopes.emplace_back();
         Val last{nullptr, t_void()};
         for (size_t i = from; i < f->size(); i++) {
             ensure_open();
             last = expr(f->at(i), i + 1 == f->size() ? want : nullptr);
         }
+        if (open()) run_defers(scopes.size() - 1);
+        scopes.pop_back();
         return last;
+    }
+    // one form as a block (an if branch)
+    Val block(Form *f, Type *want) {
+        scopes.emplace_back();
+        Val v = expr(f, want);
+        if (open()) run_defers(scopes.size() - 1);
+        scopes.pop_back();
+        return v;
+    }
+
+    // the defers of scopes[from..], innermost first, each compiled with the
+    // scopes it was written in (a later local of the same name can't capture it)
+    bool in_defer = false;
+    void run_defers(size_t from) {
+        for (size_t k = scopes.size(); k-- > from;) {
+            std::vector<Form *> ds = scopes[k].defers;
+            if (ds.empty()) continue;
+            std::vector<Scope> inner(scopes.begin() + k + 1, scopes.end());
+            scopes.resize(k + 1);
+            bool saved = in_defer;
+            in_defer = true;
+            for (size_t i = ds.size(); i-- > 0;) {
+                ensure_open();
+                expr(ds[i], nullptr);
+            }
+            in_defer = saved;
+            scopes.insert(scopes.end(), inner.begin(), inner.end());
+        }
     }
 
     // the operand type of an arithmetic or compare form: the first typed operand's
@@ -1373,7 +1427,7 @@ struct Compiler::Impl : MetaHost {
                 if (f->text == n) return true;
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
-        return f->is_call("ptr") || f->is_call("array") || f->is_call("fn");
+        return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice");
     }
 
     Val set(Form *f) {
@@ -1457,6 +1511,111 @@ struct Compiler::Impl : MetaHost {
         return {b.CreateAtomicRMW(k, a.v, v.v, al, order), a.t};  // the old value
     }
 
+    Val enum_member(Type *t, Form *name) {
+        for (auto &v : t->en->values)
+            if (v.first == name->text) return {llvm::ConstantInt::get(ll(t), v.second), t};
+        fatal(name->loc, "enum %s has no member %s", t->en->name.c_str(), name->text.c_str());
+    }
+
+    // (cond (test body...) ... (else body...)): an if / else-if chain
+    Val cond(Form *f, Type *want) {
+        Form *chain = nullptr;
+        for (size_t i = f->size(); i-- > 1;) {
+            Form *cl = f->at(i);
+            if (!cl->is_list() || cl->items.empty()) fatal(cl->loc, "cond clause must be (test body...)");
+            std::vector<Form *> b0 = {mk_sym(cl->loc, "do")};
+            b0.insert(b0.end(), cl->items.begin() + 1, cl->items.end());
+            Form *bodyf = mk_list(cl->loc, b0);
+            if (cl->at(0)->is_sym("else")) {
+                if (i + 1 != f->size()) fatal(cl->loc, "else must be the last cond clause");
+                chain = bodyf;
+            } else {
+                std::vector<Form *> it = {mk_sym(cl->loc, "if"), cl->at(0), bodyf};
+                if (chain) it.push_back(chain);
+                chain = mk_list(cl->loc, it);
+            }
+        }
+        return chain ? expr(chain, want) : Val{nullptr, t_void()};
+    }
+
+    // (case x (v body...) ((v1 v2) body...) ... (else body...)): a jump table on an
+    // integer or enum; a value if every clause (and an else) gives one of one type
+    Val case_(Form *f, Type *want) {
+        if (f->size() < 3) fatal(f->loc, "(case x (value body...) ... [(else body...)])");
+        Val x = expr(f->at(1), nullptr);
+        if (!x.t->is_int()) fatal(f->at(1)->loc, "case needs an integer or enum, got %s", type_name(x.t).c_str());
+        BasicBlock *done = BasicBlock::Create(ctx, "endcase", fn), *dflt = done;
+        Form *lastcl = f->at(f->size() - 1);
+        bool has_else = lastcl->is_list() && !lastcl->items.empty() && lastcl->at(0)->is_sym("else");
+        if (has_else) dflt = BasicBlock::Create(ctx, "else", fn);
+        llvm::SwitchInst *sw = b.CreateSwitch(x.v, dflt, f->size() - 2);
+        std::set<uint64_t> seen;
+        std::vector<std::pair<Val, BasicBlock *>> results;
+        Type *t = want;
+        bool value = has_else;
+        for (size_t i = 2; i < f->size(); i++) {
+            Form *cl = f->at(i);
+            if (!cl->is_list() || cl->size() < 1) fatal(cl->loc, "case clause must be (value body...)");
+            bool is_else = cl->at(0)->is_sym("else");
+            if (is_else && i + 1 != f->size()) fatal(cl->loc, "else must be the last case clause");
+            BasicBlock *bb = is_else ? dflt : BasicBlock::Create(ctx, "when", fn);
+            if (!is_else) {
+                bool many = cl->at(0)->is_list() && !cl->at(0)->is_call(".");
+                std::vector<Form *> vs = many ? cl->at(0)->items : std::vector<Form *>{cl->at(0)};
+                for (Form *v : vs) {
+                    auto *k = llvm::dyn_cast<llvm::ConstantInt>(constant(v, x.t));
+                    if (!k) fatal(v->loc, "a case value must be an integer constant");
+                    if (!seen.insert(k->getZExtValue()).second) fatal(v->loc, "%s appears twice in this case", show(v).c_str());
+                    sw->addCase(k, bb);
+                }
+            }
+            b.SetInsertPoint(bb);
+            Val r = body(cl, 1, t);
+            if (!t && r.t != t_void()) t = r.t;
+            if (r.t == t_void() || (t && r.t != t)) value = false;
+            if (open()) {
+                results.push_back({r, b.GetInsertBlock()});
+                b.CreateBr(done);
+            }
+        }
+        b.SetInsertPoint(done);
+        if (results.empty()) {  // every clause left (return/break): nothing reaches the end
+            if (has_else) b.CreateUnreachable();
+            return {nullptr, t_void()};
+        }
+        if (!value) return {nullptr, t_void()};
+        llvm::PHINode *phi = b.CreatePHI(ll(t), results.size());
+        for (auto &r : results) phi->addIncoming(r.first.v, r.second);
+        return {phi, t};
+    }
+
+    // (slice-of a) — an array as a (slice T); (slice-of a from [to]) — part of an
+    // array, slice or str (a str's part is a str)
+    Val slice_of(Form *f) {
+        if (f->size() < 2 || f->size() > 4) fatal(f->loc, "(slice-of a [from [to]])");
+        Val data, len;
+        Type *st;  // the result type
+        Val base = is_place(f->at(1)) ? place(f->at(1)) : spill(expr(f->at(1), nullptr));
+        if (base.t->kind == Type::Array) {
+            st = t_slice(base.t->elem);
+            data = {base.v, t_ptr(base.t->elem)};
+            len = {b.getInt64(base.t->n), t_int(64, false)};
+        } else if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of)) {
+            st = base.t;
+            data = {load(field_addr(base, mk_sym(f->loc, "data"))), st->st->fields[0].type};
+            len = {load(field_addr(base, mk_sym(f->loc, "len"))), t_int(64, false)};
+        } else fatal(f->at(1)->loc, "slice-of needs an array, a slice or a str, got %s", type_name(base.t).c_str());
+        Type *u64 = t_int(64, false);
+        llvm::Value *from = f->size() >= 3 ? coerce(expr(f->at(2), u64), u64, f->at(2)->loc, "from").v : b.getInt64(0);
+        llvm::Value *to = f->size() == 4 ? coerce(expr(f->at(3), u64), u64, f->at(3)->loc, "to").v : len.v;
+        Type *elem = data.t->elem;
+        llvm::Value *p = b.CreateGEP(ll(elem), data.v, from);
+        llvm::Value *v = llvm::UndefValue::get(ll(st));
+        v = b.CreateInsertValue(v, p, 0);
+        v = b.CreateInsertValue(v, b.CreateSub(to, from), 1);
+        return {v, st};
+    }
+
     Val if_(Form *f, Type *want) {
         if (f->size() != 3 && f->size() != 4) fatal(f->loc, "(if cond then [else])");
         llvm::Value *c0 = to_bool(expr(f->at(1), t_bool()), f->at(1)->loc);
@@ -1474,13 +1633,13 @@ struct Compiler::Impl : MetaHost {
         bool th_open, el_open;
         auto then_branch = [&](Type *tt) {
             b.SetInsertPoint(th);
-            a = expr(f->at(2), tt);
+            a = block(f->at(2), tt);
             th_end = b.GetInsertBlock();
             th_open = open();
         };
         auto else_branch = [&](Type *tt) {
             b.SetInsertPoint(el);
-            if (two) x = expr(f->at(3), tt);
+            if (two) x = block(f->at(3), tt);
             el_end = b.GetInsertBlock();
             el_open = open();
         };
@@ -1525,7 +1684,7 @@ struct Compiler::Impl : MetaHost {
         b.SetInsertPoint(cond);
         b.CreateCondBr(to_bool(expr(f->at(1), t_bool()), f->at(1)->loc), bodyb, done);
         b.SetInsertPoint(bodyb);
-        loops.push_back({cond, done});
+        loops.push_back({cond, done, scopes.size()});
         body(f, 2, nullptr);
         loops.pop_back();
         if (open()) b.CreateBr(cond);
@@ -1568,7 +1727,7 @@ struct Compiler::Impl : MetaHost {
         llvm::Value *i = load({iv, t});
         b.CreateCondBr(t->sign ? b.CreateICmpSLT(i, end.v) : b.CreateICmpULT(i, end.v), bodyb, done);
         b.SetInsertPoint(bodyb);
-        loops.push_back({step, done});
+        loops.push_back({step, done, scopes.size()});
         body(f, 2, nullptr);
         loops.pop_back();
         if (open()) b.CreateBr(step);
@@ -1584,16 +1743,21 @@ struct Compiler::Impl : MetaHost {
 
     Val jump(Form *f, bool is_break) {
         if (loops.empty()) fatal(f->loc, "(%s) outside a loop", is_break ? "break" : "continue");
+        if (in_defer) fatal(f->loc, "(%s) inside a defer", is_break ? "break" : "continue");
+        run_defers(loops.back().depth);
         b.CreateBr(is_break ? loops.back().brk : loops.back().cont);
         return {nullptr, t_void()};
     }
 
     Val return_(Form *f) {
+        if (in_defer) fatal(f->loc, "return inside a defer");
         if (f->size() == 1) {
             if (fn_ret != t_void()) fatal(f->loc, "return needs a %s value", type_name(fn_ret).c_str());
+            run_defers(0);
             b.CreateRetVoid();
         } else {
-            Val v = value_for(f->at(1), fn_ret, "return value");
+            Val v = value_for(f->at(1), fn_ret, "return value");  // computed before the defers run
+            run_defers(0);
             emit_ret(v);
         }
         return {nullptr, t_void()};
@@ -1774,6 +1938,7 @@ struct Compiler::Impl : MetaHost {
         std::vector<std::pair<Form *, StructInfo *>> structs;
         std::vector<ModInfo *> struct_mods;
         each(all, [&](Form *f) {
+            if (f->is_call("enum")) return define_enum(f);
             if (!f->is_call("struct") && !f->is_call("union")) return;
             if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(struct name (field T) ...)");
             auto *st = new StructInfo;
@@ -1792,7 +1957,7 @@ struct Compiler::Impl : MetaHost {
         // structs they produce are added the same way
         std::vector<std::pair<Form *, ModInfo *>> expanded;
         each(all, [&](Form *f) {
-            if (f->is_call("struct") || f->is_call("union")) {
+            if (f->is_call("struct") || f->is_call("union") || f->is_call("enum")) {
                 expanded.push_back({f, cur});
                 return;
             }
@@ -1855,22 +2020,81 @@ struct Compiler::Impl : MetaHost {
                 c.c_prefix = cur->name + "::";  // module::name, the C symbol name
                 c.add_extern_fn(f->at(1)->text, ft);
                 c.c_prefix.clear();
-            } else if (strcmp(h, "struct") && strcmp(h, "union")) {
+            } else if (!strcmp(h, "export")) {
+                exports.push_back({f, cur});
+            } else if (strcmp(h, "struct") && strcmp(h, "union") && strcmp(h, "enum")) {
                 fatal(f->loc, "unknown top-level form %s", show(f).c_str());
             }
         });
         for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second]);
+        // (export name ...): these functions and globals keep their own name, for C
+        for (auto &e : exports) {
+            cur = e.second;
+            for (size_t i = 1; i < e.first->size(); i++) {
+                Form *n = e.first->at(i);
+                if (n->kind != Form::Sym) fatal(n->loc, "(export name ...)");
+                auto it = c.globals_.find(def_key(n));
+                if (it == c.globals_.end() || it->second.kind == Global::Const)
+                    fatal(n->loc, "export: no function or global '%s' in this module", n->text.c_str());
+                auto *gv = llvm::cast<llvm::GlobalValue>(it->second.value);
+                if (gv->getName() != n->text && mod.getNamedValue(n->text))
+                    fatal(n->loc, "export: '%s' is already a symbol of the program (a C function?)", n->text.c_str());
+                gv->setName(n->text);
+                gv->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            }
+        }
+        cur = nullptr;
         // pass 3: function bodies
         each(all, [&](Form *f) {
             if (f->is_call("defn")) define_fn(f);
         });
     }
 
+    std::vector<std::pair<Form *, ModInfo *>> exports;
+
+    // (enum name T a b (c 5) d ...): a distinct integer type; values count up from
+    // 0, or from the last one given
+    void define_enum(Form *f) {
+        if (f->size() < 3 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(enum name T member ...)");
+        Type *base = parse_type(f->at(2));
+        if (!base->is_int() || base->en) fatal(f->at(2)->loc, "an enum's type is an integer type, got %s", type_name(base).c_str());
+        auto *en = new EnumInfo{f->at(1)->text, {}};
+        uint64_t next = 0;
+        for (size_t i = 3; i < f->size(); i++) {
+            Form *m = f->at(i);
+            Form *name = m->is_list() && m->size() == 2 ? m->at(0) : m;
+            if (name->kind != Form::Sym) fatal(m->loc, "an enum member is a name or (name value)");
+            if (m->is_list()) {
+                if (m->at(1)->kind != Form::Int) fatal(m->at(1)->loc, "an enum value is an integer");
+                next = m->at(1)->ival;
+            }
+            for (auto &v : en->values)
+                if (v.first == name->text) fatal(name->loc, "%s is twice in enum %s", name->text.c_str(), en->name.c_str());
+            en->values.push_back({name->text, next++});
+        }
+        std::string k = def_key(f->at(1));
+        if (c.types_.count(k)) fatal(f->loc, "type '%s' is already defined", en->name.c_str());
+        c.types_[k] = t_enum(en, base);
+        note_private(f->at(1), k);
+    }
+
     void add_fields(std::vector<std::pair<Form *, StructInfo *>> &structs, std::vector<ModInfo *> &ms) {
         for (size_t si = 0; si < structs.size(); si++) {
             auto &s = structs[si];
             cur = ms[si];
-            for (size_t i = 2; i < s.first->size(); i++) {
+            size_t first = 2;
+            // options before the fields: :packed, :align N
+            while (first < s.first->size() && s.first->at(first)->kind == Form::Sym) {
+                Form *o = s.first->at(first);
+                if (o->is_sym(":packed")) s.second->packed = true;
+                else if (o->is_sym(":align") && first + 1 < s.first->size() && s.first->at(first + 1)->kind == Form::Int) {
+                    uint64_t a = s.first->at(++first)->ival;
+                    if (!a || (a & (a - 1))) fatal(s.first->at(first)->loc, ":align needs a power of two");
+                    s.second->min_align = a;
+                } else fatal(o->loc, "struct options are :packed and :align N");
+                first++;
+            }
+            for (size_t i = first; i < s.first->size(); i++) {
 
                 Form *fd = s.first->at(i);
                 bool bits = fd->is_list() && fd->size() == 4 && fd->at(2)->is_sym(":bits") && fd->at(3)->kind == Form::Int;

@@ -1,0 +1,2 @@
+plain 12  packed 7 (b at byte 1)  line 64 align 64
+h.b 11223344  C calls twice: 42

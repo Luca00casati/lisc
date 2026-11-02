@@ -1,7 +1,7 @@
 // reader.cpp — text → forms.
 //
 //   ; comment            (a b c)             "string\n"  (UTF-8; \u{1F600}, \xHH raw byte)
-//   c"C string"  (NUL-terminated, for C)
+//   c"C string"  (NUL-terminated, for C)     #\a #\é #\newline  (a character: its code point)
 //   123  -5  0x1f        1.5  2e-3  -0.5     symbols: anything else
 //   'x  `x  ,x  ,@x  →  (quote x) (quasiquote x) (unquote x) (unquote-splicing x)
 //   a.b.c  →  (. a b c)  field access (a symbol with inner dots)
@@ -94,6 +94,7 @@ struct Reader {
             return mk_list(at, {mk_sym(at, name), read()});
         }
         if (c == '"') return read_string(at);
+        if (c == '#' && pos + 1 < src.size() && src[pos + 1] == '\\') return read_char(at);
         if (c == 'c' && pos + 1 < src.size() && src[pos + 1] == '"') {  // c"...": a C string
             next();
             Form *f = read_string(at);
@@ -103,6 +104,37 @@ struct Reader {
         std::string tok;
         while (!delimiter(peek())) tok += (char)next();
         return atom(at, tok);
+    }
+
+    // #\a #\é #\space #\newline #\tab #\nul #\return #\escape: the code point,
+    // an untyped integer (like a number written there)
+    Form *read_char(Loc at) {
+        next();
+        next();
+        std::string tok;
+        int c0 = next();  // the first character is taken whatever it is: #\( #\;
+        if (c0 < 0) fatal(at, "#\\ needs a character");
+        tok += (char)c0;
+        if ((c0 & 0xC0) == 0xC0)  // the rest of a UTF-8 sequence
+            while ((peek() & 0xC0) == 0x80) tok += (char)next();
+        while (!delimiter(peek())) tok += (char)next();
+        static const std::pair<const char *, uint32_t> names[] = {
+            {"space", 32}, {"newline", 10}, {"tab", 9}, {"nul", 0}, {"return", 13}, {"escape", 27}, {"backspace", 8}};
+        uint32_t cp = 0;
+        bool found = false;
+        for (auto &n : names)
+            if (tok == n.first) { cp = n.second; found = true; }
+        if (!found) {
+            unsigned char b0 = tok[0];
+            size_t n = b0 < 0x80 ? 1 : (b0 >> 5) == 6 ? 2 : (b0 >> 4) == 14 ? 3 : 4;
+            if (tok.size() != n) fatal(at, "unknown character #\\%s", tok.c_str());
+            cp = n == 1 ? b0 : n == 2 ? b0 & 0x1F : n == 3 ? b0 & 0x0F : b0 & 0x07;
+            for (size_t k = 1; k < n; k++) cp = cp << 6 | ((unsigned char)tok[k] & 0x3F);
+        }
+        Form *f = new Form{Form::Int, at};
+        f->ival = cp;
+        f->text = std::to_string(cp);
+        return f;
     }
 
     Form *read_string(Loc at) {

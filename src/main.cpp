@@ -119,6 +119,12 @@ int main(int argc, char **argv) {
     dir = dir.find('/') == std::string::npos ? "." : dir.substr(0, dir.rfind('/'));
     c.include_dirs.push_back(dir);
     c.include_dirs.insert(c.include_dirs.end(), includes.begin(), includes.end());
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) {
+        std::string exe(self, n);
+        c.lib_dir = exe.substr(0, exe.rfind('/')) + "/lib";
+    }
     for (auto &d : defines) {
         size_t eq = d.find('=');
         c.define_const(d.substr(0, eq), eq == std::string::npos ? "1" : d.substr(eq + 1));

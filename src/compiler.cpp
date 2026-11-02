@@ -32,6 +32,8 @@
 #include "compiler.h"
 #include "macro.h"
 
+#include <unistd.h>
+
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -416,6 +418,20 @@ struct Compiler::Impl : MetaHost {
         return from.substr(0, from.rfind('/') + 1) + path;
     }
 
+    // where (import "name") is: next to the importing file, else in the -I
+    // directories, else in the library next to lisc (lib/); .lsp is optional
+    std::string find_module(Form *at, std::string name) {
+        if (name.size() < 4 || name.compare(name.size() - 4, 4, ".lsp") != 0) name += ".lsp";
+        std::string here = near(at, name);
+        if (name[0] == '/' || access(here.c_str(), F_OK) == 0) return here;
+        for (auto &d : c.include_dirs) {
+            std::string p = d + "/" + name;
+            if (access(p.c_str(), F_OK) == 0) return p;
+        }
+        if (!c.lib_dir.empty() && access((c.lib_dir + "/" + name).c_str(), F_OK) == 0) return c.lib_dir + "/" + name;
+        return here;  // (the error says where it looked first)
+    }
+
     // a module's file, read once; its forms (and its imports') go to items
     ModInfo *load_module(const std::string &path, Loc at, std::vector<Form *> *forms = nullptr) {
         char real[4096];
@@ -455,9 +471,7 @@ struct Compiler::Impl : MetaHost {
                 ModInfo *t;
                 if (const std::vector<std::string> *hs = builtin_c(f->at(1)->text)) t = c_module(f->at(1)->text, *hs, f->loc);
                 else {
-                    std::string path = near(f, f->at(1)->text);
-                    if (path.size() < 4 || path.compare(path.size() - 4, 4, ".lsp") != 0) path += ".lsp";
-                    t = load_module(path, f->loc);
+                    t = load_module(find_module(f, f->at(1)->text), f->loc);
                 }
                 m->alias[as.empty() ? t->name : as] = t->name;
             } else if (f->is_call("import-c")) {

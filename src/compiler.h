@@ -35,8 +35,10 @@ public:
     bool checks = false;  // --checks: bounds, casts and division checked at run time
     llvm::Module &module() { return *mod_; }
 
-    // where import-c looks for headers first (then the system directories)
+    // where import and import-c look (after the importing file's directory;
+    // then lib_dir for modules, the system directories for headers)
     std::vector<std::string> include_dirs;
+    std::string lib_dir;  // the standard library: lib/ next to the lisc binary
     // -D NAME[=value]: an untyped constant (a number, or else a string; 1 without a value)
     void define_const(const std::string &name, const std::string &value);
 

@@ -177,6 +177,17 @@ C names keep their C symbols, so `libc::printf` links to `printf`. C headers
 include each other, so two C modules can declare the same thing (`size_t`,
 `NULL`); using both is fine, it is one name.
 
+## Standard library
+
+`(import "x")` looks next to the importing file, then in `-I` directories, then
+in `lib/` next to the `lisc` binary, which holds the standard library:
+
+| module | |
+|---|---|
+| `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
+| `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
+| `std/vec` | `(vec::define name T)` — a growable array `name` with `name-push` `name-pop` `name-clear` `name-free` `name-slice` |
+
 ## Operators
 
 `(defop + ((a v3) (b v3)) v3 ...)` defines `+` for two `v3`s. An operator form

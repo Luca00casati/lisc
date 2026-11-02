@@ -1,0 +1,26 @@
+; the standard library, found next to lisc: std/str, std/mem, std/vec
+(import "libc")
+(import "std/str")
+(import "std/mem")
+(import "std/vec")
+(using libc)
+
+(vec::define ints i32)
+
+(defn main () i32
+  (let ((s "teapot.lsp") (buf (array i8 16)))
+    (printf c"%d %d %d %lu\n" (cast i32 (str::eq s "teapot.lsp")) (cast i32 (str::starts-with s "tea"))
+            (cast i32 (str::ends-with s ".lsp")) (str::find s #\.))
+    (printf c"to-c: %s  from-c: %lu bytes\n" (str::to-c s (addr (aref buf 0)) 16) (. (str::from-c c"hello") len))
+    (str::print "printed as a str\n"))
+  (let ((xs (mem::new f32 4)))
+    (set (aref xs 3) 2.5)
+    (printf c"mem::new %g %g\n" (cast f64 (aref xs 0)) (cast f64 (aref xs 3)))
+    (mem::free xs))
+  (let ((v (make ints)) (sum 0))
+    (for (i 0 100) (ints-push (addr v) (* i i)))
+    (let ((all (ints-slice (addr v))))
+      (for (i u64 0 all.len) (+= sum (aref all i))))
+    (printf c"vec: %lu items, sum %d, last %d\n" v.len sum (ints-pop (addr v)))
+    (ints-free (addr v)))
+  0)

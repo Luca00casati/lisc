@@ -1,0 +1,5 @@
+1 1 1 6
+to-c: teapot.lsp  from-c: 5 bytes
+printed as a str
+mem::new 0 2.5
+vec: 100 items, sum 328350, last 9801

@@ -5,6 +5,10 @@
 cd "$(dirname "$0")"
 mkdir -p out
 pass=0 fail=0
+# C imports are cached in a fresh directory: the first test of each module
+# imports it with libclang, the others read it back
+rm -rf out/cache
+export XDG_CACHE_HOME="$PWD/out/cache"
 for src in *.lsp; do
     name=${src%.lsp}
     extra=; [ -e "$name.c" ] && extra="$name.c"   # C code linked into the test
@@ -45,5 +49,17 @@ for src in warnings/*.lsp; do
     *) fail=$((fail + 1)); echo "FAIL $src: want warning '$want', got '$got'" ;;
     esac
 done
+# The C import cache must notice a header that changed (even at the same size).
+mkdir -p out/hc
+printf '#define ANSWER 41\nstruct pt { int x, y; };\n' >out/hc/h.h
+printf '(import "libc")\n(import-c "h.h" :as h)\n(defn main () i32 (libc::printf c"%%d %%lu\\n" h::ANSWER (sizeof h::pt)) 0)\n' >out/hc/t.lsp
+got=$(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t && ../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)
+sleep 0.01
+printf '#define ANSWER 42\nstruct pt { int x, y; };\n' >out/hc/h.h
+got="$got $(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)"
+printf '#define ANSWER 42\nstruct pt { long x, y; };\n' >out/hc/h.h
+got="$got $(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)"
+if [ "$got" = "41 8
+41 8 42 8 42 16" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL C import cache: got '$got'"; fi
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

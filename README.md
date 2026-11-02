@@ -33,6 +33,12 @@ and code after a `return`/`break`/`continue`; `-w` turns them off.
 `:optnone` compiles a function as at `-O0` whatever the level: for code
 that runs once (setup, table builders) and is big enough to slow the build.
 
+C imports are cached in `~/.cache/lisc` (or `$XDG_CACHE_HOME/lisc`): each C
+module's declarations and constants, keyed by its headers, the flags and the
+lisc binary, and checked against every file the headers read (path, size,
+modification time). A build with a warm cache does no header parsing.
+`--no-cache` imports from the headers every time.
+
 `--time` reports how long each phase took (front end, optimiser, code
 generation, link); `-O0` builds fastest.
 

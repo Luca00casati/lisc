@@ -39,6 +39,7 @@ public:
     // then lib_dir for modules, the system directories for headers)
     std::vector<std::string> include_dirs;
     std::string lib_dir;  // the standard library: lib/ next to the lisc binary
+    bool c_cache = true;  // keep C imports in ~/.cache/lisc (--no-cache: don't)
     // -D NAME[=value]: an untyped constant (a number, or else a string; 1 without a value)
     void define_const(const std::string &name, const std::string &value);
 

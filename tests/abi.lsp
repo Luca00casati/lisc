@@ -2,10 +2,15 @@
 (import "libc")
 (using libc)
 (import-c "abi.h" :as cabi)
+(import "math")
 (using cabi)
 
 ; a lisc struct laid out like C's struct bf, bit fields included
 (struct mybf (a u32 :bits 3) (b u32 :bits 5) (c i32 :bits 7) (d u32 :bits 17) (e bool :bits 1) (tail i8))
+
+; bit fields in a constant initializer: the same bytes as C's
+(def gbf mybf (make mybf :a 5 :b 17 :c -33 :d 100000 :e true :tail -2))
+(def gcbf bf (make bf :a 5 :b 17 :c -33 :d 100000 :e true :tail -2))
 
 (defn len2 ((v v3)) f32 (+ (* v.x v.x) (* v.y v.y) (* v.z v.z)))   ; called from C
 (defn rot ((b big)) big                                              ; called from C, big result
@@ -42,4 +47,16 @@
   ; the same layout declared in lisc
   (let ((y (make mybf :a 5 :b 17 :c -33 :d 100000 :e true :tail -2)))
     (printf c"mybf size %lu/%lu  sum %ld\n" (sizeof mybf) (sizeof bf) (bf_sum (deref (cast (ptr bf) (addr y))))))
+  (printf c"global bf sums %ld %ld\n" (bf_sum (deref (cast (ptr bf) (addr gbf)))) (bf_sum gcbf))
+  ; long double and __int128, alone and in structs
+  (let ((x (ld_mul 1.25 3.0)) (big (i128_mul 4000000000000 5000000000000)) (sh (u128_shift 1 100))
+        (w (w1_twice (make w1 :v big))) (n (make ldn :x 0.5 :n 3)))
+    (printf c"ld %.20Lf %Lg %lu\n" x (math::sqrtl 2.0) (sizeof f80))
+    (printf c"i128 %ld %lu %ld %ld %lu\n" (cast i64 (/ big 1000000000000000)) (cast u64 (>> sh 64))
+            (cast i64 (/ w.v 1000000000000000)) (wide_low (make wide :v (<< (cast i128 7) 64) :tag 5)) (sizeof i128))
+    (printf c"ldn %Lg\n" (ldn_sum n n)))
+  ; structs through ... : in registers, then (more than fit) on the stack
+  (let ((v (make v3 :x 1.0 :y 2.0 :z 3.0)) (d (make d2 :a 5.0 :b 1.0)) (m (make mix :i 2 :f 0.5))
+        (l (make l2 :a 9 :b 2)) (bg (make big :v (make (array i32 5) 1 0 0 0 7))))
+    (printf c"var structs %.1f %.1f\n" (var_structs c"vdmlbi" v d m l bg 3) (var_structs c"dddddvvmlll" d d d d d v v m l l l)))
   0)

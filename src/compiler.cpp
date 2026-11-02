@@ -176,7 +176,7 @@ struct Compiler::Impl : MetaHost {
                 d = dib->createBasicType(type_name(t), t->bits, t->sign ? llvm::dwarf::DW_ATE_signed : llvm::dwarf::DW_ATE_unsigned);
             }
             break;
-        case Type::Float: d = dib->createBasicType(type_name(t), t->bits, llvm::dwarf::DW_ATE_float); break;
+        case Type::Float: d = dib->createBasicType(type_name(t), 8 * size_of(t), llvm::dwarf::DW_ATE_float); break;
         case Type::Ptr: d = dib->createPointerType(t->elem == t_void() ? nullptr : ditype(t->elem), 64); break;
         case Type::Array: {
             llvm::Metadata *sub[] = {dib->getOrCreateSubrange(0, (int64_t)t->n)};
@@ -405,6 +405,7 @@ struct Compiler::Impl : MetaHost {
                        [&](const std::string &a, const std::string &b) { return c.types_[a] == c.types_[b]; });
     }
     std::string macro_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return meta.is_macro(k); }); }
+    std::string meta_key(Form *sym) override { return resolve(sym, [&](const std::string &k) { return meta.is_meta(k); }); }
 
     // every symbol of a file's forms belongs to its module
     void tag(Form *f, const char *m) {
@@ -516,7 +517,7 @@ struct Compiler::Impl : MetaHost {
                 for (Form *x : inner) mark_private(x);
                 add_forms(inner, m);
             } else {
-                static const char *const dash[] = {"defn-", "def-", "const-", "defmacro-", "struct-", "union-"};
+                static const char *const dash[] = {"defn-", "def-", "const-", "defmacro-", "defmeta-", "struct-", "union-"};
                 for (const char *d : dash)
                     if (f->is_call(d)) {  // (defn- name ...) = (private (defn name ...))
                         std::vector<Form *> it = f->items;
@@ -555,7 +556,7 @@ struct Compiler::Impl : MetaHost {
     // compiled into a scratch block that is thrown away
     std::map<Form *, Type *> type_memo;  // type-of results in the function being compiled
     Type *type_of(Form *f) override {
-        if (!fn) fatal(f->loc, "type-of works only inside functions");
+        if (!fn) return type_of_top(f);
         auto memo = type_memo.find(f);
         if (memo != type_memo.end()) return memo->second;
         llvm::IRBuilderBase::InsertPoint ip = b.saveIP();
@@ -572,6 +573,33 @@ struct Compiler::Impl : MetaHost {
         return type_memo[f] = t;
     }
 
+    // type-of in a top-level macro: compiled in a function made for it and
+    // thrown away. (The program's own functions, globals and constants are
+    // declared after top-level macros run, so only types and C declarations are known.)
+    bool at_top_typeof = false;
+    Type *type_of_top(Form *f) {
+        auto saved_temps = std::move(temp_pool);
+        auto saved_scopes = std::move(scopes);
+        auto saved_loops = std::move(loops);
+        auto ip = b.saveIP();
+        temp_pool.clear();
+        scopes.assign(1, {});
+        loops.clear();
+        fn = llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(), false), llvm::GlobalValue::InternalLinkage, "lisc.typeof", mod);
+        b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
+        at_top_typeof = true;
+        Type *t = expr(f, nullptr).t;
+        at_top_typeof = false;
+        fn->eraseFromParent();
+        fn = nullptr;
+        temp_pool = std::move(saved_temps);
+        scopes = std::move(saved_scopes);
+        loops = std::move(saved_loops);
+        if (ip.isSet()) b.restoreIP(ip);
+        else b.ClearInsertionPoint();
+        return t;
+    }
+
     /* --------------------------------------------------------- types --- */
 
     llvm::Type *ll(Type *t) {
@@ -579,7 +607,7 @@ struct Compiler::Impl : MetaHost {
         case Type::Void: return b.getVoidTy();
         case Type::Bool: return b.getInt1Ty();
         case Type::Int: return b.getIntNTy(t->bits);
-        case Type::Float: return t->bits == 32 ? b.getFloatTy() : b.getDoubleTy();
+        case Type::Float: return t->bits == 32 ? b.getFloatTy() : t->bits == 64 ? b.getDoubleTy() : llvm::Type::getX86_FP80Ty(ctx);
         case Type::Ptr: return b.getPtrTy();
         case Type::Array: return llvm::ArrayType::get(ll(t->elem), t->n);
         case Type::Struct: return ll_struct(t->st);
@@ -609,7 +637,10 @@ struct Compiler::Impl : MetaHost {
             }
         } else if (t->kind == Type::Array) {
             for (uint64_t i = 0; i < t->n; i++) leaves(t->elem, off + i * size_of(t->elem), out);
-        } else out.push_back({off, t});
+        } else if (t->is_int() && t->bits == 128) {  // two INTEGER eightbytes
+            out.push_back({off, t_int(64, false)});
+            out.push_back({off + 8, t_int(64, false)});
+        } else out.push_back({off, t});  // (an f80 straddles two eightbytes: the struct goes in memory)
     }
 
     ArgAbi classify(Type *t) {
@@ -957,6 +988,7 @@ struct Compiler::Impl : MetaHost {
                 {"u8", t_int(8, false)}, {"u16", t_int(16, false)}, {"u32", t_int(32, false)}, {"u64", t_int(64, false)},
                 {"isize", t_int(64, true)}, {"usize", t_int(64, false)},
                 {"f32", t_float(32)}, {"f64", t_float(64)}, {"str", t_str()},
+                {"i128", t_int(128, true)}, {"u128", t_int(128, false)}, {"f80", t_float(80)},
             };
             auto it = builtin.find(f->text);
             if (it != builtin.end()) return it->second;
@@ -1321,6 +1353,7 @@ struct Compiler::Impl : MetaHost {
     // rounded once, from the text: like C's 1.5f / 1.5
     Val float_const(const std::string &text, Type *t) {
         if (t->bits == 32) return {llvm::ConstantFP::get(b.getFloatTy(), strtof(text.c_str(), nullptr)), t};
+        if (t->bits == 80) return {llvm::ConstantFP::get(llvm::Type::getX86_FP80Ty(ctx), text), t};  // (parsed at its own precision)
         return {llvm::ConstantFP::get(b.getDoubleTy(), strtod(text.c_str(), nullptr)), t};
     }
 
@@ -1338,7 +1371,7 @@ struct Compiler::Impl : MetaHost {
         Val l = lookup_local(key(f));
         if (l.v) return {load(l), l.t};
         Global *g = lookup_global(f);
-        if (!g) fatal(f->loc, "unknown name '%s'", n.c_str());
+        if (!g) fatal(f->loc, at_top_typeof ? "unknown name '%s' (type-of in a top-level macro knows types and C declarations, not the program's functions, globals and constants: they are declared after)" : "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
         case Global::Func: return {g->value, t_ptr(g->type)};
@@ -1382,6 +1415,11 @@ struct Compiler::Impl : MetaHost {
         if (hs == "not") {
             if (f->size() != 2) fatal(f->loc, "(not x)");
             return {b.CreateNot(to_bool(expr(f->at(1), t_bool()), f->loc)), t_bool()};
+        }
+        if (hs == "discard") {  // (discard e): e for its effects, its value dropped on purpose
+            if (f->size() != 2) fatal(f->loc, "(discard e)");
+            expr(f->at(1), nullptr);
+            return {nullptr, t_void()};
         }
         if (hs == "~") {
             if (f->size() != 2) fatal(f->loc, "(~ x)");
@@ -1475,6 +1513,17 @@ struct Compiler::Impl : MetaHost {
 
     // a block: its own scope (for using and defer); the last form is its value,
     // computed before the block's defers run
+    // a call, written here, of a lisc function (C functions' results are
+    // often ignored on purpose: printf, memcpy ...)
+    bool lisc_call(Form *f) {
+        if (!f->is_list() || f->items.empty() || f->loc.via) return false;
+        Form *h = f->at(0);
+        if (h->is_list()) return h->size() >= 2 && !generic_key(h->at(0), generic_fns).empty();
+        if (h->kind != Form::Sym || lookup_local(key(h)).v) return false;
+        if (Global *g = lookup_global(h)) return g->kind == Global::Func && !g->imported;
+        return !generic_key(h, generic_fns).empty();
+    }
+
     Val body(Form *f, size_t from, Type *want) {
         scopes.emplace_back();
         Val last{nullptr, t_void()};
@@ -1486,6 +1535,8 @@ struct Compiler::Impl : MetaHost {
             }
             ensure_open();
             last = expr(f->at(i), i + 1 == f->size() ? want : nullptr);
+            if (i + 1 < f->size() && last.t != t_void() && lisc_call(f->at(i)))
+                warn(f->at(i)->loc, "the result of %s is not used (write (discard ...) if that is meant)", show(f->at(i)->at(0)).c_str());
         }
         if (open()) run_defers(scopes.size() - 1);
         end_scope();
@@ -1805,7 +1856,8 @@ struct Compiler::Impl : MetaHost {
     bool is_type_form(Form *f) {
         f = expand(f);
         if (f->kind == Form::Sym) {
-            static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str"};
+            static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str",
+                                                "i128", "u128", "f80"};
             for (const char *n : names)
                 if (f->text == n) return true;
             if (tbind.count(f->text) && !lookup_local(key(f)).v) return true;
@@ -2233,7 +2285,7 @@ struct Compiler::Impl : MetaHost {
                 std::string gk = generic_key(head, generic_fns);
                 if (!gk.empty()) g = infer_fn(generic_fns[gk], f);
             }
-            if (!g) fatal(head->loc, "unknown function '%s'", head->text.c_str());
+            if (!g) fatal(head->loc, at_top_typeof ? "unknown function '%s' (type-of in a top-level macro knows C functions, not the program's: they are declared after)" : "unknown function '%s'", head->text.c_str());
         } else if (head->is_list() && head->size() >= 2 && head->at(0)->kind == Form::Sym && !lookup_local(key(head->at(0))).v) {
             std::string gk = generic_key(head->at(0), generic_fns);  // ((name T ...) args...)
             if (!gk.empty()) {
@@ -2274,8 +2326,19 @@ struct Compiler::Impl : MetaHost {
             else if (v.t->is_int() && v.t->bits < 32) v = cast(v, t_int(32, v.t->sign), a->loc);
             else if (v.t->kind == Type::Bool) v = cast(v, t_int(32, true), a->loc);
             else if (v.t == t_str()) fatal(a->loc, "cannot pass a str to a variadic function: for printf, \"%%.*s\" with (cast i32 s.len) and s.data, or a c\"...\" literal");
-            else if (v.t->kind == Type::Struct || v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
+            else if (v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
             var.push_back(v);
+        }
+        // A struct among the variadic arguments travels as it would as a fixed
+        // one (the x86-64 convention passes both the same way): the call is made
+        // with a type that lists every argument, still variadic (for %al).
+        bool has_struct = false;
+        for (auto &v : var) has_struct |= v.t->kind == Type::Struct;
+        if (has_struct) {
+            std::vector<Type *> ps = ft->params;
+            for (auto &v : var) ps.push_back(v.t);
+            fixed.insert(fixed.end(), var.begin(), var.end());
+            return emit_call(callee.v, t_fn(ft->elem, ps, true), fixed, {});
         }
         return emit_call(callee.v, ft, fixed, var);
     }
@@ -2628,25 +2691,43 @@ struct Compiler::Impl : MetaHost {
                 std::map<std::string, Form *> given;
                 for (size_t i = 2; i + 1 < f->size(); i += 2) given[f->at(i)->text.substr(1)] = f->at(i + 1);
                 if ((f->size() - 2) % 2) fatal(f->loc, "(make %s :field value ...)", type_name(t).c_str());
-                std::vector<const Field *> order;
-                for (auto &fd : t->st->fields) {
-                    if (fd.bit_width && given.count(fd.name)) fatal(f->loc, "bit fields in constant initializers are not supported");
-                    if (!fd.bit_width) order.push_back(&fd);
-                }
                 for (auto &g : given)
                     if (!t->st->find(g.first)) fatal(g.second->loc, "%s has no field '%s'", type_name(t).c_str(), g.first.c_str());
+                // bit fields live in the padding bytes between ordinary fields: their
+                // values are put together byte by byte (little endian)
+                std::vector<uint8_t> bits(t->st->size, 0);
+                std::vector<const Field *> order;
+                for (auto &fd : t->st->fields) {
+                    if (!fd.bit_width) {
+                        order.push_back(&fd);
+                        continue;
+                    }
+                    auto it = given.find(fd.name);
+                    if (it == given.end()) continue;
+                    auto *k = llvm::dyn_cast<llvm::ConstantInt>(constant(it->second, fd.type));
+                    if (!k) fatal(it->second->loc, "a bit field's initializer must be an integer constant");
+                    uint64_t v = k->getZExtValue();
+                    for (unsigned j = 0; j < fd.bit_width; j++)
+                        if (v >> j & 1) bits[(fd.bit_off + j) / 8] |= (uint8_t)(1u << ((fd.bit_off + j) % 8));
+                }
+                auto pad = [&](llvm::Type *ty, uint64_t from) -> llvm::Constant * {
+                    uint64_t n = llvm::cast<llvm::ArrayType>(ty)->getNumElements();
+                    for (uint64_t i = from; i < from + n; i++)
+                        if (bits[i]) return llvm::ConstantDataArray::get(ctx, llvm::ArrayRef<uint8_t>(&bits[from], n));
+                    return llvm::Constant::getNullValue(ty);
+                };
                 std::stable_sort(order.begin(), order.end(), [](const Field *a, const Field *x) { return a->offset < x->offset; });
                 auto *st = llvm::cast<llvm::StructType>(ll(t));
                 std::vector<llvm::Constant *> parts;
                 uint64_t cur = 0;
                 for (const Field *fd : order) {
                     if (fd->offset < cur) continue;
-                    if (fd->offset > cur) parts.push_back(llvm::Constant::getNullValue(st->getElementType(parts.size())));
+                    if (fd->offset > cur) parts.push_back(pad(st->getElementType(parts.size()), cur));
                     auto it = given.find(fd->name);
                     parts.push_back(it != given.end() ? constant(it->second, fd->type) : llvm::Constant::getNullValue(ll(fd->type)));
                     cur = fd->offset + size_of(fd->type);
                 }
-                if (parts.size() < st->getNumElements()) parts.push_back(llvm::Constant::getNullValue(st->getElementType(parts.size())));
+                if (parts.size() < st->getNumElements()) parts.push_back(pad(st->getElementType(parts.size()), cur));
                 return llvm::ConstantStruct::get(st, parts);
             }
         }

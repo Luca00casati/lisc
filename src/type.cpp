@@ -84,7 +84,8 @@ uint64_t size_of(const Type *t) {
     switch (t->kind) {
     case Type::Void: return 1;
     case Type::Bool: return 1;
-    case Type::Int: case Type::Float: return t->bits / 8;
+    case Type::Int: return t->bits / 8;
+    case Type::Float: return t->bits == 80 ? 16 : t->bits / 8;  // (C's long double: 10 bytes used, 16 with padding)
     case Type::Ptr: case Type::Fn: return 8;
     case Type::Array: return t->n * size_of(t->elem);
     case Type::Struct: return t->st->size;

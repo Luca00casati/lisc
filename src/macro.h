@@ -6,6 +6,7 @@
 //
 //   (defmacro name (a b &rest more) body...)   a macro: body computes a form
 //   (defmeta name (a b &rest more) body...)    a compile-time helper function
+//                                              (both belong to their module, like other names)
 //
 // Inside them:
 //   quote ' quasiquote ` unquote , unquote-splicing ,@
@@ -43,6 +44,9 @@ struct MetaHost {
     virtual ~MetaHost() = default;
     virtual Type *type_of(Form *expr) = 0;  // without emitting code
     virtual Type *parse_type(Form *t) = 0;
+    // the table key of a compile-time helper a symbol names ("" if none),
+    // resolved like other names: its module, modules in use, mod::name
+    virtual std::string meta_key(Form *sym) = 0;
 };
 
 class Meta {
@@ -52,6 +56,7 @@ public:
     // or defmeta form (compile-time helpers are global)
     void define(Form *def, const std::string &key);
     bool is_macro(const std::string &key) const { return macros_.count(key) != 0; }
+    bool is_meta(const std::string &key) const { return metas_.count(key) != 0; }
     // expand one macro call (its head names the macro `key`)
     Form *expand(Form *call, const std::string &key);
     // after an error broke off an expansion

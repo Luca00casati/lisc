@@ -28,3 +28,15 @@ double apply_v3(float (*f)(v3), v3 v);                                          
 big apply_big(big (*f)(big), big b);
 void bf_set(struct bf *p);
 long bf_sum(struct bf b);
+// variadic: a format letter per argument (v v3, d d2, m mix, l l2, b big, i int)
+double var_structs(const char *fmt, ...);
+// long double (f80) and __int128 (i128/u128)
+long double ld_mul(long double a, double b);
+__int128 i128_mul(long a, long b);
+unsigned __int128 u128_shift(unsigned __int128 x, int n);
+typedef struct { __int128 v; long tag; } wide;     // INTEGER, INTEGER, then memory (24 bytes)
+typedef struct { __int128 v; } w1;                 // INTEGER, INTEGER: two registers
+typedef struct { long double x; int n; } ldn;      // X87 inside: memory
+w1 w1_twice(w1 a);
+long double ldn_sum(ldn a, ldn b);
+long wide_low(wide w);

@@ -10,8 +10,10 @@
 //   object-like #defines             → typed constants, if clang can evaluate
 //                                      them (so DRM_IOCTL_MODE_GETCRTC works)
 //
-// Types lisc has no equivalent for (long double, __int128, vectors) are
-// skipped; a declaration that needs one is left out. Bit fields are kept.
+// long double is f80 and __int128 i128/u128. Types lisc has no equivalent for
+// (vectors, _Complex) are skipped: a declaration that needs one is left out,
+// as are functions returning a struct with a long double inside. Bit fields
+// are kept.
 //
 // An import is a list of declarations (Decl), made by libclang or read back
 // from the cache: ~/.cache/lisc (or $XDG_CACHE_HOME/lisc) keeps each C
@@ -94,6 +96,9 @@ struct Importer {
             return t_int(8 * clang_Type_getSizeOf(t), false);
         case CXType_Float: return t_float(32);
         case CXType_Double: return t_float(64);
+        case CXType_LongDouble: return clang_Type_getSizeOf(t) == 16 ? t_float(80) : nullptr;
+        case CXType_Int128: return t_int(128, true);
+        case CXType_UInt128: return t_int(128, false);
         case CXType_Pointer: {
             Type *e = conv(clang_getPointeeType(t));
             return t_ptr(e ? e : t_void());
@@ -110,7 +115,8 @@ struct Importer {
         case CXType_Record: return t_struct(record(clang_getTypeDeclaration(t)));
         case CXType_FunctionProto: case CXType_FunctionNoProto: {
             Type *ret = conv(clang_getResultType(t));
-            if (!ret) return nullptr;
+            // a struct with a long double inside comes back in x87 registers: not supported
+            if (!ret || (ret->kind == Type::Struct && has_f80(ret))) return nullptr;
             std::vector<Type *> ps;
             int n = clang_getNumArgTypes(t);
             for (int i = 0; i < n; i++) {
@@ -122,6 +128,15 @@ struct Importer {
         }
         default: return nullptr;
         }
+    }
+
+    static bool has_f80(Type *t) {
+        if (t->kind == Type::Float) return t->bits == 80;
+        if (t->kind == Type::Array) return has_f80(t->elem);
+        if (t->kind == Type::Struct)
+            for (auto &f : t->st->fields)
+                if (has_f80(f.type)) return true;
+        return false;
     }
 
     StructInfo *record(CXCursor decl) {

@@ -279,9 +279,8 @@ void Meta::define(Form *def, const std::string &key) {
         fatal(def->loc, "(%s name (params...) body...)", macro ? "defmacro" : "defmeta");
     auto *c = new Closure{def->at(1)->text, def->at(2), def, 3, nullptr};
     auto &table = macro ? macros_ : metas_;
-    const std::string &k = macro ? key : c->name;  // compile-time helpers are global
-    if (table.count(k)) fatal(def->loc, "'%s' is already defined", c->name.c_str());
-    table[k] = c;
+    if (table.count(key)) fatal(def->loc, "'%s' is already defined", c->name.c_str());
+    table[key] = c;
 }
 
 Form *Meta::expand(Form *call, const std::string &key) {
@@ -341,8 +340,8 @@ Form *Meta::apply(Form *fn, const std::vector<Form *> &args, Loc at) {
             std::vector<Form *> a = args;
             return b->second(a, at);
         }
-        auto m = metas_.find(fn->text);
-        if (m != metas_.end()) return call_closure(m->second, args, at);
+        std::string k = host_.meta_key(fn);
+        if (!k.empty()) return call_closure(metas_.at(k), args, at);
     }
     fatal(at, "%s is not a function", show(fn).c_str());
 }
@@ -383,7 +382,7 @@ Form *Meta::eval(Form *f, Env *env) {
         if (f->text == "true" || f->text == "false") return f;
         if (f->text == "nil") return mk_list(f->loc, {});
         if (Form **v = env->find(f->text)) return *v;
-        if (builtins_.count(f->text) || metas_.count(f->text)) return f;  // a function, by name
+        if (builtins_.count(f->text) || !host_.meta_key(f).empty()) return f;  // a function, by name
         fatal(f->loc, "unknown name '%s' in a macro", f->text.c_str());
     }
     case Form::List: break;

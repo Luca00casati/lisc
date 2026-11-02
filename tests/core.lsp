@@ -43,7 +43,7 @@
     (printf c"%d %d %u %u\n" (/ a 2) (% a 2) (/ b 2) (>> b 28))
     (printf c"%d %d\n" (>> a 1) (& (~ a) 0xff)))
   ; casts and bit reinterpretation
-  (printf c"%d %u 0x%08x\n" (cast i32 3.99) (cast u8 300) (bitcast u32 (cast f32 1.0)))
+  (printf c"%d %u 0x%08x\n" (cast i32 3.99) (truncate u8 300) (bitcast u32 (cast f32 1.0)))
   (printf c"%s %s %s\n" (classify -3) (classify 0) (classify 8))
   ; if as a value: an untyped branch takes the other's type
   (let ((k i32 3) (big (> k 2)))

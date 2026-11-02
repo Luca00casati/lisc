@@ -30,6 +30,12 @@ Errors in function bodies are all reported (up to 20), not just the first.
 Warnings: a variable that is never read (name it `_x` to say that is meant),
 and code after a `return`/`break`/`continue`; `-w` turns them off.
 
+`--checks` builds with run-time checks that stop the program with the source
+location: indexing arrays, slices and strs out of bounds, integer casts that
+lose the value (narrowing, or a negative into unsigned), float-to-integer
+casts out of range, division by zero. `(truncate T e)` keeps an integer's low
+bits on purpose and is never checked.
+
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a
 macro produced belongs to the line of the macro call. Extra `.c`/`.o` inputs
@@ -75,7 +81,7 @@ Expressions — everything is one; statements have type `void`:
     (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
       — each with an optional :relaxed :acquire :release :acq-rel :seq-cst (default)
     (. x field ...) — also written x.field.sub; pointers are followed automatically
-    (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)  (sizeof T)  (alignof T)
+    (aref a i)  (deref p)  (addr place)  (cast T e)  (truncate T e)  (bitcast T e)  (sizeof T)  (alignof T)
     (make T :field e ...)  (make (array T N) e ...)  — the rest is zero
     "text" is a str;  c"text" is a C string;  #\a #\é #\newline — a character's code point;  true false
     null — the zero value of the wanted type;  undefined — no value at all

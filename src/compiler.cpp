@@ -16,7 +16,7 @@
 //   (+ - * / % & | ^ << >>)  (- x)  (~ x)  (= != < <= > >=)  (and ...) (or ...) (not x)
 //   (+= place e) ... (>>= place e): the place's address computed once
 //   (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
-//   (. x field ...)  (aref a i)  (deref p)  (addr place)  (cast T e)  (bitcast T e)
+//   (. x field ...)  (aref a i)  (deref p)  (addr place)  (cast T e)  (truncate T e)  (bitcast T e)
 //   (sizeof T)  (alignof T)  (make T [:field e ...] | [e ...])
 //
 // Everything starts as zero: let bindings without a value, globals, the
@@ -216,6 +216,27 @@ struct Compiler::Impl : MetaHost {
         }
         }
         return ditypes[t] = d;
+    }
+
+    /* ---------------------------------------------------- run-time checks --- */
+    // lisc --checks: unless `ok`, print "file:line:col: what" (printf-style, with
+    // `args`) to stderr and abort
+    void check(llvm::Value *ok, Loc at, const std::string &what, std::vector<llvm::Value *> args = {}) {
+        if (!c.checks || !fn) return;
+        BasicBlock *fail = BasicBlock::Create(ctx, "check.fail", fn), *cont = BasicBlock::Create(ctx, "check.ok", fn);
+        b.CreateCondBr(ok, cont, fail);
+        b.SetInsertPoint(fail);
+        Loc u = user_loc(at);
+        std::string file;
+        for (const char *p = u.file; *p; p++) file += *p == '%' ? std::string("%%") : std::string(1, *p);
+        std::string msg = file + ":" + std::to_string(u.line) + ":" + std::to_string(u.col) + ": " + what + "\n";
+        auto *dp = llvm::FunctionType::get(b.getInt32Ty(), {b.getInt32Ty(), b.getPtrTy()}, true);
+        std::vector<llvm::Value *> as = {b.getInt32(2), b.CreateGlobalStringPtr(msg, "check", 0, &mod)};
+        as.insert(as.end(), args.begin(), args.end());
+        b.CreateCall(mod.getOrInsertFunction("dprintf", dp), as);
+        b.CreateCall(mod.getOrInsertFunction("abort", llvm::FunctionType::get(b.getVoidTy(), false)));
+        b.CreateUnreachable();
+        b.SetInsertPoint(cont);
     }
 
     // where generated code is: the outermost macro call, for code macros made
@@ -966,20 +987,27 @@ struct Compiler::Impl : MetaHost {
         if (f->is_call("aref")) {
             if (f->size() != 3) fatal(f->loc, "(aref a i)");
             Val base;
+            llvm::Value *len = nullptr;  // the length, where there is one (for --checks)
             if (is_place(f->at(1))) {
                 base = place(f->at(1));
-                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of))
+                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of)) {
+                    if (c.checks) len = load(field_addr(base, mk_sym(f->loc, "len")));
                     base = field_addr(base, mk_sym(f->loc, "data"));  // a str's bytes, a slice's elements
+                }
                 if (base.t->kind == Type::Ptr) base = {load(base), base.t};
             } else {
                 base = expr(f->at(1), nullptr);
-                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of))
+                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of)) {
+                    if (c.checks) len = b.CreateExtractValue(base.v, 1);
                     base = {b.CreateExtractValue(base.v, 0), base.t->st->fields[0].type};
+                }
                 if (base.t->kind == Type::Array) base = spill(base);
             }
             Val i = expr(f->at(2), t_int(64, true));
             if (!i.t->is_int()) fatal(f->at(2)->loc, "index must be an integer, got %s", type_name(i.t).c_str());
             llvm::Value *idx = b.CreateIntCast(i.v, b.getInt64Ty(), i.t->sign);
+            if (base.t->kind == Type::Array) len = b.getInt64(base.t->n);
+            if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len});
             if (base.t->kind == Type::Array) {
                 llvm::Value *p = b.CreateInBoundsGEP(ll(base.t), base.v, {b.getInt64(0), idx});
                 return {p, base.t->elem};
@@ -1181,6 +1209,13 @@ struct Compiler::Impl : MetaHost {
             Val a = place(f->at(1));
             if (a.bwidth) fatal(f->at(1)->loc, "cannot take the address of a bit field");
             return {a.v, t_ptr(a.t)};
+        }
+        if (hs == "truncate") {  // (truncate T e): the low bits of an integer, on purpose (never checked)
+            if (f->size() != 3) fatal(f->loc, "(truncate T e)");
+            Type *to = parse_type(f->at(1));
+            Val v = expr(f->at(2), nullptr);
+            if (!v.t->is_int() || !to->is_int()) fatal(f->loc, "truncate is for integers: %s to %s", type_name(v.t).c_str(), type_name(to).c_str());
+            return {b.CreateIntCast(v.v, ll(to), v.t->sign), to};
         }
         if (hs == "cast" || hs == "bitcast") {
             if (f->size() != 3) fatal(f->loc, "(%s T e)", h);
@@ -1465,6 +1500,13 @@ struct Compiler::Impl : MetaHost {
         if (op == "+") return {b.CreateAdd(a.v, x.v), t};
         if (op == "-") return {b.CreateSub(a.v, x.v), t};
         if (op == "*") return {b.CreateMul(a.v, x.v), t};
+        if ((op == "/" || op == "%") && c.checks) {
+            check(b.CreateICmpNE(x.v, llvm::ConstantInt::get(ll(t), 0)), at, "division by zero");
+            if (t->sign)
+                check(b.CreateNot(b.CreateAnd(b.CreateICmpEQ(a.v, llvm::ConstantInt::get(ll(t), llvm::APInt::getSignedMinValue(t->bits))),
+                                              b.CreateICmpEQ(x.v, llvm::ConstantInt::getSigned(ll(t), -1)))),
+                      at, "integer overflow in division");
+        }
         if (op == "/") return {t->sign ? b.CreateSDiv(a.v, x.v) : b.CreateUDiv(a.v, x.v), t};
         if (op == "%") return {t->sign ? b.CreateSRem(a.v, x.v) : b.CreateURem(a.v, x.v), t};
         if (op == "&") return {b.CreateAnd(a.v, x.v), t};
@@ -1911,11 +1953,31 @@ struct Compiler::Impl : MetaHost {
         Type *from = v.t;
         if (from == to) return v;
         llvm::Type *lt = ll(to);
-        if (from->is_int() && to->is_int()) return {b.CreateIntCast(v.v, lt, from->sign), to};
+        if (from->is_int() && to->is_int()) {
+            llvm::Value *r = b.CreateIntCast(v.v, lt, from->sign);
+            if (c.checks && fn && (to->bits < from->bits || from->sign != to->sign)) {  // could lose the value
+                llvm::Value *ok = b.CreateICmpEQ(b.CreateIntCast(r, ll(from), to->sign), v.v);
+                if (from->sign && !to->sign) ok = b.CreateAnd(ok, b.CreateICmpSGE(v.v, llvm::ConstantInt::get(ll(from), 0)));
+                if (!from->sign && to->sign) ok = b.CreateAnd(ok, b.CreateICmpSGE(r, llvm::ConstantInt::get(lt, 0)));
+                check(ok, at, std::string(from->sign ? "%ld" : "%lu") + " does not fit in " + type_name(to),
+                      {b.CreateIntCast(v.v, b.getInt64Ty(), from->sign)});
+            }
+            return {r, to};
+        }
         if (from->kind == Type::Bool && to->is_int()) return {b.CreateZExt(v.v, lt), to};
         if (from->is_int() && to->kind == Type::Bool) return {b.CreateICmpNE(v.v, llvm::ConstantInt::get(ll(from), 0)), to};
         if (from->is_int() && to->is_float()) return {from->sign ? b.CreateSIToFP(v.v, lt) : b.CreateUIToFP(v.v, lt), to};
-        if (from->is_float() && to->is_int()) return {to->sign ? b.CreateFPToSI(v.v, lt) : b.CreateFPToUI(v.v, lt), to};
+        if (from->is_float() && to->is_int()) {
+            if (c.checks && fn) {  // in range (and not NaN): the ordered compares fail on NaN
+                llvm::Type *ft = ll(from);
+                double hi = std::ldexp(1.0, to->sign ? to->bits - 1 : to->bits);
+                llvm::Value *ok = b.CreateAnd(to->sign ? b.CreateFCmpOGE(v.v, llvm::ConstantFP::get(ft, -hi))
+                                                       : b.CreateFCmpOGT(v.v, llvm::ConstantFP::get(ft, -1.0)),
+                                              b.CreateFCmpOLT(v.v, llvm::ConstantFP::get(ft, hi)));
+                check(ok, at, "%g does not fit in " + type_name(to), {b.CreateFPExt(v.v, b.getDoubleTy())});
+            }
+            return {to->sign ? b.CreateFPToSI(v.v, lt) : b.CreateFPToUI(v.v, lt), to};
+        }
         if (from->is_float() && to->is_float()) return {b.CreateFPCast(v.v, lt), to};
         if (from->is_ptr() && to->is_ptr()) return {v.v, to};
         if (from->is_ptr() && to->is_int()) return {b.CreatePtrToInt(v.v, lt), to};

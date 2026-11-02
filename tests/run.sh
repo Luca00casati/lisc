@@ -24,6 +24,17 @@ for src in errors/*.lsp; do
     *) fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$got'" ;;
     esac
 done
+# Each tests/checks/NAME.lsp, built with --checks, must stop with the message in
+# its first line ("; abort: ...").
+for src in checks/*.lsp; do
+    [ -e "$src" ] || continue
+    want=$(head -1 "$src" | sed 's/^; abort: //')
+    if ../lisc "$src" --checks -o out/check 2>out/check.err && ! ./out/check 2>out/check.txt >/dev/null && grep -qF -- "$want" out/check.txt; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$(cat out/check.err out/check.txt)'"
+    fi
+done
 # Each tests/warnings/NAME.lsp must compile with the warning in its first line.
 for src in warnings/*.lsp; do
     [ -e "$src" ] || continue

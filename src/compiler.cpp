@@ -1107,7 +1107,9 @@ struct Compiler::Impl : MetaHost {
     }
 
     // operands of f from `from` on, all of one type
-    std::vector<Val> operands(Form *f, size_t from, Type *want) {
+    // (compare: the operands of a comparison, which all take the first's type;
+    // arithmetic on a pointer takes integer offsets instead)
+    std::vector<Val> operands(Form *f, size_t from, Type *want, bool compare = false) {
         size_t k;
         Type *t = operand_type(f, from, want, &k);
         std::vector<Val> vs(f->size());
@@ -1117,7 +1119,7 @@ struct Compiler::Impl : MetaHost {
         }
         for (size_t i = from; i < f->size(); i++) {
             if (vs[i].v) continue;
-            Type *ti = t->is_ptr() ? t_int(64, true) : t;  // pointer arithmetic: integer offsets
+            Type *ti = t->is_ptr() && !compare ? t_int(64, true) : t;  // pointer arithmetic: integer offsets
             vs[i] = expr(f->at(i), ti);
             if (t->is_ptr() || vs[i].t == t) continue;
             if (widens(vs[i].t, t)) vs[i] = cast(vs[i], t, f->at(i)->loc);
@@ -1286,7 +1288,7 @@ struct Compiler::Impl : MetaHost {
             if (!xs[0].v.v && !xs[1].v.v) xs[0].v = expr(xs[0].f, default_type(mk_list(f->loc, {mk_sym(f->loc, "+"), xs[0].f, xs[1].f})));
             return builtin_pair(op, xs[0], xs[1], f->loc, true).v;
         }
-        std::vector<Val> vs = operands(f, 1, nullptr);
+        std::vector<Val> vs = operands(f, 1, nullptr, true);
         return compare_vals(op, vs[0], vs[1], f->at(2)->loc);
     }
 

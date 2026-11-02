@@ -1,3 +1,4 @@
 zero: 0 0 0 0 (nil) 0 0
 null: 0 0  0 0 0
+compare with null: 1 0
 undefined, then filled: 63

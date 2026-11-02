@@ -13,6 +13,8 @@
     (let ((k i32 9) (f f32 2.0) (ok true))
       (set k null) (set f null) (set ok null)
       (printf "null: %g %d  %d %g %d\n" (cast f64 v.x) v.n k (cast f64 f) (cast i32 ok))))
+  (let ((q (ptr p3) null))
+    (printf "compare with null: %d %d\n" (cast i32 (= q null)) (cast i32 (!= null q))))
   (let ((buf (array u8 64) undefined) (n u32 undefined))
     (memset buf 65 63)                          ; fills it before any use
     (set (aref buf 63) 0)

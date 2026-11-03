@@ -68,11 +68,27 @@ modification time). A build with a warm cache does no header parsing.
 `--time` reports how long each phase took (front end, compiling the parts,
 link) and how many parts came from the cache; `-O0` builds fastest.
 
-`--checks` builds with run-time checks that stop the program with the source
-location: indexing arrays, slices and strs out of bounds, integer casts that
-lose the value (narrowing, or a negative into unsigned), float-to-integer
-casts out of range, division by zero. `(truncate T e)` keeps an integer's low
-bits on purpose and is never checked.
+Every build checks, at run time, indexing and integer division, and stops the
+program with the source location (`file:line:col: index 5 out of bounds
+(length 5)`):
+
+- an index into an array, a simd, or anything with `data` and `len` fields (a
+  str, a slice, a `(vec T)`: `v[i]`); a constant index past an array's end is
+  a compile-time error. A raw pointer's `p[i]` has no length and isn't checked:
+  prefer slices.
+- `(slice-of a from to)`: `from <= to <= length`
+- integer `/` and `%`: by zero, and the minimum divided by -1
+
+Most checks in loops cost nothing after optimisation (LLVM proves them); the
+teapot's CPU side runs at the same speed with them. To leave them out:
+`(unchecked body...)` for a block, `:unchecked` after a function's result type
+for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
+`--no-checks` for the whole build.
+
+`--checks` adds checks for number conversions: integer casts that lose the
+value (narrowing, or a negative into unsigned) and float-to-integer casts out
+of range. `(truncate T e)` keeps an integer's low bits on purpose and is never
+checked.
 
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a
@@ -101,7 +117,7 @@ Top level:
 | `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
-| `(defn name [a T] ... R [:noinline\|:inline\|:cold\|:optnone] body...)` | function (`[]`: no parameters); the last expression is the result |
+| `(defn name [a T] ... R [:noinline\|:inline\|:cold\|:optnone\|:unchecked] body...)` | function (`[]`: no parameters); the last expression is the result |
 | `(extern name (T ... [...]) R)` | a C function by hand |
 | `(defop op [a T] ... R body...)` | an operator for these operand types |
 | `(defmacro name! (params...) body...)` | a macro (see below); its name ends in `!` |
@@ -119,6 +135,7 @@ Expressions — everything is one; statements have type `void`:
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
     (fn [a T] ... R body...) — a function written where it is used; with captures a closure (see below)
     (fn :heap [a T] ... R body...) — a heap-fn, kept until (drop f)
+    (unchecked body...) — no bounds or division checks in it
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first

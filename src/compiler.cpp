@@ -228,8 +228,14 @@ struct Compiler::Impl : MetaHost {
     /* ---------------------------------------------------- run-time checks --- */
     // lisc --checks: unless `ok`, print "file:line:col: what" (printf-style, with
     // `args`) to stderr and abort
-    void check(llvm::Value *ok, Loc at, const std::string &what, std::vector<llvm::Value *> args = {}) {
-        if (!c.checks || !fn) return;
+    // Bounds and division checks (`safe`) are on unless --no-checks or inside
+    // (unchecked ...) / a :unchecked function; conversion checks need --checks.
+    int unchecked = 0;
+    bool checking(bool safe) const { return fn && !unchecked && (safe ? c.safety || c.checks : c.checks); }
+    void check(llvm::Value *ok, Loc at, const std::string &what, std::vector<llvm::Value *> args = {}, bool safe = false) {
+        if (!checking(safe)) return;
+        if (auto *k = llvm::dyn_cast<llvm::ConstantInt>(ok))
+            if (k->isOne()) return;  // (known to hold)
         BasicBlock *fail = BasicBlock::Create(ctx, "check.fail", fn), *cont = BasicBlock::Create(ctx, "check.ok", fn);
         b.CreateCondBr(ok, cont, fail);
         b.SetInsertPoint(fail);
@@ -244,6 +250,13 @@ struct Compiler::Impl : MetaHost {
         b.CreateCall(mod.getOrInsertFunction("abort", llvm::FunctionType::get(b.getVoidTy(), false)));
         b.CreateUnreachable();
         b.SetInsertPoint(cont);
+    }
+
+    // indexable through its fields: data, a pointer, and len, an integer
+    static bool has_data_len(const Type *t) {
+        if (t->kind != Type::Struct || !t->st->complete) return false;
+        const Field *d = t->st->find("data"), *l = t->st->find("len");
+        return d && l && d->type->is_ptr() && d->type->elem != t_void() && l->type->is_int() && !l->bit_width;
     }
 
     // where generated code is: the outermost macro call, for code macros made
@@ -1311,6 +1324,7 @@ struct Compiler::Impl : MetaHost {
         std::map<std::string, Type *> bind;
         Loc at;  // where it was first used
         std::set<std::string> outer;  // a fn: the locals around it (which it can't use)
+        bool unchecked = false;       // a fn written inside (unchecked ...)
     };
     const std::set<std::string> *lambda_outer = nullptr;  // while compiling a fn's body
     int lambda_count = 0;
@@ -1378,7 +1392,7 @@ struct Compiler::Impl : MetaHost {
         snprintf(at, sizeof at, "(fn at %d:%d)", f->loc.line, f->loc.col);
         if (caps.empty() && !heap) {
             declare_fn(def, k);
-            pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer});
+            pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer, unchecked > 0});
             lambdas_made[{f, fn}] = {k, {}, nullptr, false};
             Global &g = c.globals_[k];
             return {g.value, t_ptr(g.type)};
@@ -1423,7 +1437,7 @@ struct Compiler::Impl : MetaHost {
         Form *def2 = new Form(*def);
         def2->items = items2;
         declare_fn(def2, k);
-        pending_fns.push_back({def2, k, at, cur, tbind, f->loc, outer});
+        pending_fns.push_back({def2, k, at, cur, tbind, f->loc, outer, unchecked > 0});
         lambdas_made[{f, fn}] = {k, vals, env_t, heap};
         if (heap) return make_heap_fn(c.globals_[k], env_t, vals, f->loc);
         return make_closure(c.globals_[k], env_t, vals, f->loc);
@@ -1998,32 +2012,36 @@ struct Compiler::Impl : MetaHost {
         }
         if (f->is_call("aref")) {
             if (f->size() != 3) fatal(f->loc, "(aref a i)");
-            Val base;
-            llvm::Value *len = nullptr;  // the length, where there is one (for --checks)
-            if (is_place(f->at(1))) {
-                base = place(f->at(1));
-                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of)) {
-                    if (c.checks) len = load(field_addr(base, mk_sym(f->loc, "len")));
-                    base = field_addr(base, mk_sym(f->loc, "data"));  // a str's bytes, a slice's elements
-                }
-                if (base.t->kind == Type::Ptr) base = {load(base), base.t};
-            } else {
-                base = expr(f->at(1), nullptr);
-                if (base.t == t_str() || (base.t->kind == Type::Struct && base.t->st->slice_of)) {
-                    if (c.checks) len = b.CreateExtractValue(base.v, 1);
-                    base = {b.CreateExtractValue(base.v, 0), base.t->st->fields[0].type};
-                }
-                if (base.t->kind == Type::Array || base.t->is_simd()) base = spill(base);
+            // a struct with data (a pointer) and len (an integer): a str, a slice, a (vec T) ...
+            Val base = is_place(f->at(1)) ? place(f->at(1)) : expr(f->at(1), nullptr);
+            bool in_memory = is_place(f->at(1));
+            if (!in_memory && (base.t->kind == Type::Struct || base.t->kind == Type::Array || base.t->is_simd())) {
+                base = spill(base);
+                in_memory = true;
             }
+            llvm::Value *len = nullptr;  // the length, where there is one (to check against)
+            if (in_memory && has_data_len(base.t)) {
+                if (checking(true)) {
+                    Val l = field_addr(base, mk_sym(f->loc, "len"));
+                    len = b.CreateIntCast(load(l), b.getInt64Ty(), l.t->sign);
+                }
+                base = field_addr(base, mk_sym(f->loc, "data"));
+            }
+            if (in_memory && base.t->kind == Type::Ptr) base = {load(base), base.t};
             Val i = expr(f->at(2), t_int(64, true));
             if (!i.t->is_int()) fatal(f->at(2)->loc, "index must be an integer, got %s", type_name(i.t).c_str());
             llvm::Value *idx = b.CreateIntCast(i.v, b.getInt64Ty(), i.t->sign);
-            if (base.t->kind == Type::Array || base.t->is_simd()) len = b.getInt64(base.t->n);
+            if ((base.t->kind == Type::Array || base.t->is_simd()) && base.t->n > 0) {  // ([0]: a C flexible array member)
+                if (auto *k = llvm::dyn_cast<llvm::ConstantInt>(idx))
+                    if (k->getValue().uge(base.t->n))
+                        fatal(f->at(2)->loc, "index %lld out of bounds (length %llu)", (long long)k->getSExtValue(), (unsigned long long)base.t->n);
+                len = b.getInt64(base.t->n);
+            }
+            if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len}, true);
             if (base.t->is_simd()) {  // an element of the vector in memory
                 uint64_t es = size_of(base.t->elem);
                 return {b.CreateInBoundsGEP(ll(base.t->elem), base.v, idx), base.t->elem, es};
             }
-            if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len});
             if (base.t->kind == Type::Array) {
                 llvm::Value *p = b.CreateInBoundsGEP(ll(base.t), base.v, {b.getInt64(0), idx});
                 return {p, base.t->elem};
@@ -2323,6 +2341,12 @@ struct Compiler::Impl : MetaHost {
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
         if (hs == "%captures") return alias(f, want, false);
+        if (hs == "unchecked") {  // (unchecked body...): no bounds or division checks in it
+            unchecked++;
+            Val r = body(f, 1, want);
+            unchecked--;
+            return r;
+        }
         if (hs == "fn" && f->size() >= 2 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return lambda(f, want);
         if (hs == "drop" && !lookup_global(f->at(0))) return drop(f);
         if (hs == "match") return match_(f, want);
@@ -2815,12 +2839,12 @@ struct Compiler::Impl : MetaHost {
         if (op == "+") return {b.CreateAdd(a.v, x.v), t};
         if (op == "-") return {b.CreateSub(a.v, x.v), t};
         if (op == "*") return {b.CreateMul(a.v, x.v), t};
-        if ((op == "/" || op == "%") && c.checks) {
-            check(b.CreateICmpNE(x.v, llvm::ConstantInt::get(ll(t), 0)), at, "division by zero");
+        if (op == "/" || op == "%") {
+            check(b.CreateICmpNE(x.v, llvm::ConstantInt::get(ll(t), 0)), at, "division by zero", {}, true);
             if (t->sign)
                 check(b.CreateNot(b.CreateAnd(b.CreateICmpEQ(a.v, llvm::ConstantInt::get(ll(t), llvm::APInt::getSignedMinValue(t->bits))),
                                               b.CreateICmpEQ(x.v, llvm::ConstantInt::getSigned(ll(t), -1)))),
-                      at, "integer overflow in division");
+                      at, "integer overflow in division", {}, true);
         }
         if (op == "/") return {t->sign ? b.CreateSDiv(a.v, x.v) : b.CreateUDiv(a.v, x.v), t};
         if (op == "%") return {t->sign ? b.CreateSRem(a.v, x.v) : b.CreateURem(a.v, x.v), t};
@@ -3124,6 +3148,8 @@ struct Compiler::Impl : MetaHost {
         Type *u64 = t_int(64, false);
         llvm::Value *from = f->size() >= 3 ? coerce(expr(f->at(2), u64), u64, f->at(2)->loc, "from").v : b.getInt64(0);
         llvm::Value *to = f->size() == 4 ? coerce(expr(f->at(3), u64), u64, f->at(3)->loc, "to").v : len.v;
+        check(b.CreateAnd(b.CreateICmpULE(from, to), b.CreateICmpULE(to, len.v)), f->loc, "slice %lu..%lu out of bounds (length %lu)",
+              {from, to, len.v}, true);
         Type *elem = data.t->elem;
         llvm::Value *p = b.CreateGEP(ll(elem), data.v, from);
         llvm::Value *v = llvm::UndefValue::get(ll(st));
@@ -3773,6 +3799,7 @@ struct Compiler::Impl : MetaHost {
                 }
             }
             error_trap = nullptr;
+            unchecked = 0;
         };
         each(all, [&](Form *f) {
             if (!f->is_call("defn") || (f->size() >= 2 && f->at(1)->is_list())) return;
@@ -3784,7 +3811,10 @@ struct Compiler::Impl : MetaHost {
             cur = p.mod;
             tbind = p.bind;
             lambda_outer = &p.outer;
-            guarded([&] { define_fn(p.def, p.key, p.shown); }, &p);
+            guarded([&] {
+                unchecked = p.unchecked;
+                define_fn(p.def, p.key, p.shown);
+            }, &p);
             lambda_outer = nullptr;
             tbind.clear();
             cur = nullptr;
@@ -3989,7 +4019,7 @@ struct Compiler::Impl : MetaHost {
             else if (o->is_sym(":optnone")) {  // compiled as at -O0 (and never inlined)
                 fn0->addFnAttr(llvm::Attribute::OptimizeNone);
                 fn0->addFnAttr(llvm::Attribute::NoInline);
-            } else fatal(o->loc, "function options are :noinline :inline :cold :optnone");
+            } else if (!o->is_sym(":unchecked")) fatal(o->loc, "function options are :noinline :inline :cold :optnone :unchecked");
         }
         if (!ikey.empty()) c.globals_[ikey] = Global{Global::Func, ft, fn0, nullptr, f};
         else define(f->at(1), Global{Global::Func, ft, fn0, nullptr, f});
@@ -3997,6 +4027,7 @@ struct Compiler::Impl : MetaHost {
 
     // after an error in a function body: drop what was built, reset the state
     void abandon_fn() {
+        unchecked = 0;
         if (fn) fn->deleteBody();
         tbind.clear();
         temp_pool.clear();
@@ -4015,6 +4046,8 @@ struct Compiler::Impl : MetaHost {
         const std::string fname = shown.empty() ? f->at(1)->text : shown;
         fn = llvm::cast<llvm::Function>(g.value);
         fn_ret = g.type->elem;
+        for (size_t i = 4; i < body_start(f); i++)
+            if (f->at(i)->is_sym(":unchecked")) unchecked = 1;  // (reset when the function is done)
         cur_ft = g.type;
         type_memo.clear();
         temp_pool.clear();

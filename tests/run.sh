@@ -38,8 +38,25 @@ for src in errors/*.lsp; do
     fi
     if [ $ok = 1 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$got'"; fi
 done
-# Each tests/checks/NAME.lsp, built with --checks, must stop with the message in
-# its first line ("; abort: ...").
+# Each tests/safety/NAME.lsp, built as it is (bounds and division are checked
+# by default), must stop with the message in its first line ("; abort: ...").
+for src in safety/*.lsp; do
+    want=$(head -1 "$src" | sed 's/^; abort: //')
+    if ../lisc "$src" -o out/check 2>out/check.err && ! ./out/check 2>out/check.txt >/dev/null && grep -qF -- "$want" out/check.txt; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$(cat out/check.err out/check.txt)'"
+    fi
+done
+# --no-checks, (unchecked ...) and :unchecked leave the checks out
+nochecks() {
+    if ../lisc -O0 -w --emit-llvm "$@" -o out/nc.ll && ! grep -q '^check.fail' out/nc.ll; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL checks left in: $*"; fi
+}
+nochecks --no-checks safety/vec-index.lsp
+nochecks --no-checks safety/div-overflow.lsp
+nochecks unchecked.lsp
+# Each tests/checks/NAME.lsp, built with --checks (number conversions checked
+# too), must stop with the message in its first line ("; abort: ...").
 for src in checks/*.lsp; do
     [ -e "$src" ] || continue
     want=$(head -1 "$src" | sed 's/^; abort: //')

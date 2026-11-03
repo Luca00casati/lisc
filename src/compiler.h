@@ -32,7 +32,8 @@ public:
     // compile a whole program; stops with an error message on the first problem
     void compile(const std::vector<Form *> &forms);
     bool debug = false;   // -g: DWARF debug info
-    bool checks = false;  // --checks: bounds, casts and division checked at run time
+    bool safety = true;   // bounds and integer division checked at run time (off: --no-checks)
+    bool checks = false;  // --checks: number conversions too
     llvm::Module &module() { return *mod_; }
 
     // where import and import-c look (after the importing file's directory;

@@ -8,7 +8,8 @@
 (defn len [a v2] f32 (sqrtf (+ (* a.x a.x) (* a.y a.y))))
 (const UNIT 1.0)
 
-(defn- scale-by [a v2] [k f32] v2 {v2 :x (* a.x k) :y (* a.y k)})   ; private
+(private
+  (defn scale-by [a v2] [k f32] v2 {v2 :x (* a.x k) :y (* a.y k)}))   ; private
 (private
   (def calls i32 0))
 
@@ -18,4 +19,5 @@
 (defn call-count [] i32 calls)
 
 ; a private generic (tests/errors/generic-private.lsp)
-(defn- (hidden T) [x T] T x)
+(private
+  (defn (hidden T) [x T] T x))

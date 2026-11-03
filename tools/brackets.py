@@ -143,7 +143,7 @@ def convert(src):
             return conv(node.items[1]) + '[' + conv(node.items[2]) + ']'
         if h == 'make' and k >= 2:
             return render(node, {0: ''}, '{', '}').replace('{ ', '{', 1)
-        if h in ('defn', 'defn-', 'defop') and k >= 4 and node.items[2].kind == '(' and \
+        if h in ('defn', 'defop') and k >= 4 and node.items[2].kind == '(' and \
                 all(x.kind == '(' for x in node.items[2].items):
             return render(node, {2: splice(node.items[2])})
         if h == 'let' and k >= 2 and node.items[1].kind == '(' and \

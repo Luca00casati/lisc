@@ -529,12 +529,10 @@ struct Compiler::Impl : MetaHost {
             } else {
                 static const char *const dash[] = {"defn-", "def-", "const-", "defmacro-", "defmeta-", "struct-", "union-"};
                 for (const char *d : dash)
-                    if (f->is_call(d)) {  // (defn- name ...) = (private (defn name ...))
-                        std::vector<Form *> it = f->items;
+                    if (f->is_call(d)) {
                         std::string h = d;
-                        it[0] = mk_sym(f->at(0)->loc, h.substr(0, h.size() - 1));
-                        f = mk_list(f->loc, it);
-                        mark_private(f);
+                        h.pop_back();
+                        fatal(f->at(0)->loc, "%s is gone: private definitions go in (private (%s ...) ...)", d, h.c_str());
                     }
                 if (f->is_call("variant")) {
                     for (Form *x : desugar_variant(f, m)) items.push_back({x, m});

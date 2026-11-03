@@ -33,9 +33,9 @@ struct Open {
 };
 
 const std::set<std::string> body_forms = {
-    "defn", "defn-", "defop", "defmacro", "defmacro-", "defmeta", "defmeta-", "fn", "let", "when", "unless", "while", "for",
-    "match", "case", "defer", "if-defined", "def", "def-", "const", "const-", "struct", "struct-", "union", "union-", "variant", "enum", "private", "%alias", "lambda"};
-const std::set<std::string> binding_forms = {"defn", "defn-", "defop", "fn", "let", "%alias"};
+    "defn", "defop", "defmacro", "defmeta", "fn", "let", "when", "unless", "while", "for",
+    "match", "case", "defer", "if-defined", "def", "const", "struct", "union", "variant", "enum", "private", "%alias", "lambda"};
+const std::set<std::string> binding_forms = {"defn", "defop", "fn", "let", "%alias"};
 
 bool delim(int c) { return c == 0 || strchr(" \t\r\n()[]{}\";'`,", c) != nullptr; }
 

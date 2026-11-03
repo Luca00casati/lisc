@@ -2,9 +2,10 @@
 ; globals, strings, structs and calls across the two must all line up
 (struct pair [a i64] [b i64] [c (array f32 3)])
 (def total i64 0)
-(def- hidden i32 7)
-(defn- add [p pair] pair {pair :a (+ p.a 1) :b (* p.b 2) :c p.c})   ; optimised, called from both
-(defn- record [x i64] void (+= total x))
+(private
+  (def hidden i32 7)
+  (defn add [p pair] pair {pair :a (+ p.a 1) :b (* p.b 2) :c p.c})   ; optimised, called from both
+  (defn record [x i64] void (+= total x)))
 
 (defn build [n i32] pair :optnone
   (let [p {pair :a 1 :b 1 :c {(array f32 3) 0.5 1.5 2.5}}] [q pair]

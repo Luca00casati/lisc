@@ -326,11 +326,11 @@ void check_bindings(const Form *f) {
     if (!f->is_list() || f->is_call("quote")) return;
     if (f->is_call("let") && f->size() >= 2 && old_binding(f->at(1)))
         old_spelling(f->at(1), "(let [x 1] [y T 2] body...)");
-    if ((f->is_call("defn") || f->is_call("defn-") || f->is_call("defop")) && f->size() >= 3 && old_binding(f->at(2)))
+    if ((f->is_call("defn") || f->is_call("defop")) && f->size() >= 3 && old_binding(f->at(2)))
         old_spelling(f->at(2), f->at(2)->items.empty() ? "[] for no parameters" : "(defn f [a T] [b U] R body...)");
     if (f->is_call("for") && f->size() >= 2 && old_binding(f->at(1)))
         old_spelling(f->at(1), "(for [i 0 n] body...), (for [x :in xs] body...)");
-    if (f->is_call("struct") || f->is_call("struct-") || f->is_call("union") || f->is_call("union-"))
+    if (f->is_call("struct") || f->is_call("union"))
         for (size_t i = 2; i < f->size(); i++)
             if (old_binding(f->at(i))) old_spelling(f->at(i), "(struct name [field T] ...)");
     if (f->is_call("variant"))

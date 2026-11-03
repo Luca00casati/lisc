@@ -106,7 +106,7 @@ Top level:
 | `(defop op [a T] ... R body...)` | an operator for these operand types |
 | `(defmacro name! (params...) body...)` | a macro (see below); its name ends in `!` |
 | `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
-| `(defn- ...)` `(def- ...)` `(const- ...)` `(struct- ...)` `(defmacro- ...)` `(private form ...)` | names only their module can use |
+| `(private form ...)` | definitions (any kind) only their module can use |
 
 Expressions — everything is one; statements have type `void`:
 
@@ -412,8 +412,16 @@ relative to the importing file, `.lsp` optional) makes its names reachable as
 
 A name resolves to the module's own definition first, then to the modules in
 use (the innermost block's, then the file's; a name two of them define must
-be written qualified), then to `-D` constants. Definitions marked
-private (`defn-`, `(private ...)` ...) are unreachable from other modules.
+be written qualified), then to `-D` constants. Definitions inside
+`(private ...)` are unreachable from other modules:
+
+```lisp
+(defn area [s shape] f32 (* (side s) (side s)))   ; public
+
+(private
+  (def calls i32 0)
+  (defn side [s shape] f32 ...))
+```
 
 Macros are hygienic across modules too: the symbols of a macro's template
 resolve in the macro's own module, so `(geom::doubled! v)` works anywhere

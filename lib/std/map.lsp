@@ -12,50 +12,51 @@
 
 (struct (map K V) [keys (ptr K)] [vals (ptr V)] [used (ptr bool)] [len u64] [cap u64])
 
-(defn- hash-bytes [p (ptr u8)] [n u64] u64
-  (let [h u64 0xcbf29ce484222325]
-    (for [i u64 0 n]
-      (set h (* (^ h p[i]) 0x100000001b3)))
-    (mix h)))
-(defn- mix [x u64] u64                         ; (splitmix64's finalizer)
-  (set x (* (^ x (>> x 30)) 0xbf58476d1ce4e5b9))
-  (set x (* (^ x (>> x 27)) 0x94d049bb133111eb))
-  (^ x (>> x 31)))
+(private
+  (defn hash-bytes [p (ptr u8)] [n u64] u64
+    (let [h u64 0xcbf29ce484222325]
+      (for [i u64 0 n]
+        (set h (* (^ h p[i]) 0x100000001b3)))
+      (mix h)))
+  (defn mix [x u64] u64                         ; (splitmix64's finalizer)
+    (set x (* (^ x (>> x 30)) 0xbf58476d1ce4e5b9))
+    (set x (* (^ x (>> x 27)) 0x94d049bb133111eb))
+    (^ x (>> x 31)))
 
-(defmeta- by-value? (t) (let [k (type-kind t)] (or (eq k 'int) (eq k 'bool) (eq k 'ptr))))
+  (defmeta by-value? (t) (let [k (type-kind t)] (or (eq k 'int) (eq k 'bool) (eq k 'ptr))))
 
-(defmacro- hash-of! (x K)
-  (let [t (type-of x)]
-    (cond ((eq t 'str) `(hash-bytes (. ,x data) (. ,x len)))
-          ((by-value? t) `(mix (cast u64 ,x)))
-          (else `(hash-bytes (cast (ptr u8) (addr ,x)) (sizeof ,K))))))
+  (defmacro hash-of! (x K)
+    (let [t (type-of x)]
+      (cond ((eq t 'str) `(hash-bytes (. ,x data) (. ,x len)))
+            ((by-value? t) `(mix (cast u64 ,x)))
+            (else `(hash-bytes (cast (ptr u8) (addr ,x)) (sizeof ,K))))))
 
-(defmacro- same! (a b K)
-  (let [t (type-of a)]
-    (cond ((eq t 'str) `(and (= (. ,a len) (. ,b len)) (= (libc::memcmp (. ,a data) (. ,b data) (. ,a len)) 0)))
-          ((by-value? t) `(= ,a ,b))
-          (else `(= (libc::memcmp (addr ,a) (addr ,b) (sizeof ,K)) 0)))))
+  (defmacro same! (a b K)
+    (let [t (type-of a)]
+      (cond ((eq t 'str) `(and (= (. ,a len) (. ,b len)) (= (libc::memcmp (. ,a data) (. ,b data) (. ,a len)) 0)))
+            ((by-value? t) `(= ,a ,b))
+            (else `(= (libc::memcmp (addr ,a) (addr ,b) (sizeof ,K)) 0)))))
 
-; where k is, or the free slot where it would go (cap > 0)
-(defn- (slot K V) [m (ptr (map K V))] [k K] u64
-  (let [mask (- m.cap 1)] [i (& (hash-of! k K) mask)]
-    (while (and m.used[i] (not (same! m.keys[i] k K)))
-      (set i (& (+ i 1) mask)))
-    i))
+  ; where k is, or the free slot where it would go (cap > 0)
+  (defn (slot K V) [m (ptr (map K V))] [k K] u64
+    (let [mask (- m.cap 1)] [i (& (hash-of! k K) mask)]
+      (while (and m.used[i] (not (same! m.keys[i] k K)))
+        (set i (& (+ i 1) mask)))
+      i))
 
-(defn- (grow K V) [m (ptr (map K V))] void
-  (let [old (deref m)] [cap (if (= old.cap 0) 16 (* old.cap 2))]
-    (set m.cap cap)
-    (set m.len 0)
-    (set m.keys (cast (ptr K) (libc::calloc cap (sizeof K))))
-    (set m.vals (cast (ptr V) (libc::calloc cap (sizeof V))))
-    (set m.used (cast (ptr bool) (libc::calloc cap 1)))
-    (when (or (= m.keys null) (= m.vals null) (= m.used null)) (libc::abort))
-    (for [i u64 0 old.cap]
-      (when old.used[i] (put m old.keys[i] old.vals[i])))
-    (libc::free old.keys)
-    (libc::free old.vals)
-    (libc::free old.used)))
+  (defn (grow K V) [m (ptr (map K V))] void
+    (let [old (deref m)] [cap (if (= old.cap 0) 16 (* old.cap 2))]
+      (set m.cap cap)
+      (set m.len 0)
+      (set m.keys (cast (ptr K) (libc::calloc cap (sizeof K))))
+      (set m.vals (cast (ptr V) (libc::calloc cap (sizeof V))))
+      (set m.used (cast (ptr bool) (libc::calloc cap 1)))
+      (when (or (= m.keys null) (= m.vals null) (= m.used null)) (libc::abort))
+      (for [i u64 0 old.cap]
+        (when old.used[i] (put m old.keys[i] old.vals[i])))
+      (libc::free old.keys)
+      (libc::free old.vals)
+      (libc::free old.used))))
 
 (defn (put K V) [m (ptr (map K V))] [k K] [v V] void
   (when (>= (* (+ m.len 1) 4) (* m.cap 3)) (grow m))   ; (at most 3/4 full)

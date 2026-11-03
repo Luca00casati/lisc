@@ -38,14 +38,18 @@ def parse(src):
         nonlocal pos
         skip()
         start = pos
+        if pos >= n:
+            raise SyntaxError('unclosed bracket at the end')
         c = src[pos]
+        if c in ')]}':
+            raise SyntaxError(f'unexpected {c} at offset {pos}')
         if c in '([{':
             close = {'(': ')', '[': ']', '{': '}'}[c]
             node = Node(c, start)
             pos += 1
             while True:
                 skip()
-                if src[pos] == close:
+                if pos < n and src[pos] == close:
                     pos += 1
                     break
                 node.items.append(form())
@@ -164,7 +168,11 @@ def convert(src):
 
 for path in sys.argv[1:]:
     src = open(path).read()
-    new = convert(src)
+    try:
+        new = convert(src)
+    except (SyntaxError, IndexError) as e:
+        print(f'{path}: not converted ({e})', file=sys.stderr)
+        continue
     if new != src:
         open(path, 'w').write(new)
         print('rewrote', path)

@@ -1,2 +1,2 @@
 ; error: [...] is a binding
-(defn main () i32 (let ((x 1)) [x] 0))
+(defn main [] i32 (let [x 1] (do [x]) 0))

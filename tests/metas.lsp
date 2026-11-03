@@ -5,6 +5,6 @@
 (defmeta scale (x) (+ x 1))                     ; this module's own
 (defmacro plus-one! (x) (scale x))
 (defmacro loud! (s) (cstr (a::shout s)))         ; another module's helper, by its full name
-(defn main () i32
+(defn main [] i32
   (libc::printf c"%d %d %d %s\n" (a::tens! 4) (b::hundreds! 4) (plus-one! 4) (loud! "hi"))
   0)

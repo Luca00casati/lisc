@@ -308,6 +308,41 @@ static void check_utf8(const char *path, const std::string &s) {
     }
 }
 
+namespace {
+
+// a list written with ( ) where a binding goes ([x T]); ,x and ,@x in a
+// template stand for whatever they are given, so they pass
+bool old_binding(const Form *f) {
+    return f->is_list() && !f->bracket && !f->is_call("unquote") && !f->is_call("unquote-splicing");
+}
+
+[[noreturn]] void old_spelling(const Form *f, const char *want) {
+    fatal(f->loc, "bindings are written in [ ]: %s (tools/brackets.py rewrites old code)", want);
+}
+
+// bindings have one spelling, [ ]: (let ((x 1)) ...), (defn f ((a T)) R ...),
+// (for (i 0 n) ...) and (struct s (x T)) are errors in written source
+void check_bindings(const Form *f) {
+    if (!f->is_list() || f->is_call("quote")) return;
+    if (f->is_call("let") && f->size() >= 2 && old_binding(f->at(1)))
+        old_spelling(f->at(1), "(let [x 1] [y T 2] body...)");
+    if ((f->is_call("defn") || f->is_call("defn-") || f->is_call("defop")) && f->size() >= 3 && old_binding(f->at(2)))
+        old_spelling(f->at(2), f->at(2)->items.empty() ? "[] for no parameters" : "(defn f [a T] [b U] R body...)");
+    if (f->is_call("for") && f->size() >= 2 && old_binding(f->at(1)))
+        old_spelling(f->at(1), "(for [i 0 n] body...), (for [x :in xs] body...)");
+    if (f->is_call("struct") || f->is_call("struct-") || f->is_call("union") || f->is_call("union-"))
+        for (size_t i = 2; i < f->size(); i++)
+            if (old_binding(f->at(i))) old_spelling(f->at(i), "(struct name [field T] ...)");
+    if (f->is_call("variant"))
+        for (size_t i = 2; i < f->size(); i++)
+            if (f->at(i)->is_list())
+                for (size_t j = 1; j < f->at(i)->size(); j++)
+                    if (old_binding(f->at(i)->at(j))) old_spelling(f->at(i)->at(j), "(variant name (case [field T] ...) ...)");
+    for (const Form *x : f->items) check_bindings(x);
+}
+
+}  // namespace
+
 std::vector<Form *> read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) fatal({path, 0, 0}, "cannot open: %s", strerror(errno));
@@ -323,6 +358,7 @@ std::vector<Form *> read_file(const char *path) {
         if (r.peek() < 0) break;
         forms.push_back(r.read());
     }
+    for (Form *f : forms) check_bindings(f);
     return forms;
 }
 

@@ -52,7 +52,7 @@ done
 # The C import cache must notice a header that changed (even at the same size).
 mkdir -p out/hc
 printf '#define ANSWER 41\nstruct pt { int x, y; };\n' >out/hc/h.h
-printf '(import "libc")\n(import-c "h.h" :as h)\n(defn main () i32 (libc::printf c"%%d %%lu\\n" h::ANSWER (sizeof h::pt)) 0)\n' >out/hc/t.lsp
+printf '(import "libc")\n(import-c "h.h" :as h)\n(defn main [] i32 (libc::printf c"%%d %%lu\\n" h::ANSWER (sizeof h::pt)) 0)\n' >out/hc/t.lsp
 got=$(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t && ../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)
 sleep 0.01
 printf '#define ANSWER 42\nstruct pt { int x, y; };\n' >out/hc/h.h

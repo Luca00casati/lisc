@@ -137,9 +137,10 @@ Three kinds of brackets:
 
 - `[ ... ]` is a binding: a parameter `[a T]`, a `let` binding `[x T init]`, a
   `for` header `[i 0 n]`, a struct field `[x f32]`. They stand one after
-  another, `(let [x 1] [y 2] body...)`, where the old spelling had one list
-  of them, `(let ((x 1) (y 2)) body...)`, which still works. `[]` alone is
-  no parameters. A `[...]` anywhere else is an error, not a call.
+  another, `(let [x 1] [y 2] body...)`. `[]` alone is no parameters. This is
+  the only spelling: the old one, a list of them in parentheses
+  (`(let ((x 1) (y 2)) ...)`, `(defn f () ...)`), is an error. A `[...]`
+  anywhere else is an error too, not a call.
 - `{T :field e ...}` is `(make T :field e ...)`.
 - `a[i]`, written right after a name, `a.b`, `(...)` or another index, is
   `(aref a i)`: `v.data[v.len]`, `grid[y][x]`, `(f)[0]`. A `.field` may
@@ -147,7 +148,8 @@ Three kinds of brackets:
 
 Macro templates keep brackets as written, and compile-time code takes them in
 `let` too. `tools/brackets.py file.lsp ...` rewrites code in the old spelling
-(keeping comments and layout).
+(keeping comments and layout). Code a macro builds with `list` rather than a
+template isn't checked: the compiler takes either shape from macros.
 
 Everything starts as zero: `let` bindings without a value, globals, and the
 fields and elements `make` doesn't set. `null` is the zero value of the

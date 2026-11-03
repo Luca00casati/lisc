@@ -1,7 +1,7 @@
 #!/bin/sh
 # Each tests/NAME.lsp is compiled (with debug info) and run; its output must equal tests/NAME.out.
 # Each tests/errors/NAME.lsp must fail to compile with the message in its
-# first line ("; error: ...").
+# first line ("; error: ..."), and any "; note: ..." lines after it.
 cd "$(dirname "$0")"
 mkdir -p out
 pass=0 fail=0
@@ -23,10 +23,20 @@ for src in errors/*.lsp; do
     [ -e "$src" ] || continue
     want=$(head -1 "$src" | sed 's/^; error: //')
     got=$(../lisc "$src" -o out/err 2>&1)
-    case "$got" in
-    *"$want"*) pass=$((pass + 1)) ;;
-    *) fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$got'" ;;
-    esac
+    ok=1
+    case "$got" in *"$want"*) ;; *) ok=0 ;; esac
+    # "; note: ..." lines after it: notes the output must have too
+    notes=$(sed -n '2,$p' "$src" | grep '^; note: ' | sed 's/^; note: //')
+    if [ -n "$notes" ]; then
+        nl='
+'
+        old_ifs=$IFS; IFS=$nl
+        for note in $notes; do
+            case "$got" in *"$note"*) ;; *) ok=0; want="$want / $note" ;; esac
+        done
+        IFS=$old_ifs
+    fi
+    if [ $ok = 1 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$got'"; fi
 done
 # Each tests/checks/NAME.lsp, built with --checks, must stop with the message in
 # its first line ("; abort: ...").

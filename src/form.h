@@ -28,6 +28,9 @@ struct Expansion {
 
 extern jmp_buf *error_trap;
 extern int error_count;
+// what is being made while an error can happen (a generic's instance, and
+// where it was asked for): fatal prints a note for each, innermost first
+extern std::vector<std::pair<Loc, std::string>> error_context;
 
 // "file:line:col: warning: ..." (unless warnings are off: lisc -w)
 void warn(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));

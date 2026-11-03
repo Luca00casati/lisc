@@ -25,12 +25,15 @@ void fatal(Loc at, const char *fmt, ...) {
     fputc('\n', stderr);
     for (const Expansion *e = at.via; e; e = e->at.via)
         fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
+    for (auto c = error_context.rbegin(); c != error_context.rend(); ++c)
+        fprintf(stderr, "%s:%d:%d: note: in %s, used here\n", c->first.file, c->first.line, c->first.col, c->second.c_str());
     error_count++;
     if (error_trap) longjmp(*error_trap, 1);
     exit(1);
 }
 
 jmp_buf *error_trap = nullptr;
+std::vector<std::pair<Loc, std::string>> error_context;
 int error_count = 0;
 bool warnings = true;
 

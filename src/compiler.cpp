@@ -1602,11 +1602,13 @@ struct Compiler::Impl : MetaHost {
         Type *t = t_struct(st);
         g.structs[args] = t;  // (before its fields: they may point to it)
         instance_of[st] = {&g, args};
+        error_context.push_back({at, st->name});
         inside(g, binding(g, args), [&] {
             std::vector<std::pair<Form *, StructInfo *>> one{{g.def, st}};
             std::vector<ModInfo *> ms{g.mod};
             add_fields(one, ms);
         });
+        error_context.pop_back();
         if (structs_ready) lay_out(st, at);
         else pending_layout.push_back({st, at});
         return t;
@@ -1621,7 +1623,9 @@ struct Compiler::Impl : MetaHost {
         check_needs(g, args, at);
         std::string shown = instance_name(g, args);
         auto bind = binding(g, args);
+        error_context.push_back({at, shown});
         inside(g, bind, [&] { declare_fn(g.def, key); });
+        error_context.pop_back();
         pending_fns.push_back({g.def, key, shown, g.mod, bind, at});
         return &c.globals_[key];
     }
@@ -1799,7 +1803,8 @@ struct Compiler::Impl : MetaHost {
     }
     void no_closure(Type *t, Loc at, const char *what) {
         if (is_closure(t))
-            fatal(at, "a closure can't be %s: it is only passed down, as an argument or a local (what it captured lives in the frame that made it)", what);
+            fatal(at, "a closure can't be %s (here %s): it is only passed down, as an argument or a local; to keep one, make a heap-fn with (fn :heap ...)",
+                  what, type_name(t).c_str());
     }
 
     [[noreturn]] void type_error(Loc at, const char *what, Type *want, Type *got) {
@@ -3754,10 +3759,12 @@ struct Compiler::Impl : MetaHost {
         // compiled anyway (up to 20 errors); the program is not produced.
         auto guarded = [&](auto body, const PendingFn *inst) {
             jmp_buf here;
+            size_t context = error_context.size();
             if (setjmp(here) == 0) {
                 error_trap = &here;
                 body();
             } else {
+                error_context.resize(context);  // (the jump skipped their pops)
                 if (inst) fprintf(stderr, "%s:%d:%d: note: in %s, used here\n", inst->at.file, inst->at.line, inst->at.col, inst->shown.c_str());
                 abandon_fn();
                 if (error_count >= 20) {

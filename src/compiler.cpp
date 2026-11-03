@@ -1477,11 +1477,55 @@ struct Compiler::Impl : MetaHost {
     Val make_heap_fn(Global &g, Type *env_t, const std::vector<Val> &caps, Loc at) {
         llvm::Value *env = llvm::ConstantPointerNull::get(b.getPtrTy());
         if (!caps.empty()) {
+            // a 16-byte header before the env says whether it is alive (see drop)
             llvm::FunctionCallee malloc_ = mod.getOrInsertFunction("malloc", b.getPtrTy(), b.getInt64Ty());
-            env = b.CreateCall(malloc_, {b.getInt64(size_of(env_t))}, "env");
+            llvm::Value *base = b.CreateCall(malloc_, {b.getInt64(size_of(env_t) + HEAP_HEADER)}, "env.base");
+            b.CreateStore(b.getInt64(ENV_ALIVE), base);
+            env = b.CreateInBoundsGEP(b.getInt8Ty(), base, b.getInt64(HEAP_HEADER), "env");
             for (size_t i = 0; i < caps.size(); i++) store(field_addr({env, env_t}, mk_sym(at, "c" + std::to_string(i))), load(caps[i]));
         }
         return callable_val(g, env, true);
+    }
+
+    // A heap-fn's env (when it has one) follows a header holding ENV_ALIVE.
+    // drop sets it to ENV_DROPPED and, with checks on, keeps the memory in a
+    // quarantine of the last 256 drops before freeing it, so a call or drop
+    // of a dropped heap-fn meanwhile is caught (as AddressSanitizer does).
+    static constexpr uint64_t HEAP_HEADER = 16, ENV_ALIVE = 0x4c495343414c4956, ENV_DROPPED = 0x4c49534344524f50;
+    // the header to check, or a constant alive one when there is none (no env, or a plain function's)
+    llvm::Value *env_header(llvm::Value *heapfn, Type *t, Loc at) {
+        llvm::Value *fnp = b.CreateExtractValue(heapfn, 0), *env = b.CreateExtractValue(heapfn, 1);
+        llvm::Value *own = b.CreateAnd(b.CreateIsNotNull(env), b.CreateICmpNE(fnp, trampoline(t->st->closure_of, at)));
+        llvm::GlobalVariable *alive = mod.getGlobalVariable("lisc.env.alive", true);
+        if (!alive)
+            alive = new llvm::GlobalVariable(mod, b.getInt64Ty(), true, llvm::GlobalValue::InternalLinkage, b.getInt64(ENV_ALIVE), "lisc.env.alive");
+        llvm::Value *hdr = b.CreateInBoundsGEP(b.getInt8Ty(), env, b.getInt64(-(int64_t)HEAP_HEADER));
+        return b.CreateSelect(own, hdr, alive);
+    }
+    void check_alive(llvm::Value *heapfn, Type *t, Loc at, const char *what) {
+        if (!checking()) return;
+        llvm::Value *magic = b.CreateLoad(b.getInt64Ty(), env_header(heapfn, t, at));
+        check(b.CreateICmpEQ(magic, b.getInt64(ENV_ALIVE)), at, what);
+    }
+    // lisc.env.release(header): marks it dropped and frees the one dropped 256 drops ago
+    llvm::Function *env_release() {
+        if (llvm::Function *f = mod.getFunction("lisc.env.release")) return f;
+        auto *f = llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy()}, false), llvm::GlobalValue::InternalLinkage,
+                                         "lisc.env.release", mod);
+        f->addFnAttr(llvm::Attribute::NoInline);
+        auto *qt = llvm::ArrayType::get(b.getPtrTy(), 256);
+        auto *q = new llvm::GlobalVariable(mod, qt, false, llvm::GlobalValue::InternalLinkage, llvm::Constant::getNullValue(qt), "lisc.env.quarantine");
+        auto *n = new llvm::GlobalVariable(mod, b.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage, b.getInt64(0), "lisc.env.drops");
+        llvm::IRBuilder<> e(BasicBlock::Create(ctx, "entry", f));
+        llvm::Value *hdr = &*f->arg_begin();
+        e.CreateStore(e.getInt64(ENV_DROPPED), hdr);
+        // (atomic: threads may drop at once)
+        llvm::Value *i = e.CreateAtomicRMW(llvm::AtomicRMWInst::Add, n, e.getInt64(1), llvm::MaybeAlign(8), llvm::AtomicOrdering::Monotonic);
+        llvm::Value *slot = e.CreateInBoundsGEP(qt, q, {e.getInt64(0), e.CreateAnd(i, 255)});
+        llvm::Value *old = e.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, slot, hdr, llvm::MaybeAlign(8), llvm::AtomicOrdering::AcquireRelease);
+        e.CreateCall(mod.getOrInsertFunction("free", e.getVoidTy(), e.getPtrTy()), {old});
+        e.CreateRetVoid();
+        return f;
     }
 
     Val callable_val(Global &g, llvm::Value *env, bool heap) {
@@ -1499,9 +1543,17 @@ struct Compiler::Impl : MetaHost {
         Val v = expr(f->at(1), nullptr);
         if (v.t->kind != Type::Struct || !v.t->st->heap_fn) fatal(f->at(1)->loc, "drop frees a heap-fn's env, not %s", type_name(v.t).c_str());
         llvm::Value *fnp = b.CreateExtractValue(v.v, 0), *env = b.CreateExtractValue(v.v, 1);
-        llvm::Value *own = b.CreateICmpNE(fnp, trampoline(v.t->st->closure_of, f->loc));
-        llvm::FunctionCallee free_ = mod.getOrInsertFunction("free", b.getVoidTy(), b.getPtrTy());
-        b.CreateCall(free_, {b.CreateSelect(own, env, llvm::ConstantPointerNull::get(b.getPtrTy()))});
+        llvm::Value *own = b.CreateAnd(b.CreateIsNotNull(env), b.CreateICmpNE(fnp, trampoline(v.t->st->closure_of, f->loc)));
+        BasicBlock *rel = BasicBlock::Create(ctx, "drop", fn), *done = BasicBlock::Create(ctx, "dropped", fn);
+        b.CreateCondBr(own, rel, done);
+        b.SetInsertPoint(rel);
+        llvm::Value *hdr = b.CreateInBoundsGEP(b.getInt8Ty(), env, b.getInt64(-(int64_t)HEAP_HEADER));
+        if (checking()) {
+            check(b.CreateICmpEQ(b.CreateLoad(b.getInt64Ty(), hdr), b.getInt64(ENV_ALIVE)), f->loc, "heap-fn dropped twice");
+            b.CreateCall(env_release(), {hdr});
+        } else b.CreateCall(mod.getOrInsertFunction("free", b.getVoidTy(), b.getPtrTy()), {hdr});
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
         return {nullptr, t_void()};
     }
 
@@ -2071,6 +2123,7 @@ struct Compiler::Impl : MetaHost {
             }
             if (base.t->kind == Type::Ptr) {
                 if (base.t->elem == t_void()) fatal(f->loc, "cannot index a (ptr void)");
+                if (!len) not_null(base.v, f->at(1)->loc);  // (a str's or slice's data: its len is checked)
                 return {b.CreateInBoundsGEP(ll(base.t->elem), base.v, idx), base.t->elem};
             }
             fatal(f->at(1)->loc, "cannot index %s", type_name(base.t).c_str());
@@ -2079,6 +2132,7 @@ struct Compiler::Impl : MetaHost {
             if (f->size() != 2) fatal(f->loc, "(deref p)");
             Val p = expr(f->at(1), nullptr);
             if (!p.t->is_ptr() || p.t->elem == t_void()) fatal(f->loc, "cannot dereference %s", type_name(p.t).c_str());
+            not_null(p.v, f->loc);
             return {p.v, p.t->elem};
         }
         fatal(f->loc, "%s is not a place", show(f).c_str());
@@ -2109,12 +2163,23 @@ struct Compiler::Impl : MetaHost {
     Val struct_base(Form *x) {
         if (is_place(x)) return place(x);
         Val v = expr(x, nullptr);
-        if (v.t->is_ptr()) return {v.v, v.t->elem};
+        if (v.t->is_ptr()) {
+            not_null(v.v, x->loc);
+            return {v.v, v.t->elem};
+        }
         return spill(v);
     }
 
+    // a pointer about to be followed: null stops the program (a check)
+    void not_null(llvm::Value *p, Loc at, const char *what = "null pointer dereference") {
+        if (checking() && !llvm::isa<llvm::AllocaInst>(p) && !llvm::isa<llvm::GlobalValue>(p)) check(b.CreateIsNotNull(p), at, what);
+    }
+
     Val field_addr(Val a, Form *name) {
-        while (a.t->is_ptr()) a = {load(a), a.t->elem};  // auto-deref
+        while (a.t->is_ptr()) {  // auto-deref
+            a = {load(a), a.t->elem};
+            not_null(a.v, name->loc);
+        }
         if (a.t->kind != Type::Struct) fatal(name->loc, "%s has no field '%s'", type_name(a.t).c_str(), name->text.c_str());
         ensure_layout(a.t->st, name->loc);
         const Field *fd = a.t->st->find(name->text);
@@ -3539,6 +3604,8 @@ struct Compiler::Impl : MetaHost {
                 if (n != cf->params.size())
                     fatal(f->loc, "%s takes %zu argument%s, got %zu", show(head).c_str(), cf->params.size(), cf->params.size() == 1 ? "" : "s", n);
                 std::vector<Type *> ps{t_ptr(t_void())};
+                not_null(b.CreateExtractValue(callee.v, 0), head->loc, callee.t->st->heap_fn ? "call of a null heap-fn" : "call of a null closure");
+                if (callee.t->st->heap_fn) check_alive(callee.v, callee.t, head->loc, "call of a dropped heap-fn");
                 std::vector<Val> args{{b.CreateExtractValue(callee.v, 1), t_ptr(t_void())}};
                 for (size_t i = 0; i < n; i++) {
                     ps.push_back(cf->params[i]);
@@ -3547,6 +3614,7 @@ struct Compiler::Impl : MetaHost {
                 return emit_call(b.CreateExtractValue(callee.v, 0), t_fn(cf->elem, ps, false), args, {});
             }
             if (!callee.t->is_ptr() || callee.t->elem->kind != Type::Fn) fatal(head->loc, "%s is not a function", show(head).c_str());
+            not_null(callee.v, head->loc, "call through a null function pointer");
             ft = callee.t->elem;
         }
         size_t n = f->size() - 1;

@@ -78,6 +78,11 @@ conversions, and stops the program with the source location
   prefer slices.
 - `(slice-of a from to)`: `from <= to <= length`
 - integer `/` and `%`: by zero, and the minimum divided by -1
+- a null pointer followed: `(deref p)`, `p[i]`, `p.field` through a pointer, a
+  call through a function pointer, and a null closure or heap-fn called
+- a heap-fn called after `drop`, or dropped twice. drop marks its env dead and
+  keeps it in a quarantine of the last 256 drops before freeing it, so this is
+  caught within those (as AddressSanitizer does), not after
 - `(cast T e)` of an integer that loses the value: narrowed, or a negative
   into an unsigned type. A literal cast is read as that type, and one that
   doesn't fit is a compile-time error. `(truncate T e)` keeps an integer's low
@@ -89,7 +94,7 @@ range gives the type's minimum or maximum, NaN gives 0: `(cast u8 300.5)` is
 
 Bounds checks in loops mostly cost nothing after optimisation (LLVM proves
 them); saturating float casts cost the most (a few instructions each). The
-teapot's CPU side is about 4% slower with all of them on. To leave them out:
+teapot's CPU side is about 1.5% slower with all of them on. To leave them out:
 `(unchecked body...)` for a block, `:unchecked` after a function's result type
 for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
 `--no-checks` for the whole build. There, float casts are C's: a value out of
@@ -276,7 +281,8 @@ value goes, and lives until `(drop f)` frees its env:
 ```
 
 As with `malloc`, it is yours to drop once: not dropping it leaks its env,
-and calling it (or a copy of it) after the drop reads freed memory. A plain
+and calling it (or a copy of it) after the drop reads freed memory (a check
+catches that, and a second drop, for the last 256 drops). A plain
 function goes where a heap-fn is wanted (dropping it frees nothing), and a
 heap-fn goes where a closure is wanted (to `sort-by`, say). A heap-fn can't
 capture a closure, which would outlive what that captured.

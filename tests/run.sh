@@ -50,7 +50,7 @@ for src in safety/*.lsp; do
     fi
 done
 # a failed check prints what the program printed before it
-if ../lisc safety/castforce-operand.lsp -o out/check 2>/dev/null && ./out/check 2>/dev/null | grep -q "printed before the abort"; then
+if ../lisc safety/castforce-operand.lsp -o out/check 2>/dev/null && (./out/check) 2>/dev/null | grep -q "printed before the abort"; then
     pass=$((pass + 1))
 else
     fail=$((fail + 1)); echo "FAIL: output before a failed check was lost"

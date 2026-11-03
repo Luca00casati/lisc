@@ -1,7 +1,7 @@
 // main.cpp — the lisc driver: source → LLVM IR → optimised native object →
 // executable (linked by the system C compiler, against libc and libm).
 //
-//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-w] [--checks|--no-checks] [--time] [--no-cache] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
+//   lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-g] [-w] [--no-checks] [--time] [--no-cache] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
 //
 // Other input files go to the linker (cc), so C code can be linked in.
 // import-c searches the source file's directory and -I directories for headers.
@@ -46,7 +46,7 @@ void phase(const char *name) {
 }
 
 [[noreturn]] void usage() {
-    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-w] [--checks|--no-checks] [--time] [--no-cache] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
+    fprintf(stderr, "usage: lisc file.lsp [file.c|file.o ...] [-o out] [-O0..-O3] [-g] [-w] [--no-checks] [--time] [--no-cache] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]\n");
     exit(1);
 }
 
@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
     const char *in = nullptr;
     std::string out;
     int opt = 2;
-    bool emit_llvm = false, object_only = false, debug = false, checks = false, safety = true, c_cache = true;
+    bool emit_llvm = false, object_only = false, debug = false, checks = true, c_cache = true;
     std::vector<std::string> libs, includes, defines;
     for (int i = 1; i < argc; i++) {
         const char *s = argv[i];
@@ -88,8 +88,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(s, "--emit-llvm")) emit_llvm = true;
         else if (!strcmp(s, "-g")) debug = true;
         else if (!strcmp(s, "-w")) warnings = false;
-        else if (!strcmp(s, "--checks")) checks = true;
-        else if (!strcmp(s, "--no-checks")) safety = false;
+        else if (!strcmp(s, "--no-checks")) checks = false;
         else if (!strcmp(s, "--time")) timing = true;
         else if (!strcmp(s, "--no-cache")) c_cache = false;
         else if (!strcmp(s, "-c")) object_only = true;
@@ -123,7 +122,6 @@ int main(int argc, char **argv) {
     }
     c.debug = debug;
     c.checks = checks;
-    c.safety = safety;
     c.c_cache = c_cache;
     phase("start");
     c.compile(read_file(in));

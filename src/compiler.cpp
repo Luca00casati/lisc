@@ -46,6 +46,8 @@
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/MDBuilder.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
@@ -228,28 +230,47 @@ struct Compiler::Impl : MetaHost {
     /* ---------------------------------------------------- run-time checks --- */
     // lisc --checks: unless `ok`, print "file:line:col: what" (printf-style, with
     // `args`) to stderr and abort
-    // Bounds and division checks (`safe`) are on unless --no-checks or inside
-    // (unchecked ...) / a :unchecked function; conversion checks need --checks.
+    // Run-time checks (bounds, division, number conversions) are on unless
+    // --no-checks or inside (unchecked ...) / a :unchecked function.
     int unchecked = 0;
-    bool checking(bool safe) const { return fn && !unchecked && (safe ? c.safety || c.checks : c.checks); }
-    void check(llvm::Value *ok, Loc at, const std::string &what, std::vector<llvm::Value *> args = {}, bool safe = false) {
-        if (!checking(safe)) return;
+    bool checking() const { return fn && !unchecked && c.checks; }
+    void check(llvm::Value *ok, Loc at, const std::string &what, std::vector<llvm::Value *> args = {}) {
+        if (!checking()) return;
         if (auto *k = llvm::dyn_cast<llvm::ConstantInt>(ok))
             if (k->isOne()) return;  // (known to hold)
         BasicBlock *fail = BasicBlock::Create(ctx, "check.fail", fn), *cont = BasicBlock::Create(ctx, "check.ok", fn);
-        b.CreateCondBr(ok, cont, fail);
+        // the failure is never expected: laid out of the way, one small call
+        b.CreateCondBr(ok, cont, fail, llvm::MDBuilder(ctx).createBranchWeights(1 << 20, 1));
         b.SetInsertPoint(fail);
         Loc u = user_loc(at);
         std::string file;
         for (const char *p = u.file; *p; p++) file += *p == '%' ? std::string("%%") : std::string(1, *p);
         std::string msg = file + ":" + std::to_string(u.line) + ":" + std::to_string(u.col) + ": " + what + "\n";
-        auto *dp = llvm::FunctionType::get(b.getInt32Ty(), {b.getInt32Ty(), b.getPtrTy()}, true);
-        std::vector<llvm::Value *> as = {b.getInt32(2), b.CreateGlobalStringPtr(msg, "check", 0, &mod)};
+        std::vector<llvm::Value *> as = {b.CreateGlobalStringPtr(msg, "check", 0, &mod)};
         as.insert(as.end(), args.begin(), args.end());
-        b.CreateCall(mod.getOrInsertFunction("dprintf", dp), as);
-        b.CreateCall(mod.getOrInsertFunction("abort", llvm::FunctionType::get(b.getVoidTy(), false)));
+        llvm::CallInst *call = b.CreateCall(check_failed(), as);
+        call->setDoesNotReturn();
         b.CreateUnreachable();
         b.SetInsertPoint(cont);
+    }
+    // lisc.check.failed(format, args...): prints the message to stderr and aborts
+    llvm::Function *check_failed() {
+        if (llvm::Function *f = mod.getFunction("lisc.check.failed")) return f;
+        auto *ft = llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy()}, true);
+        auto *f = llvm::Function::Create(ft, llvm::GlobalValue::InternalLinkage, "lisc.check.failed", mod);
+        f->addFnAttr(llvm::Attribute::Cold);
+        f->addFnAttr(llvm::Attribute::NoReturn);
+        f->addFnAttr(llvm::Attribute::NoInline);
+        f->addFnAttr(llvm::Attribute::NoUnwind);
+        llvm::IRBuilder<> e(BasicBlock::Create(ctx, "entry", f));
+        auto *va_list_t = llvm::ArrayType::get(e.getInt8Ty(), 24);  // x86-64 SysV va_list
+        llvm::Value *ap = e.CreateAlloca(va_list_t);
+        e.CreateIntrinsic(llvm::Intrinsic::vastart, {}, {ap});
+        auto *vd = llvm::FunctionType::get(e.getInt32Ty(), {e.getInt32Ty(), e.getPtrTy(), e.getPtrTy()}, false);
+        e.CreateCall(mod.getOrInsertFunction("vdprintf", vd), {e.getInt32(2), &*f->arg_begin(), ap});
+        e.CreateCall(mod.getOrInsertFunction("abort", llvm::FunctionType::get(e.getVoidTy(), false)));
+        e.CreateUnreachable();
+        return f;
     }
 
     // indexable through its fields: data, a pointer, and len, an integer
@@ -2021,7 +2042,7 @@ struct Compiler::Impl : MetaHost {
             }
             llvm::Value *len = nullptr;  // the length, where there is one (to check against)
             if (in_memory && has_data_len(base.t)) {
-                if (checking(true)) {
+                if (checking()) {
                     Val l = field_addr(base, mk_sym(f->loc, "len"));
                     len = b.CreateIntCast(load(l), b.getInt64Ty(), l.t->sign);
                 }
@@ -2037,7 +2058,7 @@ struct Compiler::Impl : MetaHost {
                         fatal(f->at(2)->loc, "index %lld out of bounds (length %llu)", (long long)k->getSExtValue(), (unsigned long long)base.t->n);
                 len = b.getInt64(base.t->n);
             }
-            if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len}, true);
+            if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len});
             if (base.t->is_simd()) {  // an element of the vector in memory
                 uint64_t es = size_of(base.t->elem);
                 return {b.CreateInBoundsGEP(ll(base.t->elem), base.v, idx), base.t->elem, es};
@@ -2232,7 +2253,8 @@ struct Compiler::Impl : MetaHost {
                                        : (f->ival < (uint64_t(1) << want->bits)) || (v < 0 && v >= -(int64_t(1) << (want->bits - 1)));
                 if (!fits) fatal(f->loc, "%s does not fit in %s", f->text.c_str(), type_name(want).c_str());
             }
-            return {llvm::ConstantInt::get(ll(want), f->ival), want};
+            bool negative = !f->text.empty() && f->text[0] == '-';  // (ival is its 64-bit two's complement)
+            return {llvm::ConstantInt::get(ctx, llvm::APInt(want->bits, f->ival, negative)), want};
         }
         // Float
         if (want && want->is_int()) fatal(f->loc, "%s is not an integer", f->text.c_str());
@@ -2341,7 +2363,7 @@ struct Compiler::Impl : MetaHost {
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
         if (hs == "%captures") return alias(f, want, false);
-        if (hs == "unchecked") {  // (unchecked body...): no bounds or division checks in it
+        if (hs == "unchecked") {  // (unchecked body...): no run-time checks in it
             unchecked++;
             Val r = body(f, 1, want);
             unchecked--;
@@ -2402,6 +2424,9 @@ struct Compiler::Impl : MetaHost {
         if (hs == "cast" || hs == "bitcast") {
             if (f->size() != 3) fatal(f->loc, "(%s T e)", h);
             Type *to = parse_type(f->at(1));
+            // an integer literal is read as the type it is cast to (so
+            // (cast u64 18000000000000000000) is that number)
+            if (hs == "cast" && f->at(2)->kind == Form::Int && to->is_int()) return expr(f->at(2), to);
             // the operand keeps its own type (3.99 is an f64 here), then converts
             Val v = expr(f->at(2), nullptr);
             return hs == "cast" ? cast(v, to, f->loc) : bitcast(v, to, f->loc);
@@ -2840,11 +2865,11 @@ struct Compiler::Impl : MetaHost {
         if (op == "-") return {b.CreateSub(a.v, x.v), t};
         if (op == "*") return {b.CreateMul(a.v, x.v), t};
         if (op == "/" || op == "%") {
-            check(b.CreateICmpNE(x.v, llvm::ConstantInt::get(ll(t), 0)), at, "division by zero", {}, true);
+            check(b.CreateICmpNE(x.v, llvm::ConstantInt::get(ll(t), 0)), at, "division by zero");
             if (t->sign)
                 check(b.CreateNot(b.CreateAnd(b.CreateICmpEQ(a.v, llvm::ConstantInt::get(ll(t), llvm::APInt::getSignedMinValue(t->bits))),
                                               b.CreateICmpEQ(x.v, llvm::ConstantInt::getSigned(ll(t), -1)))),
-                      at, "integer overflow in division", {}, true);
+                      at, "integer overflow in division");
         }
         if (op == "/") return {t->sign ? b.CreateSDiv(a.v, x.v) : b.CreateUDiv(a.v, x.v), t};
         if (op == "%") return {t->sign ? b.CreateSRem(a.v, x.v) : b.CreateURem(a.v, x.v), t};
@@ -3149,7 +3174,7 @@ struct Compiler::Impl : MetaHost {
         llvm::Value *from = f->size() >= 3 ? coerce(expr(f->at(2), u64), u64, f->at(2)->loc, "from").v : b.getInt64(0);
         llvm::Value *to = f->size() == 4 ? coerce(expr(f->at(3), u64), u64, f->at(3)->loc, "to").v : len.v;
         check(b.CreateAnd(b.CreateICmpULE(from, to), b.CreateICmpULE(to, len.v)), f->loc, "slice %lu..%lu out of bounds (length %lu)",
-              {from, to, len.v}, true);
+              {from, to, len.v});
         Type *elem = data.t->elem;
         llvm::Value *p = b.CreateGEP(ll(elem), data.v, from);
         llvm::Value *v = llvm::UndefValue::get(ll(st));
@@ -3387,7 +3412,7 @@ struct Compiler::Impl : MetaHost {
         }
         if (from->is_int() && to->is_int()) {
             llvm::Value *r = b.CreateIntCast(v.v, lt, from->sign);
-            if (c.checks && fn && (to->bits < from->bits || from->sign != to->sign)) {  // could lose the value
+            if (checking() && (to->bits < from->bits || from->sign != to->sign)) {  // could lose the value
                 llvm::Value *ok = b.CreateICmpEQ(b.CreateIntCast(r, ll(from), to->sign), v.v);
                 if (from->sign && !to->sign) ok = b.CreateAnd(ok, b.CreateICmpSGE(v.v, llvm::ConstantInt::get(ll(from), 0)));
                 if (!from->sign && to->sign) ok = b.CreateAnd(ok, b.CreateICmpSGE(r, llvm::ConstantInt::get(lt, 0)));
@@ -3400,7 +3425,7 @@ struct Compiler::Impl : MetaHost {
         if (from->is_int() && to->kind == Type::Bool) return {b.CreateICmpNE(v.v, llvm::ConstantInt::get(ll(from), 0)), to};
         if (from->is_int() && to->is_float()) return {from->sign ? b.CreateSIToFP(v.v, lt) : b.CreateUIToFP(v.v, lt), to};
         if (from->is_float() && to->is_int()) {
-            if (c.checks && fn) {  // in range (and not NaN): the ordered compares fail on NaN
+            if (checking()) {  // in range (and not NaN): the ordered compares fail on NaN
                 llvm::Type *ft = ll(from);
                 double hi = std::ldexp(1.0, to->sign ? to->bits - 1 : to->bits);
                 llvm::Value *ok = b.CreateAnd(to->sign ? b.CreateFCmpOGE(v.v, llvm::ConstantFP::get(ft, -hi))

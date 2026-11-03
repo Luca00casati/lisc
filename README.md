@@ -68,9 +68,9 @@ modification time). A build with a warm cache does no header parsing.
 `--time` reports how long each phase took (front end, compiling the parts,
 link) and how many parts came from the cache; `-O0` builds fastest.
 
-Every build checks, at run time, indexing and integer division, and stops the
-program with the source location (`file:line:col: index 5 out of bounds
-(length 5)`):
+Every build checks, at run time, indexing, integer division and number
+conversions, and stops the program with the source location
+(`file:line:col: index 5 out of bounds (length 5)`):
 
 - an index into an array, a simd, or anything with `data` and `len` fields (a
   str, a slice, a `(vec T)`: `v[i]`); a constant index past an array's end is
@@ -78,17 +78,17 @@ program with the source location (`file:line:col: index 5 out of bounds
   prefer slices.
 - `(slice-of a from to)`: `from <= to <= length`
 - integer `/` and `%`: by zero, and the minimum divided by -1
+- `(cast T e)` that loses the value: an integer narrowed, a negative into an
+  unsigned type, a float out of the integer type's range (or NaN). A literal
+  cast is read as that type, and one that doesn't fit is a compile-time error.
+  `(truncate T e)` keeps an integer's low bits on purpose and is never checked.
 
-Most checks in loops cost nothing after optimisation (LLVM proves them); the
-teapot's CPU side runs at the same speed with them. To leave them out:
-`(unchecked body...)` for a block, `:unchecked` after a function's result type
-for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
-`--no-checks` for the whole build.
-
-`--checks` adds checks for number conversions: integer casts that lose the
-value (narrowing, or a negative into unsigned) and float-to-integer casts out
-of range. `(truncate T e)` keeps an integer's low bits on purpose and is never
-checked.
+Bounds checks in loops mostly cost nothing after optimisation (LLVM proves
+them); float-to-integer checks cost the most. The teapot's CPU side is about
+4% slower with all of them on. To leave them out: `(unchecked body...)` for a
+block, `:unchecked` after a function's result type for a whole function
+(`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or `--no-checks` for the
+whole build.
 
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a
@@ -135,7 +135,7 @@ Expressions — everything is one; statements have type `void`:
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
     (fn [a T] ... R body...) — a function written where it is used; with captures a closure (see below)
     (fn :heap [a T] ... R body...) — a heap-fn, kept until (drop f)
-    (unchecked body...) — no bounds or division checks in it
+    (unchecked body...) — no run-time checks in it
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first

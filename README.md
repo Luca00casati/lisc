@@ -78,17 +78,22 @@ conversions, and stops the program with the source location
   prefer slices.
 - `(slice-of a from to)`: `from <= to <= length`
 - integer `/` and `%`: by zero, and the minimum divided by -1
-- `(cast T e)` that loses the value: an integer narrowed, a negative into an
-  unsigned type, a float out of the integer type's range (or NaN). A literal
-  cast is read as that type, and one that doesn't fit is a compile-time error.
-  `(truncate T e)` keeps an integer's low bits on purpose and is never checked.
+- `(cast T e)` of an integer that loses the value: narrowed, or a negative
+  into an unsigned type. A literal cast is read as that type, and one that
+  doesn't fit is a compile-time error. `(truncate T e)` keeps an integer's low
+  bits on purpose and is never checked.
+
+A float cast to an integer doesn't stop: it saturates, as in Rust. Out of
+range gives the type's minimum or maximum, NaN gives 0: `(cast u8 300.5)` is
+255, `(cast i32 -1e10)` is the smallest i32.
 
 Bounds checks in loops mostly cost nothing after optimisation (LLVM proves
-them); float-to-integer checks cost the most. The teapot's CPU side is about
-4% slower with all of them on. To leave them out: `(unchecked body...)` for a
-block, `:unchecked` after a function's result type for a whole function
-(`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or `--no-checks` for the
-whole build.
+them); saturating float casts cost the most (a few instructions each). The
+teapot's CPU side is about 4% slower with all of them on. To leave them out:
+`(unchecked body...)` for a block, `:unchecked` after a function's result type
+for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
+`--no-checks` for the whole build. There, float casts are C's: a value out of
+range gives an undefined result.
 
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a

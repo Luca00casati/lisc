@@ -3425,15 +3425,12 @@ struct Compiler::Impl : MetaHost {
         if (from->is_int() && to->kind == Type::Bool) return {b.CreateICmpNE(v.v, llvm::ConstantInt::get(ll(from), 0)), to};
         if (from->is_int() && to->is_float()) return {from->sign ? b.CreateSIToFP(v.v, lt) : b.CreateUIToFP(v.v, lt), to};
         if (from->is_float() && to->is_int()) {
-            if (checking()) {  // in range (and not NaN): the ordered compares fail on NaN
-                llvm::Type *ft = ll(from);
-                double hi = std::ldexp(1.0, to->sign ? to->bits - 1 : to->bits);
-                llvm::Value *ok = b.CreateAnd(to->sign ? b.CreateFCmpOGE(v.v, llvm::ConstantFP::get(ft, -hi))
-                                                       : b.CreateFCmpOGT(v.v, llvm::ConstantFP::get(ft, -1.0)),
-                                              b.CreateFCmpOLT(v.v, llvm::ConstantFP::get(ft, hi)));
-                check(ok, at, "%g does not fit in " + type_name(to), {b.CreateFPExt(v.v, b.getDoubleTy())});
-            }
-            return {to->sign ? b.CreateFPToSI(v.v, lt) : b.CreateFPToUI(v.v, lt), to};
+            // saturating, as Rust does: out of range gives the type's minimum or
+            // maximum, NaN gives 0 (never undefined). Where checks are off it is
+            // C's plain conversion (a few instructions less; out of range is undefined).
+            if (!checking()) return {to->sign ? b.CreateFPToSI(v.v, lt) : b.CreateFPToUI(v.v, lt), to};
+            auto id = to->sign ? llvm::Intrinsic::fptosi_sat : llvm::Intrinsic::fptoui_sat;
+            return {b.CreateIntrinsic(id, {lt, ll(from)}, {v.v}), to};
         }
         if (from->is_float() && to->is_float()) return {b.CreateFPCast(v.v, lt), to};
         if (from->is_ptr() && to->is_ptr()) return {v.v, to};

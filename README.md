@@ -84,7 +84,7 @@ directory and `-I` directories, then the system ones.
 
 Types: `i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 isize usize f32 f64 f80 bool void str`
 (`f80` is C's `long double`, `i128` its `__int128`),
-`(ptr T)`, `(array T N)`, `(slice T)`, `(simd T N)`, `(fn (A B ...) R)`, `(closure (A B ...) R)`, struct/union/enum names, and every
+`(ptr T)`, `(array T N)`, `(slice T)`, `(simd T N)`, `(fn (A B ...) R)`, `(closure (A B ...) R)`, `(heap-fn (A B ...) R)`, struct/union/enum names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
 Top level:
@@ -118,6 +118,7 @@ Expressions — everything is one; statements have type `void`:
       (setting it sets the element), i its index (a u64)
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
     (fn [a T] ... R body...) — a function written where it is used; with captures a closure (see below)
+    (fn :heap [a T] ... R body...) — a heap-fn, kept until (drop f)
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
@@ -226,6 +227,32 @@ captured variables, and nothing keeps a closure from an earlier pass of a
 loop. A plain function, or a fn without captures, goes wherever a closure is
 wanted. A generic parameter `[f F]` takes either, with no indirection added
 (`sort-by` does this).
+
+To keep a function with what it captured (a struct of event handlers, a
+`vec` of callbacks, a function that makes one), write `(fn :heap ...)`: a
+**heap-fn**, typed `(heap-fn (T ...) R)`. It captures by value: its captures
+are copied into an env `malloc`'d when it is made, and are its own from then
+on (setting one changes the copy, kept between calls). It goes anywhere a
+value goes, and lives until `(drop f)` frees its env:
+
+```lisp
+(struct button [name str] [on-click (heap-fn (i32) void)])
+
+(defn make-greet [who str] [times (ptr i32)] (heap-fn (i32) void)
+  (fn :heap [x i32] void
+    (+= (deref times) 1)               ; shared state: capture a pointer to it
+    (println "hello " who " at " x)))
+
+(let [clicks 0] [ok {button :name "ok" :on-click (make-greet "ann" (addr clicks))}]
+  (ok.on-click 10)
+  (drop ok.on-click))
+```
+
+As with `malloc`, it is yours to drop once: not dropping it leaks its env,
+and calling it (or a copy of it) after the drop reads freed memory. A plain
+function goes where a heap-fn is wanted (dropping it frees nothing), and a
+heap-fn goes where a closure is wanted (to `sort-by`, say). A heap-fn can't
+capture a closure, which would outlive what that captured.
 
 A fn is compiled as a function of its own; in a generic, it sees the
 instance's types. `(fn (T) R)`, with a list where the brackets are, is

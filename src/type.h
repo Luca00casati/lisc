@@ -27,7 +27,8 @@ struct StructInfo {
     bool packed = false;       // (struct name :packed ...): no padding, alignment 1
     uint64_t min_align = 1;    // (struct name :align N ...)
     Type *slice_of = nullptr;  // (slice T): data (ptr T), len u64
-    Type *closure_of = nullptr;  // (closure (A ...) R): its (fn (A ...) R); fields fn, env
+    Type *closure_of = nullptr;  // (closure (A ...) R) / (heap-fn (A ...) R): its (fn (A ...) R); fields fn, env
+    bool heap_fn = false;        // a heap-fn: its env is malloc'd (and freed by drop)
     std::vector<Field> fields;
     uint64_t size = 0, align = 1;
     bool complete = false;
@@ -78,6 +79,8 @@ Type *t_slice(Type *elem);       // (slice T), one per element type
 // (closure (A ...) R) for a (fn (A ...) R): a function and what it captured,
 // fn (ptr (fn ((ptr void) A ...) R)) called with env (ptr void) first
 Type *t_closure(Type *fn);
+// (heap-fn (A ...) R): the same, with an env of its own on the heap, to keep
+Type *t_heap_fn(Type *fn);
 Type *t_simd(Type *elem, uint64_t n);  // (simd T N): N numbers in one vector register
 
 uint64_t size_of(const Type *t);

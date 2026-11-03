@@ -1325,24 +1325,35 @@ struct Compiler::Impl : MetaHost {
     // closure is never a result or a global).
     struct LambdaMade {
         std::string key;
-        std::vector<Val> caps;  // (empty: a plain function)
+        std::vector<Val> caps;  // (empty and not heap: a plain function)
         Type *env_t = nullptr;
+        bool heap = false;
     };
     // a fn literal compiled again in the same function (a generic call infers
     // its types from the arguments first) is the function made the first time
     std::map<std::pair<Form *, llvm::Function *>, LambdaMade> lambdas_made;
 
+    // (fn :heap [a T] ... R body...): a heap-fn, its captures copied into an env
+    // malloc'd when it is made (freed by drop)
     Val lambda(Form *f, Type *want) {
-        if (f->size() < 3) fatal(f->loc, "(fn [a T] ... R body...)");
+        bool heap = f->size() >= 2 && f->at(1)->is_sym(":heap");
+        Form *lit = f;
+        if (heap) {
+            lit = new Form(*f);
+            lit->items.erase(lit->items.begin() + 1);
+        }
+        if (lit->size() < 3) fatal(f->loc, heap ? "(fn :heap [a T] ... R body...)" : "(fn [a T] ... R body...)");
         auto made = lambdas_made.find({f, fn});
         if (made != lambdas_made.end()) {
-            Global &g = c.globals_[made->second.key];
-            if (made->second.caps.empty()) return {g.value, t_ptr(g.type)};
-            return make_closure(g, made->second.env_t, made->second.caps, f->loc);
+            LambdaMade &m = made->second;
+            Global &g = c.globals_[m.key];
+            if (m.heap) return make_heap_fn(g, m.env_t, m.caps, f->loc);
+            if (m.caps.empty()) return {g.value, t_ptr(g.type)};
+            return make_closure(g, m.env_t, m.caps, f->loc);
         }
         Form *name = mk_sym(f->loc, "fn#" + std::to_string(++lambda_count));
         std::vector<Form *> items{mk_sym(f->loc, "defn"), name};
-        items.insert(items.end(), f->items.begin() + 1, f->items.end());
+        items.insert(items.end(), lit->items.begin() + 1, lit->items.end());
         Form *def = unbracket(mk_list(f->loc, items), 2);
         if (def->size() < 4) fatal(f->loc, "(fn [a T] ... R body...): the result type is missing");
         // the captures: the locals around it its code names (not its parameters)
@@ -1367,29 +1378,33 @@ struct Compiler::Impl : MetaHost {
         std::string k = (cur ? cur->name + "::" : std::string()) + name->text;
         char at[64];
         snprintf(at, sizeof at, "(fn at %d:%d)", f->loc.line, f->loc.col);
-        if (caps.empty()) {
+        if (caps.empty() && !heap) {
             declare_fn(def, k);
             pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer});
-            lambdas_made[{f, fn}] = {k, {}, nullptr};
+            lambdas_made[{f, fn}] = {k, {}, nullptr, false};
             Global &g = c.globals_[k];
             return {g.value, t_ptr(g.type)};
         }
         if (want && want->is_ptr() && want->elem->kind == Type::Fn)
-            fatal(caps[0]->loc, "this fn uses '%s' from the code around it, so it is a closure, not a function pointer: (closure (A ...) R) holds one",
-                  caps[0]->text.c_str());
-        // the env: a struct of the captured locals' addresses, c0 c1 ...
+            fatal(heap ? f->loc : caps[0]->loc, heap ? "a (fn :heap ...) is a heap-fn, not a function pointer"
+                                                     : "this fn uses '%s' from the code around it, so it is a closure, not a function pointer: (closure (A ...) R) holds one",
+                  caps.empty() ? "" : caps[0]->text.c_str());
+        // the env, c0 c1 ...: a closure's holds the captured locals' addresses, a heap-fn's copies of their values
         auto *st = new StructInfo;
         st->name = "(captures of " + std::string(at) + ")";
         std::vector<Val> vals;
         for (size_t i = 0; i < caps.size(); i++) {
             Val a = lookup_local(key(caps[i]));
-            if (a.bwidth) fatal(caps[i]->loc, "a fn can't capture '%s', a bit field", caps[i]->text.c_str());
+            if (a.bwidth && !heap) fatal(caps[i]->loc, "a fn can't capture '%s', a bit field", caps[i]->text.c_str());
+            if (heap && is_closure(a.t))
+                fatal(caps[i]->loc, "a heap-fn can't capture '%s', a closure (it would outlive what that captured)", caps[i]->text.c_str());
             vals.push_back(a);
-            st->fields.push_back({"c" + std::to_string(i), t_ptr(a.t), 0});
+            st->fields.push_back({"c" + std::to_string(i), heap ? a.t : t_ptr(a.t), 0});
         }
         layout_struct(st);
         Type *env_t = t_struct(st);
-        // (defn fn#N [#env (ptr ENV)] [a T] ... R (%captures [x (deref (. #env c0))] ... body...))
+        // (defn fn#N [#env (ptr ENV)] [a T] ... R (%captures [x (deref (. #env c0))] ... body...)),
+        // for a heap-fn [x (. #env c0)]
         Form *env = hidden(f->loc, "env"), *env_type = mk_sym(f->loc, "#env-type");
         env_type->type = t_ptr(env_t);
         std::vector<Form *> ps{mk_list(f->loc, {env, env_type})};
@@ -1400,17 +1415,19 @@ struct Compiler::Impl : MetaHost {
         std::vector<Form *> capf{mk_sym(f->loc, "%captures")};
         for (size_t i = 0; i < caps.size(); i++) {
             Form *fd = mk_list(f->loc, {mk_sym(f->loc, "."), env, mk_sym(f->loc, "c" + std::to_string(i))});
-            Form *bd = mk_list(caps[i]->loc, {caps[i], mk_list(f->loc, {mk_sym(f->loc, "deref"), fd})});
+            Form *bd = mk_list(caps[i]->loc, {caps[i], heap ? fd : mk_list(f->loc, {mk_sym(f->loc, "deref"), fd})});
             bd->bracket = true;
             capf.push_back(bd);
         }
+        if (caps.empty()) capf.push_back(mk_list(f->loc, {}));  // ([] alone: no bindings)
         capf.insert(capf.end(), def->items.begin() + bs, def->items.end());
         items2.push_back(mk_list(f->loc, capf));
         Form *def2 = new Form(*def);
         def2->items = items2;
         declare_fn(def2, k);
         pending_fns.push_back({def2, k, at, cur, tbind, f->loc, outer});
-        lambdas_made[{f, fn}] = {k, vals, env_t};
+        lambdas_made[{f, fn}] = {k, vals, env_t, heap};
+        if (heap) return make_heap_fn(c.globals_[k], env_t, vals, f->loc);
         return make_closure(c.globals_[k], env_t, vals, f->loc);
     }
 
@@ -1418,11 +1435,39 @@ struct Compiler::Impl : MetaHost {
     Val make_closure(Global &g, Type *env_t, const std::vector<Val> &caps, Loc at) {
         Val e{alloca_(env_t, "env"), env_t};
         for (size_t i = 0; i < caps.size(); i++) store(field_addr(e, mk_sym(at, "c" + std::to_string(i))), caps[i].v);
+        return callable_val(g, e.v, false);
+    }
+
+    // a heap-fn of function g: its env, malloc'd, holds copies of the captures' values (none: no env)
+    Val make_heap_fn(Global &g, Type *env_t, const std::vector<Val> &caps, Loc at) {
+        llvm::Value *env = llvm::ConstantPointerNull::get(b.getPtrTy());
+        if (!caps.empty()) {
+            llvm::FunctionCallee malloc_ = mod.getOrInsertFunction("malloc", b.getPtrTy(), b.getInt64Ty());
+            env = b.CreateCall(malloc_, {b.getInt64(size_of(env_t))}, "env");
+            for (size_t i = 0; i < caps.size(); i++) store(field_addr({env, env_t}, mk_sym(at, "c" + std::to_string(i))), load(caps[i]));
+        }
+        return callable_val(g, env, true);
+    }
+
+    Val callable_val(Global &g, llvm::Value *env, bool heap) {
         std::vector<Type *> user_ps(g.type->params.begin() + 1, g.type->params.end());
-        Type *ct = t_closure(t_fn(g.type->elem, user_ps, false));
+        Type *ft = t_fn(g.type->elem, user_ps, false);
+        Type *ct = heap ? t_heap_fn(ft) : t_closure(ft);
         llvm::Value *cv = llvm::UndefValue::get(ll(ct));
         cv = b.CreateInsertValue(cv, g.value, 0);
-        return {b.CreateInsertValue(cv, e.v, 1), ct};
+        return {b.CreateInsertValue(cv, env, 1), ct};
+    }
+
+    // (drop f): frees a heap-fn's env (a plain function made into one has none to free)
+    Val drop(Form *f) {
+        if (f->size() != 2) fatal(f->loc, "(drop f)");
+        Val v = expr(f->at(1), nullptr);
+        if (v.t->kind != Type::Struct || !v.t->st->heap_fn) fatal(f->at(1)->loc, "drop frees a heap-fn's env, not %s", type_name(v.t).c_str());
+        llvm::Value *fnp = b.CreateExtractValue(v.v, 0), *env = b.CreateExtractValue(v.v, 1);
+        llvm::Value *own = b.CreateICmpNE(fnp, trampoline(v.t->st->closure_of, f->loc));
+        llvm::FunctionCallee free_ = mod.getOrInsertFunction("free", b.getVoidTy(), b.getPtrTy());
+        b.CreateCall(free_, {b.CreateSelect(own, env, llvm::ConstantPointerNull::get(b.getPtrTy()))});
+        return {nullptr, t_void()};
     }
 
     // a plain function used as a closure: its env is the function itself, and
@@ -1591,7 +1636,7 @@ struct Compiler::Impl : MetaHost {
             if (std::find(g.params.begin(), g.params.end(), pat->text) == g.params.end()) return;
             auto it = b.find(pat->text);
             if (it == b.end()) b[pat->text] = t;
-            else if (it->second != t)
+            else if (it->second != t && !fn_to_callable(t, it->second))
                 fatal(arg->loc, "%s is %s here but %s in an earlier argument", pat->text.c_str(), type_name(t).c_str(), type_name(it->second).c_str());
             return;
         }
@@ -1599,7 +1644,8 @@ struct Compiler::Impl : MetaHost {
         if ((pat->is_call("ptr") && t->is_ptr()) || (pat->is_call("array") && t->kind == Type::Array)) return match(g, pat->at(1), t->elem, b, arg);
         if (t->kind != Type::Struct) return;
         if (pat->is_call("slice") && t->st->slice_of) return match(g, pat->at(1), t->st->slice_of, b, arg);
-        if (pat->is_call("closure") && pat->size() == 3 && pat->at(1)->is_list() && t->st->closure_of) {
+        if ((pat->is_call("closure") || pat->is_call("heap-fn")) && pat->size() == 3 && pat->at(1)->is_list() && t->st->closure_of &&
+            t->st->heap_fn == pat->is_call("heap-fn")) {
             Type *ft = t->st->closure_of;
             for (size_t i = 0; i < pat->at(1)->size() && i < ft->params.size(); i++) match(g, pat->at(1)->at(i), ft->params[i], b, arg);
             return match(g, pat->at(2), ft->elem, b, arg);
@@ -1714,10 +1760,11 @@ struct Compiler::Impl : MetaHost {
             if (!len || (len & (len - 1)) || len * size_of(e) > 64) fatal(f->at(2)->loc, "a simd's length is a power of two, up to 64 bytes in all");
             return t_simd(e, len);
         }
-        if (f->is_call("closure") && f->size() == 3 && f->at(1)->is_list()) {
+        if ((f->is_call("closure") || f->is_call("heap-fn")) && f->size() == 3 && f->at(1)->is_list()) {
             std::vector<Type *> ps;
             for (Form *p : f->at(1)->items) ps.push_back(parse_type(p));
-            return t_closure(t_fn(parse_type(f->at(2)), ps, false));
+            Type *ft = t_fn(parse_type(f->at(2)), ps, false);
+            return f->is_call("heap-fn") ? t_heap_fn(ft) : t_closure(ft);
         }
         if (f->is_call("fn") && f->size() == 3 && f->at(1)->is_list()) {
             std::vector<Type *> ps;
@@ -1740,12 +1787,17 @@ struct Compiler::Impl : MetaHost {
 
     /* ------------------------------------------------------- helpers --- */
 
+    // a plain function where a closure or heap-fn of its signature goes (it converts)
+    static bool fn_to_callable(const Type *from, const Type *to) {
+        return from->is_ptr() && to->kind == Type::Struct && to->st->closure_of && from->elem == to->st->closure_of;
+    }
+
     // A closure only goes down: a parameter, or a local it can't be set again.
     // So nothing outlives the frame its captures live in, or keeps one made
     // in an earlier pass of a loop (whose env the next pass reuses).
     static bool is_closure(const Type *t) {
         while (t->kind == Type::Array) t = t->elem;
-        return t->kind == Type::Struct && t->st->closure_of;
+        return t->kind == Type::Struct && t->st->closure_of && !t->st->heap_fn;
     }
     void no_closure(Type *t, Loc at, const char *what) {
         if (is_closure(t))
@@ -1884,8 +1936,11 @@ struct Compiler::Impl : MetaHost {
 
     Val coerce(Val v, Type *to, Loc at, const char *what) {
         if (v.t == to) return v;
+        if (to->kind == Type::Struct && to->st->closure_of && !to->st->heap_fn && v.t->kind == Type::Struct && v.t->st->heap_fn &&
+            v.t->st->closure_of == to->st->closure_of)
+            return {v.v, to};  // a heap-fn passed down as a closure (the same two pointers)
         if (to->kind == Type::Struct && to->st->closure_of && v.t->is_ptr() && v.t->elem == to->st->closure_of) {
-            // a plain function as a closure: a trampoline per signature calls the env as the function
+            // a plain function as a closure or heap-fn: a trampoline per signature calls the env as the function
             llvm::Value *c = llvm::UndefValue::get(ll(to));
             c = b.CreateInsertValue(c, trampoline(to->st->closure_of, at), 0);
             return {b.CreateInsertValue(c, v.v, 1), to};
@@ -2265,7 +2320,8 @@ struct Compiler::Impl : MetaHost {
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
         if (hs == "%captures") return alias(f, want, false);
-        if (hs == "fn" && f->size() >= 2 && f->at(1)->bracket) return lambda(f, want);
+        if (hs == "fn" && f->size() >= 2 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return lambda(f, want);
+        if (hs == "drop" && !lookup_global(f->at(0))) return drop(f);
         if (hs == "match") return match_(f, want);
         if ((hs == "print" || hs == "println") && !lookup_global(f->at(0))) return print(f, hs == "println");
         if (hs == "break" || hs == "continue") return jump(f, hs == "break");
@@ -2545,8 +2601,8 @@ struct Compiler::Impl : MetaHost {
         if (pat->is_call("ptr")) return t->is_ptr() && fits(g, pat->at(1), t->elem, b);
         if (pat->is_call("array")) return t->kind == Type::Array && fits(g, pat->at(1), t->elem, b);
         if (pat->is_call("slice")) return t->kind == Type::Struct && t->st->slice_of && fits(g, pat->at(1), t->st->slice_of, b);
-        if (pat->is_call("closure") && pat->size() == 3 && pat->at(1)->is_list()) {
-            Type *ft = t->kind == Type::Struct ? t->st->closure_of : nullptr;
+        if ((pat->is_call("closure") || pat->is_call("heap-fn")) && pat->size() == 3 && pat->at(1)->is_list()) {
+            Type *ft = t->kind == Type::Struct && t->st->heap_fn == pat->is_call("heap-fn") ? t->st->closure_of : nullptr;
             if (!ft || ft->params.size() != pat->at(1)->size()) return false;
             for (size_t i = 0; i < ft->params.size(); i++)
                 if (!fits(g, pat->at(1)->at(i), ft->params[i], b)) return false;
@@ -2882,7 +2938,7 @@ struct Compiler::Impl : MetaHost {
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
         if (f->is_list() && f->size() >= 2 && !generic_key(f->at(0), generic_structs).empty()) return true;
-        if (f->is_call("fn") && f->size() > 1 && f->at(1)->bracket) return false;  // (fn [a T] R ...): a function, not a type
+        if (f->is_call("fn") && f->size() > 1 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return false;  // (fn [a T] R ...): a function, not a type
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice") || f->is_call("simd");
     }
 
@@ -3417,7 +3473,7 @@ struct Compiler::Impl : MetaHost {
         if (g && g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
         if (!ft) {
             callee = expr(head, nullptr);
-            if (callee.t->kind == Type::Struct && callee.t->st->closure_of) {  // (fn env args...)
+            if (callee.t->kind == Type::Struct && callee.t->st->closure_of) {  // (fn env args...), a closure or heap-fn
                 Type *cf = callee.t->st->closure_of;
                 size_t n = f->size() - 1;
                 if (n != cf->params.size())

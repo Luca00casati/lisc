@@ -87,15 +87,17 @@ Type *t_slice(Type *elem) {
     return t;
 }
 
-Type *t_closure(Type *fn) {
-    static std::map<Type *, Type *> m;
-    Type *&t = m[fn];
+namespace {
+Type *callable(Type *fn, bool heap) {
+    static std::map<std::pair<Type *, bool>, Type *> m;
+    Type *&t = m[{fn, heap}];
     if (!t) {
         auto *st = new StructInfo;
         std::string ps;
         for (Type *p : fn->params) ps += (ps.empty() ? "" : " ") + type_name(p);
-        st->name = "(closure (" + ps + ") " + type_name(fn->elem) + ")";
+        st->name = std::string(heap ? "(heap-fn (" : "(closure (") + ps + ") " + type_name(fn->elem) + ")";
         st->closure_of = fn;
+        st->heap_fn = heap;
         std::vector<Type *> with_env{t_ptr(t_void())};
         with_env.insert(with_env.end(), fn->params.begin(), fn->params.end());
         st->fields = {{"fn", t_ptr(t_fn(fn->elem, with_env, false)), 0}, {"env", t_ptr(t_void()), 8}};
@@ -106,6 +108,10 @@ Type *t_closure(Type *fn) {
     }
     return t;
 }
+}  // namespace
+
+Type *t_closure(Type *fn) { return callable(fn, false); }
+Type *t_heap_fn(Type *fn) { return callable(fn, true); }
 
 uint64_t size_of(const Type *t) {
     switch (t->kind) {

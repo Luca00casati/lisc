@@ -1,3 +1,4 @@
-; error: a fn can't use 'k', a local of the code around it (it has no captures)
+; error: this fn uses 'k' from the code around it, so it is a closure, not a function pointer
+(defn apply [f (ptr (fn (i32) i32))] [x i32] i32 (f x))
 (defn main [] i32
-  (let [k 3] [f (fn [x i32] i32 (+ x k))] (f 1)))
+  (let [k 3] (apply (fn [x i32] i32 (+ x k)) 1)))

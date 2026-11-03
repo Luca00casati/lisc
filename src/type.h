@@ -27,6 +27,7 @@ struct StructInfo {
     bool packed = false;       // (struct name :packed ...): no padding, alignment 1
     uint64_t min_align = 1;    // (struct name :align N ...)
     Type *slice_of = nullptr;  // (slice T): data (ptr T), len u64
+    Type *closure_of = nullptr;  // (closure (A ...) R): its (fn (A ...) R); fields fn, env
     std::vector<Field> fields;
     uint64_t size = 0, align = 1;
     bool complete = false;
@@ -74,6 +75,9 @@ Type *t_fn(Type *ret, const std::vector<Type *> &params, bool variadic);
 Type *t_struct(StructInfo *st);  // one Type per StructInfo
 Type *t_enum(EnumInfo *en, Type *base);  // a new integer type, distinct from base
 Type *t_slice(Type *elem);       // (slice T), one per element type
+// (closure (A ...) R) for a (fn (A ...) R): a function and what it captured,
+// fn (ptr (fn ((ptr void) A ...) R)) called with env (ptr void) first
+Type *t_closure(Type *fn);
 Type *t_simd(Type *elem, uint64_t n);  // (simd T N): N numbers in one vector register
 
 uint64_t size_of(const Type *t);

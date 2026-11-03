@@ -84,7 +84,7 @@ directory and `-I` directories, then the system ones.
 
 Types: `i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 isize usize f32 f64 f80 bool void str`
 (`f80` is C's `long double`, `i128` its `__int128`),
-`(ptr T)`, `(array T N)`, `(slice T)`, `(simd T N)`, `(fn (A B ...) R)`, struct/union/enum names, and every
+`(ptr T)`, `(array T N)`, `(slice T)`, `(simd T N)`, `(fn (A B ...) R)`, `(closure (A B ...) R)`, struct/union/enum names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
 Top level:
@@ -117,7 +117,7 @@ Expressions — everything is one; statements have type `void`:
       or a struct with data and len (a (vec T)), also through a pointer; x is the element itself
       (setting it sets the element), i its index (a u64)
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
-    (fn [a T] ... R body...) — a function written where it is used (see below)
+    (fn [a T] ... R body...) — a function written where it is used; with captures a closure (see below)
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
@@ -196,18 +196,38 @@ Typing rules:
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
-Functions can be written where they are used: `(fn [a T] ... R body...)` is
-a function pointer, typed `(ptr (fn (T ...) R))`:
+Functions can be written where they are used: `(fn [a T] ... R body...)`.
+One that uses only its parameters, globals and other functions is a function
+pointer, typed `(ptr (fn (T ...) R))`, and can go to C:
 
 ```lisp
 (sort-by (slice-of xs) (fn [a i32] [b i32] bool (> a b)))   ; descending
 (let [inc (fn [x i32] i32 (+ x 1))] (inc 41))
 ```
 
-It is compiled as a function of its own: it sees globals and other functions
-(and, in a generic, the instance's types), but not the locals around it, so
-those are passed as arguments (an error says so when one is used). `(fn (T) R)`,
-with a list where the brackets are, is still the type.
+One that uses locals around it is a **closure**, typed `(closure (T ...) R)`.
+It captures them by reference: it reads and sets the variables themselves.
+
+```lisp
+(defn (each T) [xs (slice T)] [f (closure (T) void)] void
+  (for [x :in xs] (f x)))
+
+(let [total 0] [k 3]
+  (each (slice-of a) (fn [x i32] void (+= total (* x k))))
+  total)
+```
+
+A closure is two pointers: the function and its env (where the captures
+are). The env is in the frame of the function that made the closure, so a
+closure is good while that function runs: it can be passed down, held in
+locals and struct fields, but not returned or kept in a global (both are
+errors). A closure made again (in a loop) reuses its env. A plain function,
+or a fn without captures, goes wherever a closure is wanted. A generic
+parameter `[f F]` takes either, with no indirection added (`sort-by` does this).
+
+A fn is compiled as a function of its own; in a generic, it sees the
+instance's types. `(fn (T) R)`, with a list where the brackets are, is
+still the type.
 
 ## Variants
 
@@ -399,7 +419,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
 | `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
-| `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a `(ptr (fn (T T) bool))` |
+| `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a function or closure `(T T) → bool` |
 | `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
 | `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each! (k v m) ...)`; keys by value, strs by contents, structs by bytes |
 

@@ -87,6 +87,26 @@ Type *t_slice(Type *elem) {
     return t;
 }
 
+Type *t_closure(Type *fn) {
+    static std::map<Type *, Type *> m;
+    Type *&t = m[fn];
+    if (!t) {
+        auto *st = new StructInfo;
+        std::string ps;
+        for (Type *p : fn->params) ps += (ps.empty() ? "" : " ") + type_name(p);
+        st->name = "(closure (" + ps + ") " + type_name(fn->elem) + ")";
+        st->closure_of = fn;
+        std::vector<Type *> with_env{t_ptr(t_void())};
+        with_env.insert(with_env.end(), fn->params.begin(), fn->params.end());
+        st->fields = {{"fn", t_ptr(t_fn(fn->elem, with_env, false)), 0}, {"env", t_ptr(t_void()), 8}};
+        st->size = 16;
+        st->align = 8;
+        st->complete = true;
+        t = t_struct(st);
+    }
+    return t;
+}
+
 uint64_t size_of(const Type *t) {
     switch (t->kind) {
     case Type::Void: return 1;

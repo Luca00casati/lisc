@@ -265,6 +265,10 @@ Form *Meta::type_form(Type *t, Loc at) {
     }
     case Type::Struct:
         if (t->st->slice_of) return mk_list(at, {mk_sym(at, "slice"), type_form(t->st->slice_of, at)});
+        if (Type *f = t->st->closure_of) {
+            Form *fn = type_form(f, at);
+            return mk_list(at, {mk_sym(at, "closure"), fn->at(1), fn->at(2)});
+        }
         break;
     default: break;
     }

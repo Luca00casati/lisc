@@ -1317,27 +1317,140 @@ struct Compiler::Impl : MetaHost {
     const std::set<std::string> *lambda_outer = nullptr;  // while compiling a fn's body
     int lambda_count = 0;
 
-    // (fn [a T] ... R body...): a function written where it is used, as a
-    // function pointer. It is compiled on its own: it sees globals, not the
-    // locals around it (no captures).
-    Val lambda(Form *f) {
+    // (fn [a T] ... R body...): a function written where it is used. It is
+    // compiled on its own; the locals around it that it uses are its captures,
+    // reached by reference through an env (their addresses) made with it.
+    // Without captures it is a plain function pointer; with them a
+    // (closure (A ...) R), good while the function that made it runs (so a
+    // closure is never a result or a global).
+    struct LambdaMade {
+        std::string key;
+        std::vector<Val> caps;  // (empty: a plain function)
+        Type *env_t = nullptr;
+    };
+    // a fn literal compiled again in the same function (a generic call infers
+    // its types from the arguments first) is the function made the first time
+    std::map<std::pair<Form *, llvm::Function *>, LambdaMade> lambdas_made;
+
+    Val lambda(Form *f, Type *want) {
         if (f->size() < 3) fatal(f->loc, "(fn [a T] ... R body...)");
+        auto made = lambdas_made.find({f, fn});
+        if (made != lambdas_made.end()) {
+            Global &g = c.globals_[made->second.key];
+            if (made->second.caps.empty()) return {g.value, t_ptr(g.type)};
+            return make_closure(g, made->second.env_t, made->second.caps, f->loc);
+        }
         Form *name = mk_sym(f->loc, "fn#" + std::to_string(++lambda_count));
         std::vector<Form *> items{mk_sym(f->loc, "defn"), name};
         items.insert(items.end(), f->items.begin() + 1, f->items.end());
         Form *def = unbracket(mk_list(f->loc, items), 2);
         if (def->size() < 4) fatal(f->loc, "(fn [a T] ... R body...): the result type is missing");
-        std::string k = (cur ? cur->name + "::" : std::string()) + name->text;
-        declare_fn(def, k);
-        std::set<std::string> outer;
+        // the captures: the locals around it its code names (not its parameters)
+        std::set<std::string> outer, params;
         for (auto &s : scopes)
             for (auto &v : s.vars) outer.insert(v.first);
+        for (Form *p : def->at(2)->items)
+            if (p->is_list() && p->size() && p->at(0)->kind == Form::Sym) params.insert(key(p->at(0)));
+        std::vector<Form *> caps;  // one symbol per capture, in order of appearance
+        std::set<std::string> seen;
+        std::function<void(Form *)> scan = [&](Form *x) {
+            if (x->kind == Form::Sym && !x->text.empty() && x->text[0] != '.') {
+                Form s = *x;
+                s.text = s.text.substr(0, s.text.find('.'));  // p.x names p
+                std::string k = key(&s);
+                if (outer.count(k) && !params.count(k) && seen.insert(k).second) caps.push_back(new Form(s));
+            }
+            if (x->is_list() && !x->is_call("quote"))
+                for (Form *y : x->items) scan(y);
+        };
+        for (size_t i = 3; i < def->size(); i++) scan(def->at(i));
+        std::string k = (cur ? cur->name + "::" : std::string()) + name->text;
         char at[64];
         snprintf(at, sizeof at, "(fn at %d:%d)", f->loc.line, f->loc.col);
-        pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer});
-        Global &g = c.globals_[k];
-        return {g.value, t_ptr(g.type)};
+        if (caps.empty()) {
+            declare_fn(def, k);
+            pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer});
+            lambdas_made[{f, fn}] = {k, {}, nullptr};
+            Global &g = c.globals_[k];
+            return {g.value, t_ptr(g.type)};
+        }
+        if (want && want->is_ptr() && want->elem->kind == Type::Fn)
+            fatal(caps[0]->loc, "this fn uses '%s' from the code around it, so it is a closure, not a function pointer: (closure (A ...) R) holds one",
+                  caps[0]->text.c_str());
+        // the env: a struct of the captured locals' addresses, c0 c1 ...
+        auto *st = new StructInfo;
+        st->name = "(captures of " + std::string(at) + ")";
+        std::vector<Val> vals;
+        for (size_t i = 0; i < caps.size(); i++) {
+            Val a = lookup_local(key(caps[i]));
+            if (a.bwidth) fatal(caps[i]->loc, "a fn can't capture '%s', a bit field", caps[i]->text.c_str());
+            vals.push_back(a);
+            st->fields.push_back({"c" + std::to_string(i), t_ptr(a.t), 0});
+        }
+        layout_struct(st);
+        Type *env_t = t_struct(st);
+        // (defn fn#N [#env (ptr ENV)] [a T] ... R (%captures [x (deref (. #env c0))] ... body...))
+        Form *env = hidden(f->loc, "env"), *env_type = mk_sym(f->loc, "#env-type");
+        env_type->type = t_ptr(env_t);
+        std::vector<Form *> ps{mk_list(f->loc, {env, env_type})};
+        ps.insert(ps.end(), def->at(2)->items.begin(), def->at(2)->items.end());
+        size_t bs = body_start(def);
+        std::vector<Form *> items2(def->items.begin(), def->items.begin() + bs);
+        items2[2] = mk_list(def->at(2)->loc, ps);
+        std::vector<Form *> capf{mk_sym(f->loc, "%captures")};
+        for (size_t i = 0; i < caps.size(); i++) {
+            Form *fd = mk_list(f->loc, {mk_sym(f->loc, "."), env, mk_sym(f->loc, "c" + std::to_string(i))});
+            Form *bd = mk_list(caps[i]->loc, {caps[i], mk_list(f->loc, {mk_sym(f->loc, "deref"), fd})});
+            bd->bracket = true;
+            capf.push_back(bd);
+        }
+        capf.insert(capf.end(), def->items.begin() + bs, def->items.end());
+        items2.push_back(mk_list(f->loc, capf));
+        Form *def2 = new Form(*def);
+        def2->items = items2;
+        declare_fn(def2, k);
+        pending_fns.push_back({def2, k, at, cur, tbind, f->loc, outer});
+        lambdas_made[{f, fn}] = {k, vals, env_t};
+        return make_closure(c.globals_[k], env_t, vals, f->loc);
     }
+
+    // a closure of function g: its env (in this function's frame) holds where the captures are
+    Val make_closure(Global &g, Type *env_t, const std::vector<Val> &caps, Loc at) {
+        Val e{alloca_(env_t, "env"), env_t};
+        for (size_t i = 0; i < caps.size(); i++) store(field_addr(e, mk_sym(at, "c" + std::to_string(i))), caps[i].v);
+        std::vector<Type *> user_ps(g.type->params.begin() + 1, g.type->params.end());
+        Type *ct = t_closure(t_fn(g.type->elem, user_ps, false));
+        llvm::Value *cv = llvm::UndefValue::get(ll(ct));
+        cv = b.CreateInsertValue(cv, g.value, 0);
+        return {b.CreateInsertValue(cv, e.v, 1), ct};
+    }
+
+    // a plain function used as a closure: its env is the function itself, and
+    // this (one per signature) calls it, dropping the env
+    std::map<Type *, llvm::Value *> trampolines;
+    llvm::Value *trampoline(Type *ft, Loc at) {
+        llvm::Value *&t = trampolines[ft];
+        if (t) return t;
+        auto ty = [&](Type *x) {
+            Form *s = mk_sym(at, "#type");
+            s->type = x;
+            return s;
+        };
+        std::string k = "lisc.closure#" + std::to_string(trampolines.size());
+        Form *e = hidden(at, "fn");
+        std::vector<Form *> ps{mk_list(at, {e, ty(t_ptr(t_void()))})};
+        std::vector<Form *> call{mk_list(at, {mk_sym(at, "cast"), ty(t_ptr(ft)), e})};
+        for (Type *p : ft->params) {
+            Form *a = hidden(at, "a");
+            ps.push_back(mk_list(at, {a, ty(p)}));
+            call.push_back(a);
+        }
+        Form *def = mk_list(at, {mk_sym(at, "defn"), mk_sym(at, k), mk_list(at, ps), ty(ft->elem), mk_list(at, call)});
+        declare_fn(def, k);
+        pending_fns.push_back({def, k, "(a function as a closure)", cur, {}, at, {}});
+        return t = c.globals_[k].value;
+    }
+
     std::vector<PendingFn> pending_fns;  // instances declared, bodies to compile
     std::map<std::string, std::vector<Generic *>> generic_ops;  // operator → its generic defops
     std::vector<std::pair<std::string, std::string>> generic_op_keys;
@@ -1486,6 +1599,11 @@ struct Compiler::Impl : MetaHost {
         if ((pat->is_call("ptr") && t->is_ptr()) || (pat->is_call("array") && t->kind == Type::Array)) return match(g, pat->at(1), t->elem, b, arg);
         if (t->kind != Type::Struct) return;
         if (pat->is_call("slice") && t->st->slice_of) return match(g, pat->at(1), t->st->slice_of, b, arg);
+        if (pat->is_call("closure") && pat->size() == 3 && pat->at(1)->is_list() && t->st->closure_of) {
+            Type *ft = t->st->closure_of;
+            for (size_t i = 0; i < pat->at(1)->size() && i < ft->params.size(); i++) match(g, pat->at(1)->at(i), ft->params[i], b, arg);
+            return match(g, pat->at(2), ft->elem, b, arg);
+        }
         std::string gk = generic_key(pat->at(0), generic_structs);
         auto inst = instance_of.find(t->st);
         if (gk.empty() || inst == instance_of.end() || inst->second.first != &generic_structs[gk]) return;
@@ -1585,6 +1703,11 @@ struct Compiler::Impl : MetaHost {
             if (!e->is_num() || e->en) fatal(f->at(1)->loc, "a simd holds integers or floats, not %s", type_name(e).c_str());
             if (!len || (len & (len - 1)) || len * size_of(e) > 64) fatal(f->at(2)->loc, "a simd's length is a power of two, up to 64 bytes in all");
             return t_simd(e, len);
+        }
+        if (f->is_call("closure") && f->size() == 3 && f->at(1)->is_list()) {
+            std::vector<Type *> ps;
+            for (Form *p : f->at(1)->items) ps.push_back(parse_type(p));
+            return t_closure(t_fn(parse_type(f->at(2)), ps, false));
         }
         if (f->is_call("fn") && f->size() == 3 && f->at(1)->is_list()) {
             std::vector<Type *> ps;
@@ -1739,6 +1862,12 @@ struct Compiler::Impl : MetaHost {
 
     Val coerce(Val v, Type *to, Loc at, const char *what) {
         if (v.t == to) return v;
+        if (to->kind == Type::Struct && to->st->closure_of && v.t->is_ptr() && v.t->elem == to->st->closure_of) {
+            // a plain function as a closure: a trampoline per signature calls the env as the function
+            llvm::Value *c = llvm::UndefValue::get(ll(to));
+            c = b.CreateInsertValue(c, trampoline(to->st->closure_of, at), 0);
+            return {b.CreateInsertValue(c, v.v, 1), to};
+        }
         if (v.t->is_ptr() && to->is_ptr() && (v.t->elem == t_void() || to->elem == t_void())) return {v.v, to};
         if (widens(v.t, to) || (v.t->is_float() && to->is_float() && to->bits > v.t->bits)) return cast(v, to, at);
         if (v.t == t_str() && to->is_ptr()) fatal(at, "%s: a str is not a C string (no terminator): use a c\"...\" literal, or s.data with a terminator you add", what);
@@ -2065,7 +2194,7 @@ struct Compiler::Impl : MetaHost {
         Global *g = lookup_global(f);
         if (!g) g = generic_value(f, want);
         if (!g && lambda_outer && lambda_outer->count(key(f)))
-            fatal(f->loc, "a fn can't use '%s', a local of the code around it (it has no captures): pass it as an argument", n.c_str());
+            fatal(f->loc, "a fn can't use '%s' here, a local of the code around it", n.c_str());
         if (!g) fatal(f->loc, at_top_typeof ? "unknown name '%s' (type-of in a top-level macro knows types and C declarations, not the program's functions, globals and constants: they are declared after)" : "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
@@ -2113,7 +2242,8 @@ struct Compiler::Impl : MetaHost {
         if (hs == "while") return while_(f);
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
-        if (hs == "fn" && f->size() >= 2 && f->at(1)->bracket) return lambda(f);
+        if (hs == "%captures") return alias(f, want, false);
+        if (hs == "fn" && f->size() >= 2 && f->at(1)->bracket) return lambda(f, want);
         if (hs == "match") return match_(f, want);
         if ((hs == "print" || hs == "println") && !lookup_global(f->at(0))) return print(f, hs == "println");
         if (hs == "break" || hs == "continue") return jump(f, hs == "break");
@@ -2392,6 +2522,13 @@ struct Compiler::Impl : MetaHost {
         if (pat->is_call("ptr")) return t->is_ptr() && fits(g, pat->at(1), t->elem, b);
         if (pat->is_call("array")) return t->kind == Type::Array && fits(g, pat->at(1), t->elem, b);
         if (pat->is_call("slice")) return t->kind == Type::Struct && t->st->slice_of && fits(g, pat->at(1), t->st->slice_of, b);
+        if (pat->is_call("closure") && pat->size() == 3 && pat->at(1)->is_list()) {
+            Type *ft = t->kind == Type::Struct ? t->st->closure_of : nullptr;
+            if (!ft || ft->params.size() != pat->at(1)->size()) return false;
+            for (size_t i = 0; i < ft->params.size(); i++)
+                if (!fits(g, pat->at(1)->at(i), ft->params[i], b)) return false;
+            return fits(g, pat->at(2), ft->elem, b);
+        }
         std::string gk = generic_key(pat->at(0), generic_structs);
         if (gk.empty()) return true;
         auto inst = t->kind == Type::Struct ? instance_of.find(t->st) : instance_of.end();
@@ -3036,14 +3173,15 @@ struct Compiler::Impl : MetaHost {
     }
 
     // (%alias [name place] ... body...): names for places (for :in and match bind them)
-    Val alias(Form *f, Type *want) {
+    // (%captures ...): a fn literal's captures (not warned about when unused)
+    Val alias(Form *f, Type *want, bool warn = true) {
         f = unbracket(f, 1);
         scopes.emplace_back();
         for (Form *bd : f->at(1)->items) {
             Val a = place(bd->at(1));
             if (bd->at(0)->is_sym("_")) continue;
             scopes.back()[key(bd->at(0))] = a;
-            scopes.back().declared.push_back(bd->at(0));
+            if (warn) scopes.back().declared.push_back(bd->at(0));
         }
         Val r = body(f, 2, want);
         end_scope();
@@ -3254,6 +3392,19 @@ struct Compiler::Impl : MetaHost {
         if (g && g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
         if (!ft) {
             callee = expr(head, nullptr);
+            if (callee.t->kind == Type::Struct && callee.t->st->closure_of) {  // (fn env args...)
+                Type *cf = callee.t->st->closure_of;
+                size_t n = f->size() - 1;
+                if (n != cf->params.size())
+                    fatal(f->loc, "%s takes %zu argument%s, got %zu", show(head).c_str(), cf->params.size(), cf->params.size() == 1 ? "" : "s", n);
+                std::vector<Type *> ps{t_ptr(t_void())};
+                std::vector<Val> args{{b.CreateExtractValue(callee.v, 1), t_ptr(t_void())}};
+                for (size_t i = 0; i < n; i++) {
+                    ps.push_back(cf->params[i]);
+                    args.push_back(value_for(f->at(i + 1), cf->params[i], "argument"));
+                }
+                return emit_call(b.CreateExtractValue(callee.v, 0), t_fn(cf->elem, ps, false), args, {});
+            }
             if (!callee.t->is_ptr() || callee.t->elem->kind != Type::Fn) fatal(head->loc, "%s is not a function", show(head).c_str());
             ft = callee.t->elem;
         }
@@ -3642,6 +3793,8 @@ struct Compiler::Impl : MetaHost {
     void def_global(Form *f) {
         if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(def name T [init])");
         Type *t = parse_type(f->at(2));
+        if (t->kind == Type::Struct && t->st->closure_of)
+            fatal(f->at(2)->loc, "a closure can't be a global: what it captured lives in the frame of the function that made it");
         llvm::Constant *init = llvm::Constant::getNullValue(ll(t));  // zero unless given (or undefined)
         if (f->size() == 4) init = f->at(3)->is_sym("undefined") ? llvm::UndefValue::get(ll(t)) : constant(f->at(3), t);
         auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, def_key(f->at(1)));
@@ -3733,6 +3886,8 @@ struct Compiler::Impl : MetaHost {
             ps.push_back(parse_type(p->at(1)));
         }
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
+        if (ft->elem->kind == Type::Struct && ft->elem->st->closure_of)
+            fatal(f->at(3)->loc, "a closure can't be returned: what it captured lives in the frame of the function that made it");
         // the program's main (in the first module) is the C entry point; everything else is internal
         bool entry = ikey.empty() && f->at(1)->text == "main" && cur == root;
         std::string name = entry ? "main" : !ikey.empty() ? ikey : def_key(f->at(1));

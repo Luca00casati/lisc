@@ -40,3 +40,7 @@ typedef struct { long double x; int n; } ldn;      // X87 inside: memory
 w1 w1_twice(w1 a);
 long double ldn_sum(ldn a, ldn b);
 long wide_low(wide w);
+typedef float v4f __attribute__((vector_size(16)));   // one SSE register
+typedef int v8i __attribute__((vector_size(32)));     // memory (no AVX)
+v4f v4f_mad(v4f a, v4f b, float k);
+int v8i_sum(v8i a, int extra, v8i b);

@@ -60,7 +60,7 @@ directory and `-I` directories, then the system ones.
 
 Types: `i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 isize usize f32 f64 f80 bool void str`
 (`f80` is C's `long double`, `i128` its `__int128`),
-`(ptr T)`, `(array T N)`, `(slice T)`, `(fn (A B ...) R)`, struct/union/enum names, and every
+`(ptr T)`, `(array T N)`, `(slice T)`, `(simd T N)`, `(fn (A B ...) R)`, struct/union/enum names, and every
 typedef/struct a C module brings in (`libc::size_t`, `libc::FILE` ...).
 
 Top level:
@@ -73,6 +73,7 @@ Top level:
 | `(include "file.lsp" ...)` | another file's forms as part of this module |
 | `(struct name [:packed] [:align N] [field T] ...)` `(union ...)` | C layout; `[field T :bits N]` is a bit field |
 | `(enum name T a b (c 5) ...)` | a distinct integer type; members are `name.a` ... |
+| `(variant name (case [field T] ...) case ...)` | a tagged union (see Variants) |
 | `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
@@ -88,6 +89,11 @@ Expressions — everything is one; statements have type `void`:
     (do e...)  (let [x init] [y T init] [z T] body...)  (set place e)
     (if c a [b])  (when c body...)  (unless c body...)
     (while c body...)  (for [i [T] start end [step]] body...)  (break)  (continue)  (return [e])
+    (for [x :in xs] body...)  (for [i x :in xs] body...) — each element of an array, simd, slice, str,
+      or a struct with data and len (a (vec T)), also through a pointer; x is the element itself
+      (setting it sets the element), i its index (a u64)
+    (match x (case body...) ((case a b) body...) ... (else body...)) — see Variants
+    (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
     (slice-of a [from [to]]) — an array as a (slice T), or part of an array, slice or str
@@ -162,6 +168,86 @@ Typing rules:
   be given in a global's constant `make`; only `(addr ...)` of one is an error.
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
+
+## Variants
+
+A variant is a tagged union: a value that is one of its cases, each with its own fields.
+
+```lisp
+(variant shape (circle [r f32]) (rect [w f32] [h f32]) none)
+
+(defn area [s shape] f32
+  (match s
+    ((circle r) (* 3.0 r r))
+    ((rect w h) (* w h))
+    (none 0.0)))
+
+(area (shape.rect 2.0 3.0))   ; a case with fields is built like a call
+(area shape.none)             ; one without is a value
+```
+
+`match` runs the clause of the case the value holds; `(case a b ...)` names
+the case's fields in order (`_` skips one), and the names are the fields
+themselves: `(set r 5.0)` changes the matched value, when that is a place. It
+follows pointers. Without an `else`, every case must be there (or it's an
+error naming the one missing). A match is a value when its clauses are.
+
+Variants can be generic; their types are found from the values, or from the
+type wanted where there are no values to go by:
+
+```lisp
+(variant (option T) (some [value T]) none)   ; these two are in std/option
+(variant (result T E) (ok [value T]) (err [error E]))
+
+(defn find [xs (slice i32)] [want i32] (option u64)
+  (for [i x :in xs] (when (= x want) (return (option.some i))))
+  option.none)                                ; (option u64): from the result type
+```
+
+A variant is a struct `[tag u32] [cases ...]` (`tag` is the case's index),
+with C layout, so it passes to C and through `...` like other structs.
+
+## Printing
+
+`(print x ...)` writes each value as its type shows it, one after another;
+`(println x ...)` adds a newline, and `:to f` first writes to the C `FILE` f
+instead of stdout:
+
+```lisp
+(println "p = " p " n = " n)   ; p = {point :x 1 :y -2} n = 7
+(println :to libc::stderr "failed: " (parse s))   ; failed: (result.err "empty")
+```
+
+Strings are written as they are (inside a struct, quoted); integers and floats
+as printf's `%d` and `%g`; `bool`s as `true`/`false`; enums as `color.blue`;
+structs as `{name :field value ...}` (as `make` takes them); variants as
+`(shape.circle 2)` or `shape.none`; arrays, slices and simds as `[1 2 3]`;
+C strings (`(ptr i8)`) as text, other pointers as addresses. A program's own
+function named `print` or `println` comes first. Everything goes through as
+few `printf` calls as possible; for formats of your own, `printf` is there.
+
+## SIMD
+
+`(simd T N)` is N integers or floats side by side in a vector register (N a
+power of two, up to 64 bytes): C's `__attribute__((vector_size))` types and
+`__m128`, which imported headers bring in as simds.
+
+```lisp
+(let [a {(simd f32 4) 1.0 2.0 3.0 4.0}] [b (splat (simd f32 4) 0.5)]
+  (+ (* a 2.0) b)         ; element by element; a number goes to every element
+  a[3]                     ; an element (a place: (set a[3] 8.0))
+  (simd-sum (* a b)))      ; a dot product
+```
+
+- `+ - * / %`, and `& | ^ << >>` on integers, work element by element, and so
+  do `(cast (simd T N) v)` (to another simd of the same length) and `bitcast`.
+- `(splat T x)` x in every element; `(shuffle v i ...)` v's elements i ...
+  (any power of two of them).
+- `(simd-sum v)` `(simd-hmin v)` `(simd-hmax v)` — all elements into one
+  (`simd-sum` adds in order, so floats give what a loop would).
+- `(simd-min a b)` `(simd-max a b)` `(simd-abs v)` `(simd-sqrt v)` — element by element.
+- Simds up to 16 bytes pass in one SSE register as C's vectors do; bigger ones
+  in memory, as C passes them without AVX.
 
 ## Generics
 
@@ -259,6 +345,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 | `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a `(ptr (fn (T T) bool))` |
+| `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
 | `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each (k v m) ...)`; keys by value, strs by contents, structs by bytes |
 
 ## Operators
@@ -320,4 +407,4 @@ with `,'it`. `gensym` still exists for names a macro builds itself.
 
 Done: reader, typed core, LLVM code generation and optimisation, modules
 (with C headers as modules), the C calling convention, bit fields, macros with type queries, and
-operator overloading, generics. The teapot ray tracer is written in lisc.
+operator overloading, generics, variants with match, typed printing, SIMD types. The teapot ray tracer is written in lisc.

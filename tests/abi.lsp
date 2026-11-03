@@ -59,4 +59,8 @@
   (let ((v (make v3 :x 1.0 :y 2.0 :z 3.0)) (d (make d2 :a 5.0 :b 1.0)) (m (make mix :i 2 :f 0.5))
         (l (make l2 :a 9 :b 2)) (bg (make big :v (make (array i32 5) 1 0 0 0 7))))
     (printf c"var structs %.1f %.1f\n" (var_structs c"vdmlbi" v d m l bg 3) (var_structs c"dddddvvmlll" d d d d d v v m l l l)))
+  ; simd: C's vector types, in an SSE register or (32 bytes, no AVX) in memory
+  (let [r (v4f_mad {(simd f32 4) 1.0 2.0 3.0 4.0} (splat (simd f32 4) 0.5) 2.0)]
+       [i (cabi::v8i_sum {(simd i32 8) 1 1 1 1 1 1 1 1} 100 (splat (simd i32 8) 2))]
+    (println "simd " r " " i " " (sizeof cabi::v4f) " " (alignof cabi::v8i)))
   0)

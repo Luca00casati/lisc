@@ -111,6 +111,11 @@ struct Importer {
             Type *e = conv(clang_getArrayElementType(t));
             return e ? t_array(e, 0) : nullptr;
         }
+        case CXType_Vector: {  // __attribute__((vector_size(N))), __m128 ...
+            Type *e = conv(clang_getElementType(t));
+            long long n = clang_getNumElements(t);
+            return e && e->is_num() && n > 0 && !(n & (n - 1)) ? t_simd(e, (uint64_t)n) : nullptr;
+        }
         case CXType_Enum: return conv(clang_getEnumDeclIntegerType(clang_getTypeDeclaration(t)));
         case CXType_Record: return t_struct(record(clang_getTypeDeclaration(t)));
         case CXType_FunctionProto: case CXType_FunctionNoProto: {
@@ -347,6 +352,7 @@ struct Writer {
         case Type::Float: return "f" + std::to_string(t->bits);
         case Type::Ptr: return "p " + type(t->elem);
         case Type::Array: return "a " + std::to_string(t->n) + " " + type(t->elem);
+        case Type::Simd: return "V " + std::to_string(t->n) + " " + type(t->elem);
         case Type::Struct: {
             auto it = ids.find(t->st);
             if (it == ids.end()) {
@@ -415,6 +421,7 @@ struct Reader {
         case 'f': return t_float((unsigned)strtoul(t.c_str() + 1, nullptr, 10));
         case 'p': return t_ptr(type());
         case 'a': { uint64_t n = 0; in >> n; return t_array(type(), n); }
+        case 'V': { uint64_t n = 0; in >> n; return t_simd(type(), n); }
         case 's': {
             size_t id = strtoul(t.c_str() + 1, nullptr, 10);
             if (id >= recs.size()) { ok = false; return t_void(); }

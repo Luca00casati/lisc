@@ -1,7 +1,7 @@
 // type.h — lisc types: C's types, with C struct layout.
 //
 //   i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  bool  void
-//   (ptr T)  (array T N)  (fn (A B ...) R)  struct names
+//   (ptr T)  (array T N)  (simd T N)  (fn (A B ...) R)  struct names
 //
 // Types are interned: two equal types are the same pointer.
 #pragma once
@@ -46,11 +46,11 @@ struct EnumInfo {
 };
 
 struct Type {
-    enum Kind { Void, Bool, Int, Float, Ptr, Array, Struct, Fn } kind;
+    enum Kind { Void, Bool, Int, Float, Ptr, Array, Struct, Fn, Simd } kind;
     unsigned bits = 0;   // Int, Float
     bool sign = false;   // Int
-    Type *elem = nullptr;  // Ptr, Array: element; Fn: result
-    uint64_t n = 0;        // Array: length
+    Type *elem = nullptr;  // Ptr, Array, Simd: element; Fn: result
+    uint64_t n = 0;        // Array, Simd: length
     StructInfo *st = nullptr;
     std::vector<Type *> params;  // Fn
     bool variadic = false;       // Fn
@@ -61,6 +61,7 @@ struct Type {
     bool is_num() const { return kind == Int || kind == Float; }
     bool is_ptr() const { return kind == Ptr; }
     bool is_scalar() const { return kind == Int || kind == Float || kind == Ptr || kind == Bool; }
+    bool is_simd() const { return kind == Simd; }
 };
 
 Type *t_void();
@@ -73,6 +74,7 @@ Type *t_fn(Type *ret, const std::vector<Type *> &params, bool variadic);
 Type *t_struct(StructInfo *st);  // one Type per StructInfo
 Type *t_enum(EnumInfo *en, Type *base);  // a new integer type, distinct from base
 Type *t_slice(Type *elem);       // (slice T), one per element type
+Type *t_simd(Type *elem, uint64_t n);  // (simd T N): N numbers in one vector register
 
 uint64_t size_of(const Type *t);
 uint64_t align_of(const Type *t);

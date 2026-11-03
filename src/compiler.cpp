@@ -183,6 +183,11 @@ struct Compiler::Impl : MetaHost {
             d = dib->createArrayType(size_of(t) * 8, align_of(t) * 8, ditype(t->elem), dib->getOrCreateArray(sub));
             break;
         }
+        case Type::Simd: {
+            llvm::Metadata *sub[] = {dib->getOrCreateSubrange(0, (int64_t)t->n)};
+            d = dib->createVectorType(size_of(t) * 8, align_of(t) * 8, ditype(t->elem), dib->getOrCreateArray(sub));
+            break;
+        }
         case Type::Fn: {
             std::vector<llvm::Metadata *> ps{ditype(t->elem)};
             for (Type *p : t->params) ps.push_back(ditype(p));
@@ -526,6 +531,10 @@ struct Compiler::Impl : MetaHost {
                         f = mk_list(f->loc, it);
                         mark_private(f);
                     }
+                if (f->is_call("variant")) {
+                    for (Form *x : desugar_variant(f, m)) items.push_back({x, m});
+                    continue;
+                }
                 items.push_back({f, m});
             }
         }
@@ -610,6 +619,7 @@ struct Compiler::Impl : MetaHost {
         case Type::Float: return t->bits == 32 ? b.getFloatTy() : t->bits == 64 ? b.getDoubleTy() : llvm::Type::getX86_FP80Ty(ctx);
         case Type::Ptr: return b.getPtrTy();
         case Type::Array: return llvm::ArrayType::get(ll(t->elem), t->n);
+        case Type::Simd: return llvm::FixedVectorType::get(ll(t->elem), t->n);
         case Type::Struct: return ll_struct(t->st);
         case Type::Fn: return fn_abi(t).ty;
         }
@@ -635,7 +645,7 @@ struct Compiler::Impl : MetaHost {
                     for (uint64_t b0 = f.bit_off / 8; b0 <= (f.bit_off + f.bit_width - 1) / 8; b0++) out.push_back({off + b0, t_int(8, false)});
                 } else leaves(f.type, off + f.offset, out);
             }
-        } else if (t->kind == Type::Array) {
+        } else if (t->kind == Type::Array || t->kind == Type::Simd) {
             for (uint64_t i = 0; i < t->n; i++) leaves(t->elem, off + i * size_of(t->elem), out);
         } else if (t->is_int() && t->bits == 128) {  // two INTEGER eightbytes
             out.push_back({off, t_int(64, false)});
@@ -645,6 +655,9 @@ struct Compiler::Impl : MetaHost {
 
     ArgAbi classify(Type *t) {
         ArgAbi a;
+        // a simd of up to 16 bytes goes in one SSE register, as C's __m128 does;
+        // a bigger one in memory (as C does without AVX)
+        if (t->kind == Type::Simd && size_of(t) > 16) { a.kind = ArgAbi::Memory; return a; }
         if (t->kind != Type::Struct) return a;  // Direct
         uint64_t size = size_of(t);
         if (size == 0) { a.kind = ArgAbi::Ignore; return a; }
@@ -725,7 +738,7 @@ struct Compiler::Impl : MetaHost {
                 llvm::AttrBuilder ab(ctx);
                 ext(ab, p);
                 sets.push_back(llvm::AttributeSet::get(ctx, ab));
-                if (p->is_float()) sse--; else gpr--;
+                if (p->is_float() || p->is_simd()) sse--; else gpr--;
                 break;
             }
             case ArgAbi::Coerce:
@@ -816,6 +829,408 @@ struct Compiler::Impl : MetaHost {
     void ensure_layout(StructInfo *st, Loc at) {
         if (st->complete) return;
         fatal(at, "struct %s is used before its fields are known", st->name.c_str());
+    }
+
+    /* ------------------------------------------------------ variants --- */
+    // (variant shape (circle [r f32]) (rect [w f32] [h f32]) none): a tagged
+    // union. It is a struct: (struct shape [tag u32] [cases shape.cases]), the
+    // cases a union of one struct per case that has fields. Generic too:
+    // (variant (option T) (some [value T]) none).
+    struct VariantInfo {
+        std::string name;  // as written: shape, option
+        bool generic = false;
+        std::vector<std::string> cases;
+        std::vector<std::vector<std::string>> fields;  // per case
+        std::vector<std::vector<Form *>> ftypes;       // per case, the fields' types as written
+    };
+    std::map<std::string, VariantInfo> variants;  // by key (module::name)
+
+    std::vector<Form *> desugar_variant(Form *f, ModInfo *m) {
+        if (f->size() < 3) fatal(f->loc, "(variant name (case [field T] ...) case ...)");
+        Form *nm = f->at(1);
+        bool gen = nm->is_list();
+        Form *base = gen ? (nm->size() >= 2 ? nm->at(0) : nullptr) : nm;
+        if (!base || base->kind != Form::Sym) fatal(nm->loc, "a variant's name is a name, or (name T ...)");
+        std::vector<Form *> params;  // the type parameters' names
+        if (gen)
+            for (size_t i = 1; i < nm->size(); i++) params.push_back(nm->at(i)->is_list() ? nm->at(i)->at(0) : nm->at(i));
+        auto name = [&](const std::string &suffix) {
+            Form *s = new Form(*base);
+            s->text = base->text + suffix;
+            s->id = Form::next_id++;
+            return s;
+        };
+        auto header = [&](const std::string &suffix) -> Form * {  // what a struct is defined as
+            if (!gen) return name(suffix);
+            std::vector<Form *> it = nm->items;
+            it[0] = name(suffix);
+            return mk_list(nm->loc, it);
+        };
+        auto ref = [&](const std::string &suffix) -> Form * {  // the type, where it is used
+            if (!gen) return name(suffix);
+            std::vector<Form *> it{name(suffix)};
+            it.insert(it.end(), params.begin(), params.end());
+            return mk_list(nm->loc, it);
+        };
+        VariantInfo vi{base->text, gen, {}, {}, {}};
+        std::vector<Form *> out;
+        std::vector<Form *> cases{mk_sym(f->loc, "union"), header(".cases")};
+        for (size_t i = 2; i < f->size(); i++) {
+            Form *c = f->at(i), *cn = c->is_list() && c->size() ? c->at(0) : c;
+            if (cn->kind != Form::Sym || cn->text.find('.') != std::string::npos)
+                fatal(c->loc, "a variant's case is a name, or (name [field T] ...)");
+            for (auto &k : vi.cases)
+                if (k == cn->text) fatal(cn->loc, "case %s is there twice", k.c_str());
+            vi.cases.push_back(cn->text);
+            vi.fields.emplace_back();
+            vi.ftypes.emplace_back();
+            if (!c->is_list() || c->size() == 1) continue;
+            std::vector<Form *> st{mk_sym(c->loc, "struct"), header("." + cn->text)};
+            for (size_t j = 1; j < c->size(); j++) {
+                Form *fd = c->at(j);
+                if (!fd->is_list() || fd->size() != 2 || fd->at(0)->kind != Form::Sym) fatal(fd->loc, "a case's field is [name T]");
+                vi.fields.back().push_back(fd->at(0)->text);
+                vi.ftypes.back().push_back(fd->at(1));
+                st.push_back(fd);
+            }
+            out.push_back(mk_list(c->loc, st));
+            cases.push_back(mk_list(c->loc, {mk_sym(c->loc, cn->text), ref("." + cn->text)}));
+        }
+        std::vector<Form *> main{mk_sym(f->loc, "struct"), header(""), mk_list(f->loc, {mk_sym(f->loc, "tag"), mk_sym(f->loc, "u32")})};
+        if (cases.size() > 2) {
+            out.push_back(mk_list(f->loc, cases));
+            main.push_back(mk_list(f->loc, {mk_sym(f->loc, "cases"), ref(".cases")}));
+        }
+        out.push_back(mk_list(f->loc, main));
+        std::string k = m ? m->name + "::" + base->text : base->text;
+        if (variants.count(k)) fatal(base->loc, "variant %s is already defined", base->text.c_str());
+        variants[k] = vi;
+        return out;
+    }
+
+    VariantInfo *variant_of(Type *t) {
+        if (t->kind != Type::Struct) return nullptr;
+        auto inst = instance_of.find(t->st);
+        if (inst != instance_of.end()) {
+            auto it = variants.find(inst->second.first->key);
+            return it == variants.end() ? nullptr : &it->second;
+        }
+        for (auto &v : variants)
+            if (!v.second.generic) {
+                auto it = c.types_.find(v.first);
+                if (it != c.types_.end() && it->second == t) return &v.second;
+            }
+        return nullptr;
+    }
+
+    // shape.circle written as x.y: the variant and the case, if that is what it names
+    bool variant_case(Form *dot, std::string &k, size_t &ci) {
+        if (!dot->is_call(".") || dot->size() != 3 || dot->at(1)->kind != Form::Sym || dot->at(2)->kind != Form::Sym) return false;
+        Form *x = dot->at(1);
+        if (lookup_local(key(x)).v || lookup_global(x)) return false;
+        k = type_key(x);
+        if (k.empty() || !variants.count(k)) k = generic_key(x, generic_structs);
+        if (k.empty() || !variants.count(k)) return false;
+        VariantInfo &vi = variants[k];
+        for (ci = 0; ci < vi.cases.size(); ci++)
+            if (vi.cases[ci] == dot->at(2)->text) return true;
+        fatal(dot->at(2)->loc, "variant %s has no case %s", vi.name.c_str(), dot->at(2)->text.c_str());
+    }
+
+    // (shape.circle 2.0), shape.none: a value of the variant
+    Val construct(Form *dot, const std::vector<Form *> &args, Type *want, Loc at) {
+        std::string k;
+        size_t ci;
+        variant_case(dot, k, ci);
+        VariantInfo &vi = variants[k];
+        const std::string shown = vi.name + "." + vi.cases[ci];
+        if (args.size() != vi.fields[ci].size())
+            fatal(at, "%s takes %zu value%s, got %zu", shown.c_str(), vi.fields[ci].size(), vi.fields[ci].size() == 1 ? "" : "s", args.size());
+        Type *t;
+        std::vector<Val> vals(args.size());
+        if (!vi.generic) t = c.types_[k];
+        else {
+            Generic &g = generic_structs[k];
+            auto inst = want && want->kind == Type::Struct ? instance_of.find(want->st) : instance_of.end();
+            if (inst != instance_of.end() && inst->second.first == &g) t = want;
+            else {  // the types from the values
+                std::map<std::string, Type *> bnd;
+                for (size_t i = 0; i < args.size(); i++)
+                    if (!untyped(args[i]) && !args[i]->is_sym("null")) {
+                        vals[i] = expr(args[i], nullptr);
+                        match(g, vi.ftypes[ci][i], vals[i].t, bnd, args[i]);
+                    }
+                std::vector<Type *> targs;
+                for (auto &p : g.params) {
+                    if (!bnd.count(p))
+                        fatal(at, "what %s is in this %s isn't known here: give the type, as in (let [x (%s ...) %s])", p.c_str(), shown.c_str(), vi.name.c_str(), shown.c_str());
+                    targs.push_back(bnd[p]);
+                }
+                t = instantiate_struct(g, targs, at);
+            }
+        }
+        ensure_layout(t->st, at);
+        llvm::AllocaInst *a = temp(t);
+        store({a, t}, llvm::Constant::getNullValue(ll(t)));
+        store(field_addr({a, t}, mk_sym(at, "tag")), b.getInt32((uint32_t)ci));
+        if (!args.empty()) {
+            Val cs = field_addr(field_addr({a, t}, mk_sym(at, "cases")), mk_sym(at, vi.cases[ci]));
+            for (size_t i = 0; i < args.size(); i++) {
+                Val fa = field_addr(cs, mk_sym(at, vi.fields[ci][i]));
+                Val v = vals[i].v ? coerce(vals[i], fa.t, args[i]->loc, "value") : value_for(args[i], fa.t, "value");
+                store(fa, v.v);
+            }
+        }
+        Val r{load({a, t}), t};
+        done(t, a);
+        return r;
+    }
+
+    // (match x (case body...) ((case a b) body...) ... (else body...)): the
+    // case x holds; (case a b) names its fields (places: setting a sets the
+    // field). Without an else, every case must be there.
+    Val match_(Form *f, Type *want) {
+        if (f->size() < 3) fatal(f->loc, "(match x (case body...) ((case field ...) body...) ... [(else body...)])");
+        Val base = struct_base(f->at(1));
+        while (base.t->is_ptr()) base = {load(base), base.t->elem};
+        VariantInfo *vi = variant_of(base.t);
+        if (!vi) fatal(f->at(1)->loc, "match needs a variant, got %s", type_name(base.t).c_str());
+        Form *h = hidden(f->loc, "match");
+        Loc at = f->loc;
+        std::vector<Form *> cs{mk_sym(at, "case"), mk_list(at, {mk_sym(at, "."), h, mk_sym(at, "tag")})};
+        std::set<size_t> seen;
+        bool has_else = false;
+        for (size_t i = 2; i < f->size(); i++) {
+            Form *cl = f->at(i);
+            if (!cl->is_list() || cl->items.empty()) fatal(cl->loc, "a match clause is (case body...)");
+            Form *pat = cl->at(0);
+            if (pat->is_sym("else")) {
+                if (i + 1 != f->size()) fatal(cl->loc, "else must be the last match clause");
+                has_else = true;
+                cs.push_back(cl);
+                continue;
+            }
+            Form *cn = pat->is_list() && pat->size() ? pat->at(0) : pat;
+            if (cn->kind != Form::Sym) fatal(pat->loc, "a match pattern is a case's name, or (case field ...)");
+            size_t ci = std::find(vi->cases.begin(), vi->cases.end(), cn->text) - vi->cases.begin();
+            if (ci == vi->cases.size()) fatal(cn->loc, "variant %s has no case %s", vi->name.c_str(), cn->text.c_str());
+            if (!seen.insert(ci).second) fatal(cn->loc, "case %s is matched twice", cn->text.c_str());
+            std::vector<Form *> items{int_form(cl->loc, ci)};
+            if (pat->is_list()) {
+                if (pat->size() - 1 != vi->fields[ci].size())
+                    fatal(pat->loc, "%s has %zu field%s, the pattern names %zu", cn->text.c_str(), vi->fields[ci].size(), vi->fields[ci].size() == 1 ? "" : "s", pat->size() - 1);
+                std::vector<Form *> al{mk_sym(cl->loc, "%alias")};
+                for (size_t j = 1; j < pat->size(); j++) {
+                    if (pat->at(j)->kind != Form::Sym) fatal(pat->at(j)->loc, "a pattern names fields with names (or _)");
+                    Form *bd = mk_list(pat->at(j)->loc, {pat->at(j), mk_list(pat->at(j)->loc, {mk_sym(at, "."), h, mk_sym(at, "cases"),
+                                                                                               mk_sym(at, cn->text), mk_sym(at, vi->fields[ci][j - 1])})});
+                    bd->bracket = true;
+                    al.push_back(bd);
+                }
+                if (al.size() == 1) al.push_back(mk_list(cl->loc, {}));  // (a lone [] means no bindings)
+                al.insert(al.end(), cl->items.begin() + 1, cl->items.end());
+                items.push_back(mk_list(cl->loc, al));
+            } else items.insert(items.end(), cl->items.begin() + 1, cl->items.end());
+            cs.push_back(mk_list(cl->loc, items));
+        }
+        if (!has_else) {
+            for (size_t ci = 0; ci < vi->cases.size(); ci++)
+                if (!seen.count(ci)) fatal(f->loc, "this match misses %s.%s (or add an else)", vi->name.c_str(), vi->cases[ci].c_str());
+            // every case is there: the last one is the switch's default
+            Form *last = cs.back();
+            std::vector<Form *> it = last->items;
+            it[0] = mk_sym(last->loc, "else");
+            cs.back() = mk_list(last->loc, it);
+        }
+        scopes.emplace_back();
+        scopes.back()[key(h)] = base;
+        Val r = case_(mk_list(at, cs), want);
+        scopes.pop_back();
+        return r;
+    }
+
+    /* --------------------------------------------------------- print --- */
+    // (print x ...) (println x ...) [:to file]: each value as its type shows it,
+    // one after another; strings as they are. Gathered into as few printf
+    // calls as possible.
+    struct Out {
+        std::string fmt;
+        std::vector<llvm::Value *> args;
+        llvm::Value *file = nullptr;  // null: stdout
+    };
+    llvm::Value *cstr_const(const std::string &s) {
+        Form tmp{Form::Str, {}};
+        tmp.text = s;
+        tmp.cstr = true;
+        return string(&tmp, nullptr).v;
+    }
+    void flush(Out &o) {
+        if (o.fmt.empty()) return;
+        llvm::Type *i32 = b.getInt32Ty(), *p = b.getPtrTy();
+        std::vector<llvm::Value *> args;
+        llvm::FunctionCallee fnc;
+        if (o.file) {
+            fnc = mod.getOrInsertFunction("fprintf", llvm::FunctionType::get(i32, {p, p}, true));
+            args.push_back(o.file);
+        } else fnc = mod.getOrInsertFunction("printf", llvm::FunctionType::get(i32, {p}, true));
+        args.push_back(cstr_const(o.fmt));
+        args.insert(args.end(), o.args.begin(), o.args.end());
+        b.CreateCall(fnc, args);
+        o.fmt.clear();
+        o.args.clear();
+    }
+    static std::string escape_pct(const std::string &s) {
+        std::string r;
+        for (char ch : s) r += ch == '%' ? std::string("%%") : std::string(1, ch);
+        return r;
+    }
+    // [a b c]: n elements from memory at data
+    void show_seq(Out &o, llvm::Value *data, llvm::Value *n, Type *elem, Loc at) {
+        o.fmt += "[";
+        flush(o);
+        llvm::AllocaInst *iv = alloca_(t_int(64, false), "i");
+        store({iv, t_int(64, false)}, b.getInt64(0));
+        BasicBlock *cond = BasicBlock::Create(ctx, "show", fn), *body = BasicBlock::Create(ctx, "showel", fn), *done = BasicBlock::Create(ctx, "shown", fn);
+        b.CreateBr(cond);
+        b.SetInsertPoint(cond);
+        llvm::Value *i = load({iv, t_int(64, false)});
+        b.CreateCondBr(b.CreateICmpULT(i, n), body, done);
+        b.SetInsertPoint(body);
+        o.fmt += "%s";
+        o.args.push_back(b.CreateSelect(b.CreateICmpEQ(i, b.getInt64(0)), cstr_const(""), cstr_const(" ")));
+        llvm::Value *p = b.CreateInBoundsGEP(ll(elem), data, i);
+        show_val(o, {load({p, elem}), elem}, true, at);
+        flush(o);
+        store({iv, t_int(64, false)}, b.CreateAdd(i, b.getInt64(1)));
+        b.CreateBr(cond);
+        b.SetInsertPoint(done);
+        o.fmt += "]";
+    }
+    void show_val(Out &o, Val v, bool nested, Loc at) {
+        Type *t = v.t;
+        switch (t->kind) {
+        case Type::Void: fatal(at, "print: this has no value");
+        case Type::Bool:
+            o.fmt += "%s";
+            o.args.push_back(b.CreateSelect(v.v, cstr_const("true"), cstr_const("false")));
+            return;
+        case Type::Int: {
+            if (t->en) {  // its member's name
+                llvm::Value *s = cstr_const("?");
+                for (auto &m : t->en->values)
+                    s = b.CreateSelect(b.CreateICmpEQ(v.v, llvm::ConstantInt::get(ll(t), m.second)), cstr_const(escape_pct(t->en->name + "." + m.first)), s);
+                o.fmt += "%s";
+                o.args.push_back(s);
+                return;
+            }
+            if (t->bits == 128) fatal(at, "print can't show %s yet", type_name(t).c_str());
+            if (t->bits <= 32) {
+                o.fmt += t->sign ? "%d" : "%u";
+                o.args.push_back(b.CreateIntCast(v.v, b.getInt32Ty(), t->sign));
+            } else {
+                o.fmt += t->sign ? "%ld" : "%lu";
+                o.args.push_back(v.v);
+            }
+            return;
+        }
+        case Type::Float:
+            o.fmt += t->bits == 80 ? "%Lg" : "%g";
+            o.args.push_back(t->bits == 32 ? b.CreateFPExt(v.v, b.getDoubleTy()) : v.v);
+            return;
+        case Type::Ptr:
+            if (t->elem == t_int(8, true)) {  // a C string
+                o.fmt += nested ? "\"%s\"" : "%s";
+                o.args.push_back(v.v);
+            } else {
+                o.fmt += "%p";
+                o.args.push_back(v.v);
+            }
+            return;
+        case Type::Fn: fatal(at, "print can't show a function");
+        case Type::Simd:
+            o.fmt += "[";
+            for (uint64_t i = 0; i < t->n; i++) {
+                if (i) o.fmt += " ";
+                show_val(o, {b.CreateExtractElement(v.v, i), t->elem}, true, at);
+            }
+            o.fmt += "]";
+            return;
+        case Type::Array: {
+            Val m = spill(v);
+            show_seq(o, m.v, b.getInt64(t->n), t->elem, at);
+            return;
+        }
+        case Type::Struct: break;
+        }
+        StructInfo *st = t->st;
+        if (t == t_str()) {
+            o.fmt += nested ? "\"%.*s\"" : "%.*s";
+            o.args.push_back(b.CreateTrunc(b.CreateExtractValue(v.v, 1), b.getInt32Ty()));
+            o.args.push_back(b.CreateExtractValue(v.v, 0));
+            return;
+        }
+        if (st->slice_of) {
+            show_seq(o, b.CreateExtractValue(v.v, 0), b.CreateExtractValue(v.v, 1), st->slice_of, at);
+            return;
+        }
+        if (st->is_union) {
+            o.fmt += "<union " + escape_pct(type_name(t)) + ">";
+            return;
+        }
+        Val m = spill(v);
+        if (VariantInfo *vi = variant_of(t)) {  // (shape.circle 2), shape.none
+            flush(o);
+            llvm::Value *tag = load(field_addr(m, mk_sym(at, "tag")));
+            BasicBlock *done = BasicBlock::Create(ctx, "shown", fn);
+            llvm::SwitchInst *sw = b.CreateSwitch(tag, done, vi->cases.size());
+            for (size_t ci = 0; ci < vi->cases.size(); ci++) {
+                BasicBlock *bb = BasicBlock::Create(ctx, "showcase", fn);
+                sw->addCase(b.getInt32((uint32_t)ci), bb);
+                b.SetInsertPoint(bb);
+                std::string name = escape_pct(vi->name + "." + vi->cases[ci]);
+                if (vi->fields[ci].empty()) o.fmt += name;
+                else {
+                    o.fmt += "(" + name;
+                    Val cs = field_addr(field_addr(m, mk_sym(at, "cases")), mk_sym(at, vi->cases[ci]));
+                    for (auto &fname : vi->fields[ci]) {
+                        Val fa = field_addr(cs, mk_sym(at, fname));
+                        o.fmt += " ";
+                        show_val(o, {load(fa), fa.t}, true, at);
+                    }
+                    o.fmt += ")";
+                }
+                flush(o);
+                b.CreateBr(done);
+            }
+            b.SetInsertPoint(done);
+            return;
+        }
+        ensure_layout(st, at);
+        o.fmt += "{" + escape_pct(type_name(t));  // {point :x 1 :y 2}, as make writes it
+        for (auto &fd : st->fields) {
+            Val fa = field_addr(m, mk_sym(at, fd.name));
+            o.fmt += " :" + escape_pct(fd.name) + " ";
+            show_val(o, {load(fa), fa.t}, true, at);
+        }
+        o.fmt += "}";
+    }
+    Val print(Form *f, bool line) {
+        Out o;
+        size_t i = 1;
+        if (f->size() >= 3 && f->at(1)->is_sym(":to")) {
+            Val fl = expr(f->at(2), nullptr);
+            if (!fl.t->is_ptr()) fatal(f->at(2)->loc, "print :to needs a file (a (ptr libc::FILE)), got %s", type_name(fl.t).c_str());
+            o.file = fl.v;
+            i = 3;
+        }
+        for (; i < f->size(); i++) {
+            Form *x = expand(f->at(i));
+            if (x->kind == Form::Str) o.fmt += escape_pct(x->text);
+            else show_val(o, expr(x, nullptr), false, x->loc);
+        }
+        if (line) o.fmt += "\n";
+        flush(o);
+        return {nullptr, t_void()};
     }
 
     /* ------------------------------------------------------ generics --- */
@@ -916,7 +1331,7 @@ struct Compiler::Impl : MetaHost {
     bool supports(const std::string &op, Type *t, Loc at) {
         static const std::set<std::string> arith = {"+", "-", "*", "/", "%"}, order = {"<", ">", "<=", ">="},
                                            eq = {"=", "!="}, bits = {"&", "|", "^", "<<", ">>"};
-        if (arith.count(op) && t->is_num()) return true;
+        if (arith.count(op) && (t->is_num() || t->is_simd())) return true;
         if (order.count(op) && (t->is_num() || t->is_ptr())) return true;
         if (eq.count(op) && t->is_scalar()) return true;
         if (bits.count(op) && t->is_int()) return true;
@@ -1079,6 +1494,16 @@ struct Compiler::Impl : MetaHost {
             auto *k = llvm::dyn_cast<llvm::ConstantInt>(n.v);
             if (!k || !n.t->is_int()) fatal(f->at(2)->loc, "array length must be an integer constant");
             return t_array(parse_type(f->at(1)), k->getZExtValue());
+        }
+        if (f->is_call("simd") && f->size() == 3) {
+            Type *e = parse_type(f->at(1));
+            Val n = expr(f->at(2), t_int(64, false));
+            auto *k = llvm::dyn_cast<llvm::ConstantInt>(n.v);
+            if (!k || !n.t->is_int()) fatal(f->at(2)->loc, "simd length must be an integer constant");
+            uint64_t len = k->getZExtValue();
+            if (!e->is_num() || e->en) fatal(f->at(1)->loc, "a simd holds integers or floats, not %s", type_name(e).c_str());
+            if (!len || (len & (len - 1)) || len * size_of(e) > 64) fatal(f->at(2)->loc, "a simd's length is a power of two, up to 64 bytes in all");
+            return t_simd(e, len);
         }
         if (f->is_call("fn") && f->size() == 3 && f->at(1)->is_list()) {
             std::vector<Type *> ps;
@@ -1259,6 +1684,9 @@ struct Compiler::Impl : MetaHost {
             Global *g = lookup_global(f);
             return g && g->kind == Global::Var;
         }
+        std::string vk;
+        size_t vci;
+        if (f->is_call(".") && variant_case(f, vk, vci)) return false;  // shape.none: a value
         return f->is_call(".") || f->is_call("aref") || f->is_call("deref");
     }
 
@@ -1295,12 +1723,16 @@ struct Compiler::Impl : MetaHost {
                     if (c.checks) len = b.CreateExtractValue(base.v, 1);
                     base = {b.CreateExtractValue(base.v, 0), base.t->st->fields[0].type};
                 }
-                if (base.t->kind == Type::Array) base = spill(base);
+                if (base.t->kind == Type::Array || base.t->is_simd()) base = spill(base);
             }
             Val i = expr(f->at(2), t_int(64, true));
             if (!i.t->is_int()) fatal(f->at(2)->loc, "index must be an integer, got %s", type_name(i.t).c_str());
             llvm::Value *idx = b.CreateIntCast(i.v, b.getInt64Ty(), i.t->sign);
-            if (base.t->kind == Type::Array) len = b.getInt64(base.t->n);
+            if (base.t->kind == Type::Array || base.t->is_simd()) len = b.getInt64(base.t->n);
+            if (base.t->is_simd()) {  // an element of the vector in memory
+                uint64_t es = size_of(base.t->elem);
+                return {b.CreateInBoundsGEP(ll(base.t->elem), base.v, idx), base.t->elem, es};
+            }
             if (len) check(b.CreateICmpULT(idx, len), f->at(2)->loc, "index %ld out of bounds (length %lu)", {idx, len});
             if (base.t->kind == Type::Array) {
                 llvm::Value *p = b.CreateInBoundsGEP(ll(base.t), base.v, {b.getInt64(0), idx});
@@ -1373,9 +1805,85 @@ struct Compiler::Impl : MetaHost {
         return {p, fd->type, al};
     }
 
+    /* ---------------------------------------------------------- simd --- */
+
+    // a number in every element of a simd
+    Val splat(Val s, Type *vt, Loc at) {
+        s = coerce(s, vt->elem, at, "simd element");
+        return {b.CreateVectorSplat(vt->n, s.v), vt};
+    }
+
+    // (splat T x) (shuffle v i ...) (simd-sum v) (simd-hmin v) (simd-hmax v)
+    // (simd-min a b) (simd-max a b) (simd-sqrt v) (simd-abs v)
+    Val simd_op(Form *f, const std::string &op, Type *want) {
+        auto one = [&](size_t n) {
+            if (f->size() != n + 1) fatal(f->loc, "(%s%s)", op.c_str(), n == 1 ? " v" : n == 2 ? " a b" : " T x");
+        };
+        auto vec = [&](Form *x, Type *w) {
+            Val v = expr(x, w);
+            if (!v.t->is_simd()) fatal(x->loc, "%s needs a simd, got %s", op.c_str(), type_name(v.t).c_str());
+            return v;
+        };
+        if (op == "splat") {
+            one(2);
+            Type *t = parse_type(f->at(1));
+            if (!t->is_simd()) fatal(f->at(1)->loc, "splat makes a simd, not %s", type_name(t).c_str());
+            return splat(expr(f->at(2), t->elem), t, f->loc);
+        }
+        if (op == "shuffle") {  // (shuffle v i ...): v's elements i ..., as a simd of that many
+            if (f->size() < 3) fatal(f->loc, "(shuffle v i ...)");
+            Val v = vec(f->at(1), want);
+            std::vector<int> mask;
+            for (size_t i = 2; i < f->size(); i++) {
+                auto *k = llvm::dyn_cast<llvm::ConstantInt>(constant(f->at(i), t_int(32, true)));
+                if (!k || k->getSExtValue() < 0 || (uint64_t)k->getSExtValue() >= v.t->n) fatal(f->at(i)->loc, "a shuffle index is a constant 0..%lu", v.t->n - 1);
+                mask.push_back((int)k->getSExtValue());
+            }
+            size_t n = mask.size();
+            if (n & (n - 1)) fatal(f->loc, "a shuffle gives a power of two elements");
+            return {b.CreateShuffleVector(v.v, mask), t_simd(v.t->elem, n)};
+        }
+        Type *e;
+        if (op == "simd-sum" || op == "simd-hmin" || op == "simd-hmax") {  // all elements into one
+            one(1);
+            Val v = vec(f->at(1), nullptr);
+            e = v.t->elem;
+            if (op == "simd-sum")
+                return {e->is_float() ? b.CreateFAddReduce(llvm::ConstantFP::getNegativeZero(ll(e)), v.v)  // in order: strict IEEE
+                                      : b.CreateAddReduce(v.v), e};
+            bool mn = op == "simd-hmin";
+            if (e->is_float()) return {mn ? b.CreateFPMinReduce(v.v) : b.CreateFPMaxReduce(v.v), e};
+            return {mn ? b.CreateIntMinReduce(v.v, e->sign) : b.CreateIntMaxReduce(v.v, e->sign), e};
+        }
+        if (op == "simd-min" || op == "simd-max") {
+            one(2);
+            Val a = vec(f->at(1), want);
+            Val x = expr(f->at(2), a.t);
+            if (!x.t->is_simd()) x = splat(x, a.t, f->at(2)->loc);
+            if (x.t != a.t) type_error(f->at(2)->loc, op.c_str(), a.t, x.t);
+            e = a.t->elem;
+            bool mn = op == "simd-min";
+            llvm::Value *lt = e->is_float() ? b.CreateFCmpOLT(a.v, x.v) : e->sign ? b.CreateICmpSLT(a.v, x.v) : b.CreateICmpULT(a.v, x.v);
+            return {mn ? b.CreateSelect(lt, a.v, x.v) : b.CreateSelect(lt, x.v, a.v), a.t};
+        }
+        if (op == "simd-sqrt" || op == "simd-abs") {
+            one(1);
+            Val v = vec(f->at(1), want);
+            e = v.t->elem;
+            if (op == "simd-sqrt") {
+                if (!e->is_float()) fatal(f->loc, "simd-sqrt needs floats");
+                return {b.CreateUnaryIntrinsic(llvm::Intrinsic::sqrt, v.v), v.t};
+            }
+            if (e->is_float()) return {b.CreateUnaryIntrinsic(llvm::Intrinsic::fabs, v.v), v.t};
+            return {b.CreateBinaryIntrinsic(llvm::Intrinsic::abs, v.v, b.getFalse()), v.t};
+        }
+        fatal(f->loc, "unknown simd operation %s", op.c_str());
+    }
+
     /* --------------------------------------------------- expressions --- */
 
     Val literal(Form *f, Type *want) {
+        if (want && want->is_simd()) return splat(literal(f, want->elem), want, f->loc);
         if (f->kind == Form::Int) {
             if (!want || (!want->is_num() && !want->is_ptr())) want = default_type(f);
             if (want->is_float()) return float_const(f->text, want);
@@ -1472,6 +1980,11 @@ struct Compiler::Impl : MetaHost {
         if (f->items.empty()) fatal(f->loc, "empty form ()");
         if (f->bracket) fatal(f->loc, "[...] is a binding, as in (let [x 1] ...); a call is written (...)");
         const char *h = f->head();
+        std::string vk;
+        size_t vci;
+        if (!*h && variant_case(f->at(0), vk, vci))  // (shape.circle 2.0)
+            return construct(f->at(0), std::vector<Form *>(f->items.begin() + 1, f->items.end()), want, f->loc);
+        if (*h && !strcmp(h, ".") && variant_case(f, vk, vci)) return construct(f, {}, want, f->loc);  // shape.none
         if (!*h) return call(f);
         std::string hs = h;
         if (is_arith(h)) return arith(f, want);
@@ -1487,6 +2000,9 @@ struct Compiler::Impl : MetaHost {
         if (hs == "when" || hs == "unless") return when(f, hs == "unless");
         if (hs == "while") return while_(f);
         if (hs == "for") return for_(f);
+        if (hs == "%alias") return alias(f, want);
+        if (hs == "match") return match_(f, want);
+        if ((hs == "print" || hs == "println") && !lookup_global(f->at(0))) return print(f, hs == "println");
         if (hs == "break" || hs == "continue") return jump(f, hs == "break");
         if (hs == "return") return return_(f);
         if (hs == "and" || hs == "or") return logic(f, hs == "and");
@@ -1549,6 +2065,7 @@ struct Compiler::Impl : MetaHost {
             return {llvm::ConstantInt::get(ll(rt), hs == "sizeof" ? size_of(t) : align_of(t)), rt};
         }
         if (hs == "make") return make(f);
+        if ((hs == "splat" || hs == "shuffle" || hs.compare(0, 5, "simd-") == 0) && !lookup_global(f->at(0))) return simd_op(f, hs, want);
         if (hs == "defer") {  // (defer e ...): run when this block exits, however it exits
             if (scopes.empty()) fatal(f->loc, "defer outside a function");
             if (in_defer) fatal(f->loc, "defer inside a defer");
@@ -1656,7 +2173,7 @@ struct Compiler::Impl : MetaHost {
         for (size_t i = from; i < f->size(); i++)
             if (!untyped(f->at(i))) { *typed_at = i; return nullptr; }
         *typed_at = 0;
-        if (want && want->is_num()) return want;
+        if (want && (want->is_num() || want->is_simd())) return want;
         Type *t = t_int(32, true);
         for (size_t i = from; i < f->size(); i++) {
             Type *u = default_type(f->at(i));
@@ -1682,7 +2199,12 @@ struct Compiler::Impl : MetaHost {
             Type *ti = t->is_ptr() && !compare ? t_int(64, true) : t;  // pointer arithmetic: integer offsets
             vs[i] = expr(f->at(i), ti);
             if (t->is_ptr() || vs[i].t == t) continue;
-            if (widens(vs[i].t, t)) vs[i] = cast(vs[i], t, f->at(i)->loc);
+            if (t->is_simd() && !vs[i].t->is_simd()) vs[i] = splat(vs[i], t, f->at(i)->loc);  // (* v 2.0): every element
+            else if (vs[i].t->is_simd() && !t->is_simd()) {
+                t = vs[i].t;
+                for (Val &v : vs)
+                    if (v.v && v.t != t) v = splat(v, t, f->at(i)->loc);
+            } else if (widens(vs[i].t, t)) vs[i] = cast(vs[i], t, f->at(i)->loc);
             else if (widens(t, vs[i].t)) {  // a wider operand: everything so far widens to it
                 t = vs[i].t;
                 for (Val &v : vs)
@@ -1804,10 +2326,15 @@ struct Compiler::Impl : MetaHost {
         if (!a.v.v) a.v = expr(a.f, t);
         if (!x.v.v) x.v = expr(x.f, t->is_ptr() && !is_compare ? t_int(64, true) : t);
         if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
+        if (a.v.t->is_simd() != x.v.t->is_simd()) {  // a simd and a number: the number for every element
+            if (a.v.t->is_simd()) x.v = splat(x.v, a.v.t, at);
+            else a.v = splat(a.v, x.v.t, at);
+            t = a.v.t;
+        }
         bool shift = op == "<<" || op == ">>";  // as in C, the count may be any integer type
         if (!t->is_ptr() && a.v.t != x.v.t && !(shift && a.v.t->is_int() && x.v.t->is_int()) && !unify(a.v, x.v, at))
             type_error(at, op.c_str(), a.v.t, x.v.t);
-        if (!t->is_num() && !t->is_ptr()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(a.v.t).c_str(), type_name(x.v.t).c_str());
+        if (!t->is_num() && !t->is_ptr() && !t->is_simd()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(a.v.t).c_str(), type_name(x.v.t).c_str());
         return {binop(op, a.v, x.v, at), nullptr};
     }
 
@@ -1837,16 +2364,16 @@ struct Compiler::Impl : MetaHost {
             // a unary operator with no matching definition: built in
             Val v = xs[0].v.v ? xs[0].v : expr(xs[0].f, want);
             if (op != "-") fatal(f->loc, "(%s x) needs two operands", op.c_str());
-            if (v.t->is_float()) return {b.CreateFNeg(v.v), v.t};
-            if (v.t->is_int()) return {b.CreateNeg(v.v), v.t};
+            if (v.t->is_float() || (v.t->is_simd() && v.t->elem->is_float())) return {b.CreateFNeg(v.v), v.t};
+            if (v.t->is_int() || v.t->is_simd()) return {b.CreateNeg(v.v), v.t};
             fatal(f->loc, "no (- %s): define it with defop", type_name(v.t).c_str());
         }
         std::vector<Val> vs = operands(f, 1, want);
         if (vs.size() == 1) {
             if (op != "-") fatal(f->loc, "(%s x) needs two operands", op.c_str());
             Val v = vs[0];
-            if (v.t->is_float()) return {b.CreateFNeg(v.v), v.t};
-            if (v.t->is_int()) return {b.CreateNeg(v.v), v.t};
+            if (v.t->is_float() || (v.t->is_simd() && v.t->elem->is_float())) return {b.CreateFNeg(v.v), v.t};
+            if (v.t->is_int() || v.t->is_simd()) return {b.CreateNeg(v.v), v.t};
             fatal(f->loc, "cannot negate %s", type_name(v.t).c_str());
         }
         Val acc = vs[0];
@@ -1856,6 +2383,29 @@ struct Compiler::Impl : MetaHost {
 
     Val binop(const std::string &op, Val a, Val x, Loc at) {
         Type *t = a.t;
+        if (t->is_simd()) {  // element by element
+            if (!x.t->is_simd()) x = splat(x, t, at);
+            if (x.t != t) type_error(at, op.c_str(), t, x.t);
+            Type *e = t->elem;
+            if (e->is_float()) {
+                if (op == "+") return {b.CreateFAdd(a.v, x.v), t};
+                if (op == "-") return {b.CreateFSub(a.v, x.v), t};
+                if (op == "*") return {b.CreateFMul(a.v, x.v), t};
+                if (op == "/") return {b.CreateFDiv(a.v, x.v), t};
+                if (op == "%") return {b.CreateFRem(a.v, x.v), t};
+                fatal(at, "'%s' needs integers", op.c_str());
+            }
+            if (op == "+") return {b.CreateAdd(a.v, x.v), t};
+            if (op == "-") return {b.CreateSub(a.v, x.v), t};
+            if (op == "*") return {b.CreateMul(a.v, x.v), t};
+            if (op == "/") return {e->sign ? b.CreateSDiv(a.v, x.v) : b.CreateUDiv(a.v, x.v), t};
+            if (op == "%") return {e->sign ? b.CreateSRem(a.v, x.v) : b.CreateURem(a.v, x.v), t};
+            if (op == "&") return {b.CreateAnd(a.v, x.v), t};
+            if (op == "|") return {b.CreateOr(a.v, x.v), t};
+            if (op == "^") return {b.CreateXor(a.v, x.v), t};
+            if (op == "<<") return {b.CreateShl(a.v, x.v), t};
+            if (op == ">>") return {e->sign ? b.CreateAShr(a.v, x.v) : b.CreateLShr(a.v, x.v), t};
+        }
         if (t->is_ptr()) {
             if (op == "+" || op == "-") {
                 if (x.t->is_int()) {
@@ -1930,7 +2480,7 @@ struct Compiler::Impl : MetaHost {
             const P fp[] = {P::FCMP_OEQ, P::FCMP_UNE, P::FCMP_OLT, P::FCMP_OLE, P::FCMP_OGT, P::FCMP_OGE};
             return {b.CreateFCmp(fp[k], a.v, x.v), t_bool()};
         }
-        if (t->kind == Type::Struct || t->kind == Type::Array) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
+        if (t->kind == Type::Struct || t->kind == Type::Array || t->is_simd()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
         const P si[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_SLT, P::ICMP_SLE, P::ICMP_SGT, P::ICMP_SGE};
         const P ui[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_ULT, P::ICMP_ULE, P::ICMP_UGT, P::ICMP_UGE};
         return {b.CreateICmp(t->is_int() && t->sign ? si[k] : ui[k], a.v, x.v), t_bool()};
@@ -2005,7 +2555,7 @@ struct Compiler::Impl : MetaHost {
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
         if (f->is_list() && f->size() >= 2 && !generic_key(f->at(0), generic_structs).empty()) return true;
-        return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice");
+        return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice") || f->is_call("simd");
     }
 
     Val set(Form *f) {
@@ -2271,7 +2821,71 @@ struct Compiler::Impl : MetaHost {
     }
 
     // (for (i [T] start end [step]) body...): i from start while i < end
+    int hidden_count = 0;
+    Form *hidden(Loc at, const char *what) { return mk_sym(at, std::string("#") + what + std::to_string(++hidden_count)); }
+    Form *int_form(Loc at, uint64_t v) {
+        Form *n = new Form{Form::Int, at};
+        n->ival = v;
+        n->text = std::to_string(v);
+        return n;
+    }
+
+    // (for [x :in xs] body...), (for [i x :in xs] body...): each element of an
+    // array, simd, slice, str, or a struct with data and len (a (vec T)), or
+    // what a pointer points to; x is the element itself (setting it sets the
+    // element), i its index (a u64)
+    Val for_in(Form *f, Form *spec, size_t in_at) {
+        if (spec->size() != in_at + 2 || spec->at(0)->kind != Form::Sym || spec->at(in_at - 1)->kind != Form::Sym)
+            fatal(spec->loc, "(for [x :in xs] body...) or (for [i x :in xs] body...)");
+        Form *xs = spec->at(in_at + 1), *x = spec->at(in_at - 1);
+        Val base;
+        if (is_place(xs)) base = place(xs);
+        else {
+            Val v = expr(xs, nullptr);
+            base = v.t->is_ptr() ? Val{v.v, v.t->elem} : spill(v);
+        }
+        while (base.t->is_ptr()) base = {load(base), base.t->elem};
+        Form *h = hidden(xs->loc, "each"), *ix = in_at == 2 ? spec->at(0) : hidden(xs->loc, "i");
+        Form *len, *elem;
+        if (base.t->kind == Type::Array || base.t->is_simd()) {
+            len = int_form(xs->loc, base.t->n);
+            elem = mk_list(xs->loc, {mk_sym(xs->loc, "aref"), h, ix});
+        } else if (base.t->kind == Type::Struct && base.t->st->find("data") && base.t->st->find("len") &&
+                   base.t->st->find("data")->type->is_ptr() && base.t->st->find("len")->type->is_int()) {
+            len = mk_list(xs->loc, {mk_sym(xs->loc, "cast"), mk_sym(xs->loc, "u64"), mk_list(xs->loc, {mk_sym(xs->loc, "."), h, mk_sym(xs->loc, "len")})});
+            elem = mk_list(xs->loc, {mk_sym(xs->loc, "aref"), mk_list(xs->loc, {mk_sym(xs->loc, "."), h, mk_sym(xs->loc, "data")}), ix});
+        } else fatal(xs->loc, "for ... :in needs an array, simd, slice, str or a struct with data and len, got %s", type_name(base.t).c_str());
+        Form *bind = mk_list(x->loc, {x, elem});
+        bind->bracket = true;
+        std::vector<Form *> alias{mk_sym(f->loc, "%alias"), bind};
+        alias.insert(alias.end(), f->items.begin() + 2, f->items.end());
+        Form *counter = mk_list(spec->loc, {ix, mk_sym(spec->loc, "u64"), int_form(spec->loc, 0), len});
+        Form *loop = mk_list(f->loc, {f->at(0), counter, mk_list(f->loc, alias)});
+        scopes.emplace_back();
+        scopes.back()[key(h)] = base;
+        Val r = for_(loop);
+        scopes.pop_back();
+        return r;
+    }
+
+    // (%alias [name place] ... body...): names for places (for :in and match bind them)
+    Val alias(Form *f, Type *want) {
+        f = unbracket(f, 1);
+        scopes.emplace_back();
+        for (Form *bd : f->at(1)->items) {
+            Val a = place(bd->at(1));
+            if (bd->at(0)->is_sym("_")) continue;
+            scopes.back()[key(bd->at(0))] = a;
+            scopes.back().declared.push_back(bd->at(0));
+        }
+        Val r = body(f, 2, want);
+        end_scope();
+        return r;
+    }
+
     Val for_(Form *f) {
+        if (f->size() >= 2 && f->at(1)->is_list() && f->at(1)->size() >= 3 && (f->at(1)->at(1)->is_sym(":in") || f->at(1)->at(2)->is_sym(":in")))
+            return for_in(f, f->at(1), f->at(1)->at(1)->is_sym(":in") ? 1 : 2);
         if (f->size() < 2 || !f->at(1)->is_list() || f->at(1)->size() < 3 || f->at(1)->size() > 5 || f->at(1)->at(0)->kind != Form::Sym)
             fatal(f->loc, "(for (i [T] start end [step]) body...)");
         Form *spec = f->at(1);
@@ -2347,6 +2961,15 @@ struct Compiler::Impl : MetaHost {
         Type *from = v.t;
         if (from == to) return v;
         llvm::Type *lt = ll(to);
+        if (from->is_simd() || to->is_simd()) {  // element by element, between simds of one length
+            if (!from->is_simd() || !to->is_simd() || from->n != to->n)
+                fatal(at, "cannot cast %s to %s", type_name(from).c_str(), type_name(to).c_str());
+            Type *fe = from->elem, *te = to->elem;
+            if (fe->is_int() && te->is_int()) return {b.CreateIntCast(v.v, lt, fe->sign), to};
+            if (fe->is_int()) return {fe->sign ? b.CreateSIToFP(v.v, lt) : b.CreateUIToFP(v.v, lt), to};
+            if (te->is_int()) return {te->sign ? b.CreateFPToSI(v.v, lt) : b.CreateFPToUI(v.v, lt), to};
+            return {b.CreateFPCast(v.v, lt), to};
+        }
         if (from->is_int() && to->is_int()) {
             llvm::Value *r = b.CreateIntCast(v.v, lt, from->sign);
             if (c.checks && fn && (to->bits < from->bits || from->sign != to->sign)) {  // could lose the value
@@ -2381,7 +3004,8 @@ struct Compiler::Impl : MetaHost {
 
     // same bits, other type (f32 <-> u32 ...)
     Val bitcast(Val v, Type *to, Loc at) {
-        if (!v.t->is_scalar() || !to->is_scalar() || size_of(v.t) != size_of(to))
+        bool ok = (v.t->is_scalar() || v.t->is_simd()) && (to->is_scalar() || to->is_simd());
+        if (!ok || size_of(v.t) != size_of(to) || ((v.t->is_ptr() || to->is_ptr()) && (v.t->is_simd() || to->is_simd())))
             fatal(at, "cannot bitcast %s to %s", type_name(v.t).c_str(), type_name(to).c_str());
         if (v.t->is_ptr() || to->is_ptr()) return cast(v, to, at);
         return {b.CreateBitCast(v.v, ll(to)), to};
@@ -2409,7 +3033,13 @@ struct Compiler::Impl : MetaHost {
                 llvm::Value *p = b.CreateInBoundsGEP(ll(t), a, {b.getInt64(0), b.getInt64(i - 2)});
                 store({p, t->elem}, value_for(f->at(i), t->elem, "element").v);
             }
-        } else fatal(f->loc, "make needs a struct or array type");
+        } else if (t->is_simd()) {
+            if (f->size() - 2 > t->n) fatal(f->loc, "too many elements for %s", type_name(t).c_str());
+            llvm::Value *v = llvm::Constant::getNullValue(ll(t));
+            for (size_t i = 2; i < f->size(); i++) v = b.CreateInsertElement(v, value_for(f->at(i), t->elem, "element").v, i - 2);
+            done(t, a);
+            return {v, t};
+        } else fatal(f->loc, "make needs a struct, array or simd type");
         Val r{load({a, t}), t};
         done(t, a);
         return r;
@@ -2530,6 +3160,8 @@ struct Compiler::Impl : MetaHost {
         f = expand(f);
         if (f->is_call("do")) {
             for (size_t i = 1; i < f->size(); i++) expand_top(f->at(i), out);
+        } else if (f->is_call("variant")) {
+            for (Form *x : desugar_variant(f, cur)) out.push_back(x);
         } else out.push_back(f->is_call("defn") || f->is_call("defop") ? unbracket(f, 2) : f);  // (defn f [a T] [b U] R ...)
     }
 

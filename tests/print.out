@@ -1,0 +1,6 @@
+{named :name "kettle" :p {point :x 1 :y -2} :c color.blue :tags [7 8 9] :ok true}
+ints -5 200 -9000000000 18000000000000000000 97
+floats 0.1 0.1 1e+300 2.5
+text a C string 50% bc color.green false
+no newline; then [0.5 1.5]
+to stdout

@@ -229,7 +229,7 @@ Meta::Meta(MetaHost &host) : host_(host) {
         return host_.parse_type(a[0]);
     };
     B["type-kind"] = [type_arg](std::vector<Form *> &a, Loc at) {
-        static const char *const names[] = {"void", "bool", "int", "float", "ptr", "array", "struct", "fn"};
+        static const char *const names[] = {"void", "bool", "int", "float", "ptr", "array", "struct", "fn", "simd"};
         return mk_sym(at, names[type_arg(a, at, "type-kind")->kind]);
     };
     B["type-elem"] = [this, type_arg](std::vector<Form *> &a, Loc at) {
@@ -239,7 +239,7 @@ Meta::Meta(MetaHost &host) : host_(host) {
     };
     B["type-len"] = [type_arg](std::vector<Form *> &a, Loc at) {
         Type *t = type_arg(a, at, "type-len");
-        if (t->kind != Type::Array) fatal(at, "%s is not an array", type_name(t).c_str());
+        if (t->kind != Type::Array && t->kind != Type::Simd) fatal(at, "%s is not an array or simd", type_name(t).c_str());
         return mk_int(at, (int64_t)t->n);
     };
     B["type-size"] = [type_arg](std::vector<Form *> &a, Loc at) { return mk_int(at, (int64_t)size_of(type_arg(a, at, "type-size"))); };
@@ -256,6 +256,7 @@ Form *Meta::type_form(Type *t, Loc at) {
     switch (t->kind) {
     case Type::Ptr: return mk_list(at, {mk_sym(at, "ptr"), type_form(t->elem, at)});
     case Type::Array: return mk_list(at, {mk_sym(at, "array"), type_form(t->elem, at), mk_int(at, (int64_t)t->n)});
+    case Type::Simd: return mk_list(at, {mk_sym(at, "simd"), type_form(t->elem, at), mk_int(at, (int64_t)t->n)});
     case Type::Fn: {
         std::vector<Form *> ps;
         for (Type *p : t->params) ps.push_back(type_form(p, at));

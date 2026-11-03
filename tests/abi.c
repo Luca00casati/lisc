@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wpsabi"  // (v8i: 32-byte vectors go in memory without AVX, as lisc passes them)
 #include "abi.h"
 
 v3 v3_scale(v3 v, float k) { return (v3){v.x * k, v.y * k, v.z * k}; }
@@ -44,3 +45,5 @@ unsigned __int128 u128_shift(unsigned __int128 x, int n) { return x << n; }
 w1 w1_twice(w1 a) { a.v *= 2; return a; }
 long double ldn_sum(ldn a, ldn b) { return a.x * a.n + b.x * b.n; }
 long wide_low(wide w) { return (long)(w.v >> 64) + w.tag; }
+v4f v4f_mad(v4f a, v4f b, float k) { return a * k + b; }
+int v8i_sum(v8i a, int extra, v8i b) { int s = extra; for (int i = 0; i < 8; i++) s += a[i] * (i + 1) + b[i]; return s; }

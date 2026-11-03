@@ -43,6 +43,13 @@ Type *t_array(Type *elem, uint64_t n) {
     return t;
 }
 
+Type *t_simd(Type *elem, uint64_t n) {
+    static std::map<std::pair<Type *, uint64_t>, Type *> m;
+    Type *&t = m[{elem, n}];
+    if (!t) { t = make({Type::Simd}); t->elem = elem; t->n = n; }
+    return t;
+}
+
 Type *t_fn(Type *ret, const std::vector<Type *> &params, bool variadic) {
     static std::map<std::tuple<Type *, std::vector<Type *>, bool>, Type *> m;
     Type *&t = m[{ret, params, variadic}];
@@ -87,7 +94,7 @@ uint64_t size_of(const Type *t) {
     case Type::Int: return t->bits / 8;
     case Type::Float: return t->bits == 80 ? 16 : t->bits / 8;  // (C's long double: 10 bytes used, 16 with padding)
     case Type::Ptr: case Type::Fn: return 8;
-    case Type::Array: return t->n * size_of(t->elem);
+    case Type::Array: case Type::Simd: return t->n * size_of(t->elem);
     case Type::Struct: return t->st->size;
     }
     return 0;
@@ -136,6 +143,7 @@ std::string type_name(const Type *t) {
     case Type::Float: return "f" + std::to_string(t->bits);
     case Type::Ptr: return "(ptr " + type_name(t->elem) + ")";
     case Type::Array: return "(array " + type_name(t->elem) + " " + std::to_string(t->n) + ")";
+    case Type::Simd: return "(simd " + type_name(t->elem) + " " + std::to_string(t->n) + ")";
     case Type::Struct: return t->st->name.empty() ? "<anonymous struct>" : t->st->name;
     case Type::Fn: {
         std::string s = "(fn (";

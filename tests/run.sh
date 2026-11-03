@@ -61,5 +61,13 @@ printf '#define ANSWER 42\nstruct pt { long x, y; };\n' >out/hc/h.h
 got="$got $(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)"
 if [ "$got" = "41 8
 41 8 42 8 42 16" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL C import cache: got '$got'"; fi
+# lisc fmt: tests/fmt/in.lsp formatted is tests/fmt/out.lsp (and that stays as it is);
+# the standard library and the tests are formatted already
+cp fmt/in.lsp out/fmt.lsp
+if ../lisc fmt out/fmt.lsp && cmp -s out/fmt.lsp fmt/out.lsp && ../lisc fmt --check fmt/out.lsp ../lib/std/*.lsp *.lsp mods/*.lsp >out/fmt.txt; then
+    pass=$((pass + 1))
+else
+    fail=$((fail + 1)); echo "FAIL lisc fmt"; diff fmt/out.lsp out/fmt.lsp | head -20; cat out/fmt.txt
+fi
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

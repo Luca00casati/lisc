@@ -38,5 +38,7 @@
       (println s " " (area s) " " o " " (sizeof shape) " " s.tag))
     (let [c (lst i32) lst.nil] [b (lst.cons 2 (addr c))] [x (lst.cons 1 (addr b))]
       (println (len x) " " dir.down " " (match dir.up (up "up") (down "down"))))
-    (println (match (parse "xy") ((ok n) (* n 10)) ((err _) -1))))
+    (println (match (parse "xy") ((ok n) (* n 10)) ((err _) -1)))
+    (for [s :in shapes]                          ; several cases in one clause
+      (print (match s ((or circle rect) "round-or-square ") (none "nothing\n")))))
   0)

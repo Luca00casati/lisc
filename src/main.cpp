@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -143,9 +144,61 @@ void lower_aggregate_copies(llvm::Module &m) {
     }
 }
 
+// The optnone functions, moved to a module of their own (returned; null if
+// there are none), to be compiled as at -O0: the fast instruction selector
+// and register allocator, which is what optnone asks for anyway — in the
+// optimised module the code generator gives them its full (slow) treatment.
+// Names the two modules share become hidden externals; constants are copied.
+std::unique_ptr<llvm::Module> split_optnone(llvm::Module &m) {
+    bool any = false;
+    for (llvm::Function &f : m) any |= !f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::OptimizeNone);
+    if (!any) return nullptr;
+    auto copied = [](const llvm::GlobalValue *g) {  // a constant both modules get a copy of
+        auto *v = llvm::dyn_cast<llvm::GlobalVariable>(g);
+        return v && v->isConstant() && v->hasLocalLinkage();
+    };
+    int n = 0;
+    for (llvm::GlobalValue &g : m.global_values()) {
+        if (g.isDeclaration() || !g.hasLocalLinkage() || copied(&g)) continue;
+        if (!g.hasName()) g.setName("lisc.anon." + std::to_string(n++));
+        g.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        g.setVisibility(llvm::GlobalValue::HiddenVisibility);
+        g.setDSOLocal(true);
+    }
+    llvm::ValueToValueMapTy vmap;
+    std::unique_ptr<llvm::Module> m0 = llvm::CloneModule(m, vmap, [&](const llvm::GlobalValue *g) {
+        auto *f = llvm::dyn_cast<llvm::Function>(g);
+        return (f && f->hasFnAttribute(llvm::Attribute::OptimizeNone)) || copied(g);
+    });
+    for (llvm::GlobalValue &g : m0->global_values())
+        if (g.isDeclaration() && !g.hasDefaultVisibility()) g.setDSOLocal(true);
+    for (llvm::Function &f : m)
+        if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::OptimizeNone)) {
+            f.deleteBody();
+            f.setDSOLocal(true);
+        }
+    return m0;
+}
+
+bool emit_object(llvm::Module &m, llvm::TargetMachine *tm, const std::string &path) {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
+    if (ec) { fprintf(stderr, "lisc: %s: %s\n", path.c_str(), ec.message().c_str()); return false; }
+    llvm::legacy::PassManager pm;
+    if (tm->addPassesToEmitFile(pm, os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        fprintf(stderr, "lisc: the target cannot emit object files\n");
+        return false;
+    }
+    pm.run(m);
+    return true;
+}
+
 }  // namespace
 
+int fmt_main(int argc, char **argv);  // fmt.cpp
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "fmt")) return fmt_main(argc, argv);
     const char *in = nullptr;
     std::string out;
     int opt = 2;
@@ -212,10 +265,12 @@ int main(int argc, char **argv) {
     std::string features;
     if (llvm::sys::getHostCPUFeatures(host))
         for (auto &f : host) features += (features.empty() ? "" : ",") + std::string(f.second ? "+" : "-") + f.first().str();
-    llvm::TargetMachine *tm = target->createTargetMachine(triple, llvm::sys::getHostCPUName(), features, llvm::TargetOptions(),
-                                                          llvm::Reloc::PIC_, std::nullopt,
-                                                          opt == 0 ? llvm::CodeGenOptLevel::None : opt == 1 ? llvm::CodeGenOptLevel::Less
-                                                          : opt == 2 ? llvm::CodeGenOptLevel::Default : llvm::CodeGenOptLevel::Aggressive);
+    auto machine = [&](llvm::CodeGenOptLevel level) {
+        return target->createTargetMachine(triple, llvm::sys::getHostCPUName(), features, llvm::TargetOptions(), llvm::Reloc::PIC_,
+                                           std::nullopt, level);
+    };
+    llvm::TargetMachine *tm = machine(opt == 0 ? llvm::CodeGenOptLevel::None : opt == 1 ? llvm::CodeGenOptLevel::Less
+                                      : opt == 2 ? llvm::CodeGenOptLevel::Default : llvm::CodeGenOptLevel::Aggressive);
     m.setDataLayout(tm->createDataLayout());
     m.setTargetTriple(triple);
     phase("setup");
@@ -230,23 +285,21 @@ int main(int argc, char **argv) {
         m.print(os, nullptr);
         return 0;
     }
-    std::string obj = object_only ? out : out + ".o";
-    {
-        llvm::raw_fd_ostream os(obj, ec, llvm::sys::fs::OF_None);
-        if (ec) { fprintf(stderr, "lisc: %s: %s\n", obj.c_str(), ec.message().c_str()); return 1; }
-        llvm::legacy::PassManager pm;
-        if (tm->addPassesToEmitFile(pm, os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
-            fprintf(stderr, "lisc: the target cannot emit object files\n");
-            return 1;
-        }
-        pm.run(m);
-        phase("codegen");
+    std::string obj = object_only ? out : out + ".o", obj0 = out + ".optnone.o";
+    std::unique_ptr<llvm::Module> m0 = opt > 0 && !object_only ? split_optnone(m) : nullptr;
+    if (!emit_object(m, tm, obj)) return 1;
+    phase("codegen");
+    if (m0) {
+        if (!emit_object(*m0, machine(llvm::CodeGenOptLevel::None), obj0)) return 1;
+        phase("codegen optnone");
     }
     if (object_only) return 0;
     std::vector<std::string> link = {"cc", "-o", out, obj, "-lm"};
+    if (m0) link.push_back(obj0);
     link.insert(link.end(), libs.begin(), libs.end());
     int r = run(link);
     phase("link");
     unlink(obj.c_str());
+    if (m0) unlink(obj0.c_str());
     return r;
 }

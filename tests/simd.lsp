@@ -1,6 +1,14 @@
 ; (simd T N): numbers side by side in a vector register
 (defn dot [a (simd f32 4)] [b (simd f32 4)] f32 (simd-sum (* a b)))
 
+; compares give masks (each element -1 or 0); select, any, all
+(defn masks [] void
+  (let [a {(simd f32 4) 1.0 5.0 2.0 9.0}] [b {(simd f32 4) 3.0 3.0 3.0 3.0}]
+    (let [lt (< a b)] [big (> a 4.0)]
+      (println lt " " big " " (& lt (~ big)) " " (simd-select lt a b) " " (simd-select big 0.0 a))
+      (println (simd-any big) " " (simd-all big) " " (simd-all (= a a)) " " (simd-any (> {(simd u8 8) 1 2 3} 200)))
+      (println (< {(simd f64 2) 1.0 2.0} 1.5) " " (< {(simd i16 4) -1 0 1 2} 1)))))
+
 (defn main [] i32
   (let [a {(simd f32 4) 1.0 2.0 3.0 4.0}]
        [b (splat (simd f32 4) 0.5)]
@@ -13,4 +21,5 @@
     (println (cast (simd f32 4) i) " " (cast (simd i32 4) (* a 1.5)) " " (bitcast (simd u32 4) (splat (simd f32 4) 1.0))[0])
     (println (& {(simd u8 8) 255 15 7} (splat (simd u8 8) 12)) " " (<< (splat (simd u16 4) 1) 3))
     (println (sizeof (simd f32 8)) " " (alignof (simd f64 2)) " " (sizeof (simd u8 16))))
+  (masks)
   0)

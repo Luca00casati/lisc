@@ -13,5 +13,7 @@
     (println "text " c"a C string" " " "50% " (slice-of "abcdef" 1 3) " " color.green " " false)
     (print "no newline;")
     (print " then " (slice-of {(array f32 2) 0.5 1.5}) "\n")
-    (println :to libc::stdout "to " "stdout"))
+    (println :to libc::stdout "to " "stdout")
+    (println "i128 " (* (cast i128 -170141183460469231) 1000000000 1000000000000) " " (cast u128 0) " "
+             (- (<< (cast u128 1) 127) 1) " " (cast i128 -7)))
   0)

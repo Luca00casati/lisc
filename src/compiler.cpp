@@ -1015,6 +1015,21 @@ struct Compiler::Impl : MetaHost {
                 cs.push_back(cl);
                 continue;
             }
+            if (pat->is_call("or")) {  // ((or circle rect) body...): any of these cases (no fields named)
+                std::vector<Form *> vals;
+                for (size_t j = 1; j < pat->size(); j++) {
+                    Form *x = pat->at(j);
+                    size_t ci = x->kind == Form::Sym ? std::find(vi->cases.begin(), vi->cases.end(), x->text) - vi->cases.begin() : vi->cases.size();
+                    if (ci == vi->cases.size()) fatal(x->loc, "variant %s has no case %s", vi->name.c_str(), show(x).c_str());
+                    if (!seen.insert(ci).second) fatal(x->loc, "case %s is matched twice", x->text.c_str());
+                    vals.push_back(int_form(x->loc, ci));
+                }
+                if (vals.empty()) fatal(pat->loc, "(or case ...) needs a case");
+                std::vector<Form *> items{mk_list(pat->loc, vals)};
+                items.insert(items.end(), cl->items.begin() + 1, cl->items.end());
+                cs.push_back(mk_list(cl->loc, items));
+                continue;
+            }
             Form *cn = pat->is_list() && pat->size() ? pat->at(0) : pat;
             if (cn->kind != Form::Sym) fatal(pat->loc, "a match pattern is a case's name, or (case field ...)");
             size_t ci = std::find(vi->cases.begin(), vi->cases.end(), cn->text) - vi->cases.begin();
@@ -1069,6 +1084,37 @@ struct Compiler::Impl : MetaHost {
         tmp.cstr = true;
         return string(&tmp, nullptr).v;
     }
+    // lisc.i128.str(v, signed, buf[48]): v in decimal, NUL-terminated, somewhere in buf
+    llvm::Function *i128_str() {
+        if (llvm::Function *f = mod.getFunction("lisc.i128.str")) return f;
+        llvm::Type *i128 = b.getIntNTy(128), *p = b.getPtrTy();
+        auto *f = llvm::Function::Create(llvm::FunctionType::get(p, {i128, b.getInt1Ty(), p}, false), llvm::GlobalValue::InternalLinkage, "lisc.i128.str", mod);
+        llvm::IRBuilder<> h(BasicBlock::Create(ctx, "entry", f));
+        BasicBlock *entry = h.GetInsertBlock(), *loop = BasicBlock::Create(ctx, "digit", f), *done = BasicBlock::Create(ctx, "done", f);
+        llvm::Value *v = f->getArg(0), *buf = f->getArg(2);
+        llvm::Value *neg = h.CreateAnd(f->getArg(1), h.CreateICmpSLT(v, llvm::ConstantInt::get(i128, 0)));
+        llvm::Value *u = h.CreateSelect(neg, h.CreateNeg(v), v);
+        llvm::Value *end = h.CreateInBoundsGEP(h.getInt8Ty(), buf, h.getInt64(47));
+        h.CreateStore(h.getInt8(0), end);
+        h.CreateBr(loop);
+        h.SetInsertPoint(loop);
+        llvm::PHINode *n = h.CreatePHI(i128, 2), *at = h.CreatePHI(p, 2);
+        n->addIncoming(u, entry);
+        at->addIncoming(end, entry);
+        llvm::Value *q = h.CreateInBoundsGEP(h.getInt8Ty(), at, h.getInt64(-1));
+        llvm::Value *ten = llvm::ConstantInt::get(i128, 10);
+        h.CreateStore(h.CreateAdd(h.CreateTrunc(h.CreateURem(n, ten), h.getInt8Ty()), h.getInt8('0')), q);
+        llvm::Value *rest = h.CreateUDiv(n, ten);
+        n->addIncoming(rest, loop);
+        at->addIncoming(q, loop);
+        h.CreateCondBr(h.CreateICmpNE(rest, llvm::ConstantInt::get(i128, 0)), loop, done);
+        h.SetInsertPoint(done);
+        llvm::Value *minus = h.CreateInBoundsGEP(h.getInt8Ty(), q, h.getInt64(-1));
+        h.CreateStore(h.getInt8('-'), minus);  // (written either way; the result starts there only if negative)
+        h.CreateRet(h.CreateSelect(neg, minus, q));
+        return f;
+    }
+
     void flush(Out &o) {
         if (o.fmt.empty()) return;
         llvm::Type *i32 = b.getInt32Ty(), *p = b.getPtrTy();
@@ -1128,7 +1174,12 @@ struct Compiler::Impl : MetaHost {
                 o.args.push_back(s);
                 return;
             }
-            if (t->bits == 128) fatal(at, "print can't show %s yet", type_name(t).c_str());
+            if (t->bits == 128) {  // printf has no 128-bit format: digits made by a helper
+                llvm::AllocaInst *buf = alloca_(t_array(t_int(8, false), 48), "digits");
+                o.fmt += "%s";
+                o.args.push_back(b.CreateCall(i128_str(), {v.v, b.getInt1(t->sign), buf}));
+                return;
+            }
             if (t->bits <= 32) {
                 o.fmt += t->sign ? "%d" : "%u";
                 o.args.push_back(b.CreateIntCast(v.v, b.getInt32Ty(), t->sign));
@@ -1261,7 +1312,32 @@ struct Compiler::Impl : MetaHost {
         ModInfo *mod;
         std::map<std::string, Type *> bind;
         Loc at;  // where it was first used
+        std::set<std::string> outer;  // a fn: the locals around it (which it can't use)
     };
+    const std::set<std::string> *lambda_outer = nullptr;  // while compiling a fn's body
+    int lambda_count = 0;
+
+    // (fn [a T] ... R body...): a function written where it is used, as a
+    // function pointer. It is compiled on its own: it sees globals, not the
+    // locals around it (no captures).
+    Val lambda(Form *f) {
+        if (f->size() < 3) fatal(f->loc, "(fn [a T] ... R body...)");
+        Form *name = mk_sym(f->loc, "fn#" + std::to_string(++lambda_count));
+        std::vector<Form *> items{mk_sym(f->loc, "defn"), name};
+        items.insert(items.end(), f->items.begin() + 1, f->items.end());
+        Form *def = unbracket(mk_list(f->loc, items), 2);
+        if (def->size() < 4) fatal(f->loc, "(fn [a T] ... R body...): the result type is missing");
+        std::string k = (cur ? cur->name + "::" : std::string()) + name->text;
+        declare_fn(def, k);
+        std::set<std::string> outer;
+        for (auto &s : scopes)
+            for (auto &v : s.vars) outer.insert(v.first);
+        char at[64];
+        snprintf(at, sizeof at, "(fn at %d:%d)", f->loc.line, f->loc.col);
+        pending_fns.push_back({def, k, at, cur, tbind, f->loc, outer});
+        Global &g = c.globals_[k];
+        return {g.value, t_ptr(g.type)};
+    }
     std::vector<PendingFn> pending_fns;  // instances declared, bodies to compile
     std::map<std::string, std::vector<Generic *>> generic_ops;  // operator → its generic defops
     std::vector<std::pair<std::string, std::string>> generic_op_keys;
@@ -1871,6 +1947,33 @@ struct Compiler::Impl : MetaHost {
             llvm::Value *lt = e->is_float() ? b.CreateFCmpOLT(a.v, x.v) : e->sign ? b.CreateICmpSLT(a.v, x.v) : b.CreateICmpULT(a.v, x.v);
             return {mn ? b.CreateSelect(lt, a.v, x.v) : b.CreateSelect(lt, x.v, a.v), a.t};
         }
+        if (op == "simd-select") {  // (simd-select m a b): a's element where m's is nonzero, else b's
+            if (f->size() != 4) fatal(f->loc, "(simd-select mask a b)");
+            Val m = vec(f->at(1), nullptr);
+            if (!m.t->elem->is_int()) fatal(f->at(1)->loc, "a mask is a simd of integers (what a compare gives), got %s", type_name(m.t).c_str());
+            Val a, x;  // (a number takes the other value's type)
+            if (untyped(f->at(2)) && !untyped(f->at(3))) {
+                x = expr(f->at(3), want);
+                a = expr(f->at(2), x.t);
+            } else {
+                a = expr(f->at(2), want);
+                x = expr(f->at(3), a.t);
+            }
+            Type *vt = a.t->is_simd() ? a.t : x.t->is_simd() ? x.t : want && want->is_simd() ? want : t_simd(a.t, m.t->n);
+            if (!a.t->is_simd()) a = splat(a, vt, f->at(2)->loc);
+            if (!x.t->is_simd()) x = splat(x, vt, f->at(3)->loc);
+            if (x.t != a.t) type_error(f->at(3)->loc, "simd-select", a.t, x.t);
+            if (a.t->n != m.t->n) fatal(f->loc, "the mask has %lu elements, the values %lu", m.t->n, a.t->n);
+            llvm::Value *on = b.CreateICmpNE(m.v, llvm::Constant::getNullValue(ll(m.t)));
+            return {b.CreateSelect(on, a.v, x.v), a.t};
+        }
+        if (op == "simd-any" || op == "simd-all") {  // is some / every element of the mask nonzero?
+            one(1);
+            Val m = vec(f->at(1), nullptr);
+            if (!m.t->elem->is_int()) fatal(f->at(1)->loc, "a mask is a simd of integers (what a compare gives), got %s", type_name(m.t).c_str());
+            llvm::Value *on = b.CreateICmpNE(m.v, llvm::Constant::getNullValue(ll(m.t)));
+            return {op == "simd-any" ? b.CreateOrReduce(on) : b.CreateAndReduce(on), t_bool()};
+        }
         if (op == "simd-sqrt" || op == "simd-abs") {
             one(1);
             Val v = vec(f->at(1), want);
@@ -1961,6 +2064,8 @@ struct Compiler::Impl : MetaHost {
         if (l.v) return {load(l), l.t};
         Global *g = lookup_global(f);
         if (!g) g = generic_value(f, want);
+        if (!g && lambda_outer && lambda_outer->count(key(f)))
+            fatal(f->loc, "a fn can't use '%s', a local of the code around it (it has no captures): pass it as an argument", n.c_str());
         if (!g) fatal(f->loc, at_top_typeof ? "unknown name '%s' (type-of in a top-level macro knows types and C declarations, not the program's functions, globals and constants: they are declared after)" : "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
@@ -2008,6 +2113,7 @@ struct Compiler::Impl : MetaHost {
         if (hs == "while") return while_(f);
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
+        if (hs == "fn" && f->size() >= 2 && f->at(1)->bracket) return lambda(f);
         if (hs == "match") return match_(f, want);
         if ((hs == "print" || hs == "println") && !lookup_global(f->at(0))) return print(f, hs == "println");
         if (hs == "break" || hs == "continue") return jump(f, hs == "break");
@@ -2025,7 +2131,7 @@ struct Compiler::Impl : MetaHost {
         if (hs == "~") {
             if (f->size() != 2) fatal(f->loc, "(~ x)");
             Val v = expr(f->at(1), want);
-            if (!v.t->is_int()) fatal(f->loc, "~ needs an integer");
+            if (!v.t->is_int() && !(v.t->is_simd() && v.t->elem->is_int())) fatal(f->loc, "~ needs an integer");
             return {b.CreateNot(v.v), v.t};
         }
         if (hs == "." && f->size() == 3 && f->at(1)->kind == Form::Sym && f->at(2)->kind == Form::Sym && !is_place(f->at(1)) &&
@@ -2376,12 +2482,12 @@ struct Compiler::Impl : MetaHost {
         Type *t = a.v.v ? a.v.t : x.v.t;
         if (!a.v.v) a.v = expr(a.f, t);
         if (!x.v.v) x.v = expr(x.f, t->is_ptr() && !is_compare ? t_int(64, true) : t);
-        if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
         if (a.v.t->is_simd() != x.v.t->is_simd()) {  // a simd and a number: the number for every element
             if (a.v.t->is_simd()) x.v = splat(x.v, a.v.t, at);
             else a.v = splat(a.v, x.v.t, at);
             t = a.v.t;
         }
+        if (is_compare) return {compare_vals(op, a.v, x.v, at), nullptr};
         bool shift = op == "<<" || op == ">>";  // as in C, the count may be any integer type
         if (!t->is_ptr() && a.v.t != x.v.t && !(shift && a.v.t->is_int() && x.v.t->is_int()) && !unify(a.v, x.v, at))
             type_error(at, op.c_str(), a.v.t, x.v.t);
@@ -2527,11 +2633,20 @@ struct Compiler::Impl : MetaHost {
         Type *t = a.t;
         using P = llvm::CmpInst::Predicate;
         int k = op == "=" ? 0 : op == "!=" ? 1 : op == "<" ? 2 : op == "<=" ? 3 : op == ">" ? 4 : 5;
+        if (t->is_simd()) {  // a mask, as C's vector compares give: each element -1 (true) or 0, as wide as the elements
+            Type *e = t->elem;
+            const P fp[] = {P::FCMP_OEQ, P::FCMP_UNE, P::FCMP_OLT, P::FCMP_OLE, P::FCMP_OGT, P::FCMP_OGE};
+            const P si[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_SLT, P::ICMP_SLE, P::ICMP_SGT, P::ICMP_SGE};
+            const P ui[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_ULT, P::ICMP_ULE, P::ICMP_UGT, P::ICMP_UGE};
+            llvm::Value *m = e->is_float() ? b.CreateFCmp(fp[k], a.v, x.v) : b.CreateICmp(e->sign ? si[k] : ui[k], a.v, x.v);
+            Type *mt = t_simd(t_int(8 * (unsigned)size_of(e), true), t->n);
+            return {b.CreateSExt(m, ll(mt)), mt};
+        }
         if (t->is_float()) {
             const P fp[] = {P::FCMP_OEQ, P::FCMP_UNE, P::FCMP_OLT, P::FCMP_OLE, P::FCMP_OGT, P::FCMP_OGE};
             return {b.CreateFCmp(fp[k], a.v, x.v), t_bool()};
         }
-        if (t->kind == Type::Struct || t->kind == Type::Array || t->is_simd()) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
+        if (t->kind == Type::Struct || t->kind == Type::Array) fatal(at, "no (%s %s %s): define it with defop", op.c_str(), type_name(t).c_str(), type_name(t).c_str());
         const P si[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_SLT, P::ICMP_SLE, P::ICMP_SGT, P::ICMP_SGE};
         const P ui[] = {P::ICMP_EQ, P::ICMP_NE, P::ICMP_ULT, P::ICMP_ULE, P::ICMP_UGT, P::ICMP_UGE};
         return {b.CreateICmp(t->is_int() && t->sign ? si[k] : ui[k], a.v, x.v), t_bool()};
@@ -2606,6 +2721,7 @@ struct Compiler::Impl : MetaHost {
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
         if (f->is_list() && f->size() >= 2 && !generic_key(f->at(0), generic_structs).empty()) return true;
+        if (f->is_call("fn") && f->size() > 1 && f->at(1)->bracket) return false;  // (fn [a T] R ...): a function, not a type
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice") || f->is_call("simd");
     }
 
@@ -3429,7 +3545,9 @@ struct Compiler::Impl : MetaHost {
             PendingFn p = pending_fns[i];
             cur = p.mod;
             tbind = p.bind;
+            lambda_outer = &p.outer;
             guarded([&] { define_fn(p.def, p.key, p.shown); }, &p);
+            lambda_outer = nullptr;
             tbind.clear();
             cur = nullptr;
         }

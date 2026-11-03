@@ -25,6 +25,7 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
     make            # needs llvm-18 and libclang-18 (headers + libraries)
     make test
     ./lisc prog.lsp [more.c|.o ...] [-o prog] [-O0..-O3] [-I dir] [-D NAME[=value]] [--emit-llvm] [-c] [-lname ...]
+    ./lisc fmt [--check] file.lsp ...   # the canonical layout (see below)
 
 Errors in function bodies are all reported (up to 20), not just the first.
 Warnings: a variable that is never read (name it `_x` to say that is meant),
@@ -34,6 +35,16 @@ often dropped on purpose and aren't warned about). `-w` turns them off.
 
 `:optnone` compiles a function as at `-O0` whatever the level: for code
 that runs once (setup, table builders) and is big enough to slow the build.
+Such functions are compiled as a unit of their own, with the code generator's
+fast path, and linked with the rest.
+
+`lisc fmt` lays files out the canonical way without moving line breaks: it
+sets each line's indentation (a body form's body 2 in; a call's arguments
+under its first one; a `let`'s or `defn`'s further `[bindings]` under the
+first; a comment line as the code after it), one space between tokens (none
+inside brackets; tokens written touching, like `a[i]` and `'x`, stay so),
+trailing comments at their column, no trailing whitespace, at most one blank
+line in a row. `--check` changes nothing and lists the files it would change.
 
 C imports are cached in `~/.cache/lisc` (or `$XDG_CACHE_HOME/lisc`): each C
 module's declarations and constants, keyed by its headers, the flags and the
@@ -92,7 +103,8 @@ Expressions — everything is one; statements have type `void`:
     (for [x :in xs] body...)  (for [i x :in xs] body...) — each element of an array, simd, slice, str,
       or a struct with data and len (a (vec T)), also through a pointer; x is the element itself
       (setting it sets the element), i its index (a u64)
-    (match x (case body...) ((case a b) body...) ... (else body...)) — see Variants
+    (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
+    (fn [a T] ... R body...) — a function written where it is used (see below)
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
     (defer e ...) — runs when the enclosing block exits (end, return, break, continue), innermost first
@@ -169,6 +181,19 @@ Typing rules:
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
+Functions can be written where they are used: `(fn [a T] ... R body...)` is
+a function pointer, typed `(ptr (fn (T ...) R))`:
+
+```lisp
+(sort-by (slice-of xs) (fn [a i32] [b i32] bool (> a b)))   ; descending
+(let [inc (fn [x i32] i32 (+ x 1))] (inc 41))
+```
+
+It is compiled as a function of its own: it sees globals and other functions
+(and, in a generic, the instance's types), but not the locals around it, so
+those are passed as arguments (an error says so when one is used). `(fn (T) R)`,
+with a list where the brackets are, is still the type.
+
 ## Variants
 
 A variant is a tagged union: a value that is one of its cases, each with its own fields.
@@ -188,7 +213,8 @@ A variant is a tagged union: a value that is one of its cases, each with its own
 
 `match` runs the clause of the case the value holds; `(case a b ...)` names
 the case's fields in order (`_` skips one), and the names are the fields
-themselves: `(set r 5.0)` changes the matched value, when that is a place. It
+themselves: `(set r 5.0)` changes the matched value, when that is a place;
+`((or circle rect) body...)` is any of several cases (without fields). It
 follows pointers. Without an `else`, every case must be there (or it's an
 error naming the one missing). A match is a value when its clauses are.
 
@@ -219,7 +245,7 @@ instead of stdout:
 ```
 
 Strings are written as they are (inside a struct, quoted); integers and floats
-as printf's `%d` and `%g`; `bool`s as `true`/`false`; enums as `color.blue`;
+as printf's `%d` and `%g` (`i128`s too); `bool`s as `true`/`false`; enums as `color.blue`;
 structs as `{name :field value ...}` (as `make` takes them); variants as
 `(shape.circle 2)` or `shape.none`; arrays, slices and simds as `[1 2 3]`;
 C strings (`(ptr i8)`) as text, other pointers as addresses. A program's own
@@ -246,6 +272,10 @@ power of two, up to 64 bytes): C's `__attribute__((vector_size))` types and
 - `(simd-sum v)` `(simd-hmin v)` `(simd-hmax v)` — all elements into one
   (`simd-sum` adds in order, so floats give what a loop would).
 - `(simd-min a b)` `(simd-max a b)` `(simd-abs v)` `(simd-sqrt v)` — element by element.
+- Comparisons give a mask, as C's do: a simd of signed integers as wide as
+  the elements, each -1 (true) or 0. `(simd-select m a b)` takes a's element
+  where m's is nonzero, else b's (numbers go to every element);
+  `(simd-any m)` and `(simd-all m)` are bools; `& | ^ ~` combine masks.
 - Simds up to 16 bytes pass in one SSE register as C's vectors do; bigger ones
   in memory, as C passes them without AVX.
 

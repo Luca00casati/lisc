@@ -1686,13 +1686,23 @@ struct Compiler::Impl : MetaHost {
             if (!tk.empty()) return c.types_[tk];
             fatal(f->loc, "unknown type '%s'", f->text.c_str());
         }
-        if (f->is_call("ptr") && f->size() == 2) return t_ptr(parse_type(f->at(1)));
-        if (f->is_call("slice") && f->size() == 2) return t_slice(parse_type(f->at(1)));
+        if (f->is_call("ptr") && f->size() == 2) {
+            Type *e = parse_type(f->at(1));
+            no_closure(e, f->loc, "behind a pointer");
+            return t_ptr(e);
+        }
+        if (f->is_call("slice") && f->size() == 2) {
+            Type *e = parse_type(f->at(1));
+            no_closure(e, f->loc, "in a slice");
+            return t_slice(e);
+        }
         if (f->is_call("array") && f->size() == 3) {
             Val n = expr(f->at(2), t_int(64, false));
             auto *k = llvm::dyn_cast<llvm::ConstantInt>(n.v);
             if (!k || !n.t->is_int()) fatal(f->at(2)->loc, "array length must be an integer constant");
-            return t_array(parse_type(f->at(1)), k->getZExtValue());
+            Type *e = parse_type(f->at(1));
+            no_closure(e, f->loc, "in an array");
+            return t_array(e, k->getZExtValue());
         }
         if (f->is_call("simd") && f->size() == 3) {
             Type *e = parse_type(f->at(1));
@@ -1729,6 +1739,18 @@ struct Compiler::Impl : MetaHost {
     }
 
     /* ------------------------------------------------------- helpers --- */
+
+    // A closure only goes down: a parameter, or a local it can't be set again.
+    // So nothing outlives the frame its captures live in, or keeps one made
+    // in an earlier pass of a loop (whose env the next pass reuses).
+    static bool is_closure(const Type *t) {
+        while (t->kind == Type::Array) t = t->elem;
+        return t->kind == Type::Struct && t->st->closure_of;
+    }
+    void no_closure(Type *t, Loc at, const char *what) {
+        if (is_closure(t))
+            fatal(at, "a closure can't be %s: it is only passed down, as an argument or a local (what it captured lives in the frame that made it)", what);
+    }
 
     [[noreturn]] void type_error(Loc at, const char *what, Type *want, Type *got) {
         fatal(at, "%s: expected %s, got %s", what, type_name(want).c_str(), type_name(got).c_str());
@@ -2284,6 +2306,7 @@ struct Compiler::Impl : MetaHost {
             if (Global *g = generic_value(f->at(1), want)) return {g->value, t_ptr(g->type)};  // (addr (name T ...))
             Val a = place(f->at(1));
             if (a.bwidth) fatal(f->at(1)->loc, "cannot take the address of a bit field");
+            no_closure(a.t, f->loc, "behind a pointer");
             return {a.v, t_ptr(a.t)};
         }
         if (hs == "truncate") {  // (truncate T e): the low bits of an integer, on purpose (never checked)
@@ -2828,6 +2851,7 @@ struct Compiler::Impl : MetaHost {
             Val v;
             bool undef = init && init->is_sym("undefined");
             if (undef && !t) fatal(init->loc, "undefined needs a type: (%s T undefined)", name.c_str());
+            if (t && is_closure(t) && (!init || undef)) fatal(bd->loc, "a closure local is given its closure: [%s T (fn ...)]", name.c_str());
             if (init && !undef) {
                 v = value_for(init, t, "initializer");
                 t = v.t;
@@ -2865,6 +2889,7 @@ struct Compiler::Impl : MetaHost {
     Val set(Form *f) {
         if (f->size() != 3) fatal(f->loc, "(set place value)");
         Val a = place(f->at(1));
+        no_closure(a.t, f->loc, "set again");
         Val v = value_for(f->at(2), a.t, "assignment");
         store(a, v.v);
         return {nullptr, t_void()};
@@ -3436,6 +3461,7 @@ struct Compiler::Impl : MetaHost {
             else if (v.t->kind == Type::Bool) v = cast(v, t_int(32, true), a->loc);
             else if (v.t == t_str()) fatal(a->loc, "cannot pass a str to a variadic function: for printf, \"%%.*s\" with (cast i32 s.len) and s.data, or a c\"...\" literal");
             else if (v.t->kind == Type::Array) fatal(a->loc, "cannot pass %s to a variadic function", type_name(v.t).c_str());
+            else no_closure(v.t, a->loc, "a variadic argument");
             var.push_back(v);
         }
         // A struct among the variadic arguments travels as it would as a fixed
@@ -3759,6 +3785,7 @@ struct Compiler::Impl : MetaHost {
                 if (!fd->is_list() || (fd->size() != 2 && !bits) || fd->at(0)->kind != Form::Sym)
                     fatal(fd->loc, "field must be (name T) or (name T :bits N)");
                 Field field{fd->at(0)->text, parse_type(fd->at(1)), 0};
+                no_closure(field.type, fd->loc, "a field");
                 if (bits) {
                     field.bit_width = (unsigned)fd->at(3)->ival;
                     if (!field.type->is_int() && field.type->kind != Type::Bool) fatal(fd->loc, "a bit field must be an integer or bool");
@@ -3793,8 +3820,7 @@ struct Compiler::Impl : MetaHost {
     void def_global(Form *f) {
         if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(def name T [init])");
         Type *t = parse_type(f->at(2));
-        if (t->kind == Type::Struct && t->st->closure_of)
-            fatal(f->at(2)->loc, "a closure can't be a global: what it captured lives in the frame of the function that made it");
+        no_closure(t, f->at(2)->loc, "a global");
         llvm::Constant *init = llvm::Constant::getNullValue(ll(t));  // zero unless given (or undefined)
         if (f->size() == 4) init = f->at(3)->is_sym("undefined") ? llvm::UndefValue::get(ll(t)) : constant(f->at(3), t);
         auto *gv = new llvm::GlobalVariable(mod, ll(t), false, llvm::GlobalValue::InternalLinkage, init, def_key(f->at(1)));
@@ -3886,8 +3912,7 @@ struct Compiler::Impl : MetaHost {
             ps.push_back(parse_type(p->at(1)));
         }
         Type *ft = t_fn(parse_type(f->at(3)), ps, false);
-        if (ft->elem->kind == Type::Struct && ft->elem->st->closure_of)
-            fatal(f->at(3)->loc, "a closure can't be returned: what it captured lives in the frame of the function that made it");
+        no_closure(ft->elem, f->at(3)->loc, "returned");
         // the program's main (in the first module) is the C entry point; everything else is internal
         bool entry = ikey.empty() && f->at(1)->text == "main" && cur == root;
         std::string name = entry ? "main" : !ikey.empty() ? ikey : def_key(f->at(1));

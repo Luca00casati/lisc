@@ -35,7 +35,6 @@
   (let [acc init]
     (for [x :in xs] (set acc (f acc x)))
     acc))
-(struct handler [on (closure (i32) void)])
 
 (defn closures [] void
   (let [k 10]
@@ -51,8 +50,8 @@
     (let [f (fn [s f32] f32 (* s (+ p[0] p[1])))]
       (set p[0] 0.5)                       ; seen: a capture is the variable itself
       (println (f 2.0)))
-    (let [h {handler :on (fn [v i32] void (set k v))}]
-      (h.on 7)
+    (let [on (fn [v i32] void (set k v))]
+      (run (fn [] void (on 7)))           ; a closure captured by another
       (println k))
     (sort-by (slice-of a) (fn [x i32] [y i32] bool (+= calls 1) (> x y)))
     (println a " " (> calls 0))

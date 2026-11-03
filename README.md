@@ -218,12 +218,14 @@ It captures them by reference: it reads and sets the variables themselves.
 ```
 
 A closure is two pointers: the function and its env (where the captures
-are). The env is in the frame of the function that made the closure, so a
-closure is good while that function runs: it can be passed down, held in
-locals and struct fields, but not returned or kept in a global (both are
-errors). A closure made again (in a loop) reuses its env. A plain function,
-or a fn without captures, goes wherever a closure is wanted. A generic
-parameter `[f F]` takes either, with no indirection added (`sort-by` does this).
+are, in the frame of the function that made it). So a closure only goes
+down: it is an argument, a parameter, or a local given one when it is made.
+It can't be set again, returned, kept in a global, a field, an array or a
+slice, or put behind a pointer (each is an error). Nothing then outlives the
+captured variables, and nothing keeps a closure from an earlier pass of a
+loop. A plain function, or a fn without captures, goes wherever a closure is
+wanted. A generic parameter `[f F]` takes either, with no indirection added
+(`sort-by` does this).
 
 A fn is compiled as a function of its own; in a generic, it sees the
 instance's types. `(fn (T) R)`, with a list where the brackets are, is

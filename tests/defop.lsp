@@ -6,7 +6,7 @@
 (struct rgb (r f32) (g f32) (b f32))
 
 ; generate componentwise + - * and = for a struct, by asking for its fields
-(defmacro derive-ops (T)
+(defmacro derive-ops! (T)
   (let ((fields (map first (type-fields T))))
     `(do ,@(map (lambda (op)
                   `(defop ,op ((a ,T) (b ,T)) ,T
@@ -15,8 +15,8 @@
          (defop = ((a ,T) (b ,T)) bool
            (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
 
-(derive-ops v3)
-(derive-ops rgb)
+(derive-ops! v3)
+(derive-ops! rgb)
 
 ; by hand: scalar times vector (either order), negation, dot product
 (defop * ((a v3) (k f32)) v3 (make v3 :x (* a.x k) :y (* a.y k) :z (* a.z k)))

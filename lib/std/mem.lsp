@@ -2,7 +2,7 @@
 (import "libc")
 
 ; (mem::new T n): n zeroed T's, a (ptr T); aborts if there is no memory
-(defmacro new (T n)
+(defmacro new! (T n)
   `(cast (ptr ,T) (zeroed (* (sizeof ,T) (cast u64 ,n)))))
 
 (defn zeroed [bytes u64] (ptr void)

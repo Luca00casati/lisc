@@ -27,7 +27,7 @@
      (set ,v[,j] tmp)))
 
 ; compile-time code takes them too
-(defmacro twice (x) (let [n 2] `(* ,n ,x)))
+(defmacro twice! (x) (let [n 2] `(* ,n ,x)))
 
 (defn main [] i32
   (let [a (array i32 5)]
@@ -45,5 +45,5 @@
     (printf c"grid %d %d  pts %g %g %g  l.to.y %g\n" grid[2][1] grid[1][2]
             (cast f64 pts[0].x) (cast f64 pts[0].y) (cast f64 pts[1].y) (cast f64 l.to.y))
     (let [q (swap {(pair i32 f64) :a 7 :b 0.5})]
-      (printf c"%g %d  %d %d  %d\n" q.a q.b (answer) (twice 21) (three)[2])))
+      (printf c"%g %d  %d %d  %d\n" q.a q.b (answer) (twice! 21) (three)[2])))
   0)

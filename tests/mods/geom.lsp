@@ -13,7 +13,7 @@
   (def calls i32 0))
 
 ; uses the private helper and counter: expands correctly in any module
-(defmacro doubled (e)
+(defmacro doubled! (e)
   `(do (set calls (+ calls 1)) (scale-by ,e 2.0)))
 (defn call-count () i32 calls)
 

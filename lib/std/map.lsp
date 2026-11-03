@@ -24,13 +24,13 @@
 
 (defmeta- by-value? (t) (let [k (type-kind t)] (or (eq k 'int) (eq k 'bool) (eq k 'ptr))))
 
-(defmacro- hash-of (x K)
+(defmacro- hash-of! (x K)
   (let [t (type-of x)]
     (cond ((eq t 'str) `(hash-bytes (. ,x data) (. ,x len)))
           ((by-value? t) `(mix (cast u64 ,x)))
           (else `(hash-bytes (cast (ptr u8) (addr ,x)) (sizeof ,K))))))
 
-(defmacro- same (a b K)
+(defmacro- same! (a b K)
   (let [t (type-of a)]
     (cond ((eq t 'str) `(and (= (. ,a len) (. ,b len)) (= (libc::memcmp (. ,a data) (. ,b data) (. ,a len)) 0)))
           ((by-value? t) `(= ,a ,b))
@@ -38,8 +38,8 @@
 
 ; where k is, or the free slot where it would go (cap > 0)
 (defn- (slot K V) [m (ptr (map K V))] [k K] u64
-  (let [mask (- m.cap 1)] [i (& (hash-of k K) mask)]
-    (while (and m.used[i] (not (same m.keys[i] k K)))
+  (let [mask (- m.cap 1)] [i (& (hash-of! k K) mask)]
+    (while (and m.used[i] (not (same! m.keys[i] k K)))
       (set i (& (+ i 1) mask)))
     i))
 
@@ -83,7 +83,7 @@
     ; isn't between the hole and them, so lookups still reach them
     (let [j (& (+ i 1) mask)]
       (while m.used[j]
-        (let [home (& (hash-of m.keys[j] K) mask)]
+        (let [home (& (hash-of! m.keys[j] K) mask)]
           (when (if (<= i j) (or (<= home i) (> home j)) (and (<= home i) (> home j)))
             (set m.keys[i] m.keys[j])
             (set m.vals[i] m.vals[j])
@@ -100,7 +100,7 @@
   (set (deref m) null))
 
 ; (for-each (k v m) body...): every entry, in no particular order (v is a copy)
-(defmacro for-each ((k v m) &body body)
+(defmacro for-each! ((k v m) &body body)
   `(let [mp ,m]
      (for [i u64 0 mp.cap]
        (when mp.used[i]

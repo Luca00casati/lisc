@@ -336,8 +336,13 @@ struct Compiler::Impl : MetaHost {
     ModInfo *mod_of(Form *sym) { return sym->mod ? &mods[sym->mod] : cur; }
 
     // the qualified name a definition in the current module gets
-    std::string def_key(Form *name) {
+    // macro: is this a defmacro's name? Macros' names end in ! (as in (swap! a b)),
+    // and only theirs, so a call to a macro is plain to see
+    std::string def_key(Form *name, bool macro = false) {
         if (name->text.find("::") != std::string::npos) fatal(name->loc, "a definition's name has no module part: %s", name->text.c_str());
+        bool bang = name->text.size() > 1 && name->text.back() == '!';
+        if (macro && !bang) fatal(name->loc, "a macro's name ends in !: %s!", name->text.c_str());
+        if (!macro && bang) fatal(name->loc, "only macros' names end in !: %s", name->text.c_str());
         return cur ? cur->name + "::" + name->text : name->text;
     }
 
@@ -3056,6 +3061,12 @@ struct Compiler::Impl : MetaHost {
                 std::string gk = generic_key(head, generic_fns);
                 if (!gk.empty()) g = infer_fn(generic_fns[gk], f);
             }
+            if (!g && head->text.size() > 1 && head->text.back() == '!') fatal(head->loc, "unknown macro '%s'", head->text.c_str());
+            if (!g) {  // a macro, written without its !
+                Form *bang = new Form(*head);
+                bang->text += "!";
+                if (!macro_key(bang).empty()) fatal(head->loc, "%s is a macro: write %s!", head->text.c_str(), head->text.c_str());
+            }
             if (!g) fatal(head->loc, at_top_typeof ? "unknown function '%s' (type-of in a top-level macro knows C functions, not the program's: they are declared after)" : "unknown function '%s'", head->text.c_str());
         } else if (head->is_list() && head->size() >= 2 && head->at(0)->kind == Form::Sym && !lookup_local(key(head->at(0))).v) {
             std::string gk = generic_key(head->at(0), generic_fns);  // ((name T ...) args...)
@@ -3185,7 +3196,7 @@ struct Compiler::Impl : MetaHost {
         each(items, [&](Form *f) {
             if (f->is_call("defmacro") || f->is_call("defmeta")) {
                 if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(%s name (params...) body...)", f->head());
-                std::string k = def_key(f->at(1));
+                std::string k = def_key(f->at(1), f->is_call("defmacro"));
                 meta.define(f, k);
                 note_private(f->at(1), k);
             } else all.push_back({f, cur});

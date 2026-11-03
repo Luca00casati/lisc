@@ -80,7 +80,7 @@ Top level:
 | `(defn name [a T] ... R [:noinline\|:inline\|:cold\|:optnone] body...)` | function (`[]`: no parameters); the last expression is the result |
 | `(extern name (T ... [...]) R)` | a C function by hand |
 | `(defop op [a T] ... R body...)` | an operator for these operand types |
-| `(defmacro name (params...) body...)` | a macro (see below) |
+| `(defmacro name! (params...) body...)` | a macro (see below); its name ends in `!` |
 | `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
 | `(defn- ...)` `(def- ...)` `(const- ...)` `(struct- ...)` `(defmacro- ...)` `(private form ...)` | names only their module can use |
 
@@ -312,7 +312,7 @@ be written qualified), then to `-D` constants. Definitions marked
 private (`defn-`, `(private ...)` ...) are unreachable from other modules.
 
 Macros are hygienic across modules too: the symbols of a macro's template
-resolve in the macro's own module, so `(geom::doubled v)` works anywhere
+resolve in the macro's own module, so `(geom::doubled! v)` works anywhere
 even though its expansion calls geom's private helpers. Operators (`defop`)
 are chosen by type, so they apply wherever their types are used.
 
@@ -342,11 +342,11 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | module | |
 |---|---|
 | `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
-| `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
+| `std/mem` | `(mem::new! T n)` — n zeroed T's; `free` |
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 | `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a `(ptr (fn (T T) bool))` |
 | `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
-| `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each (k v m) ...)`; keys by value, strs by contents, structs by bytes |
+| `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each! (k v m) ...)`; keys by value, strs by contents, structs by bytes |
 
 ## Operators
 
@@ -360,12 +360,17 @@ runtime cost.
 
 ## Macros
 
+A macro's name ends in `!`, and only a macro's does, so a call that is a
+macro is plain to see: `(swap! a b)`, `(mem::new! f32 4)`. (A call written
+without the `!` gets told so; `defmeta` helpers are functions, not macros,
+and have no `!`.)
+
 A macro is a function that runs inside the compiler, on forms: it receives its
 arguments unevaluated and returns the form to compile in its place. The
 language inside is a small Lisp (see `src/macro.h` for the full list):
 quasiquote, `if`/`cond`/`let`/`while`/`lambda`, list functions (`map`,
 `mapcat`, `filter`, `range`, ...), `sym`/`str`/`gensym`, and parameters that
-destructure (`(defmacro unroll ((i n) &body body) ...)`).
+destructure (`(defmacro unroll! ((i n) &body body) ...)`).
 
 Macros can ask about types: `(type-of e)` is the type `e` has where the macro
 is used, and `(type-kind T)`, `(type-elem T)`, `(type-fields T)` ... describe a
@@ -373,7 +378,7 @@ type. So a macro can dispatch on its argument's type, or generate code for every
 field of a struct:
 
 ```lisp
-(defmacro derive-ops (T)                 ; + - * and = for any struct, field by field
+(defmacro derive-ops! (T)                 ; + - * and = for any struct, field by field
   (let [fields (map first (type-fields T))]
     `(do ,@(map (lambda (op)
                   `(defop ,op [a ,T] [b ,T] ,T
@@ -382,7 +387,7 @@ field of a struct:
          (defop = [a ,T] [b ,T] bool
            (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
 
-(derive-ops v3)
+(derive-ops! v3)
 ```
 
 `type-of` works in top-level macros too, for types, literals and C

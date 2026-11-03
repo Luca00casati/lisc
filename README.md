@@ -33,10 +33,23 @@ code after a `return`/`break`/`continue`, and the result of a lisc function
 dropped (write `(discard (f x))` when that is meant; C functions' results are
 often dropped on purpose and aren't warned about). `-w` turns them off.
 
+Builds are parallel and incremental. The program is compiled in parts, one
+per module, each optimised and compiled to machine code on its own thread;
+small functions a part calls in other modules are copied into it for
+inlining, so splitting costs no speed. Each part's object is cached in
+`~/.cache/lisc/obj` under a hash of its exact code and the build's settings,
+so a rebuild compiles only the parts whose code changed (an edit to a small
+function also recompiles the parts that inline it); a comment or a change
+elsewhere costs nothing. The teapot ray tracer (~4000 lines, 14 parts, 4
+cores) builds at `-O2` in 0.9 s from scratch, 0.2 s with nothing changed,
+and 0.3–0.45 s after editing a module. `--no-cache` turns both caches off;
+objects unused for a month are removed. `-c` and `--emit-llvm` produce one
+file from one module.
+
 `:optnone` compiles a function as at `-O0` whatever the level: for code
 that runs once (setup, table builders) and is big enough to slow the build.
-Such functions are compiled as a unit of their own, with the code generator's
-fast path, and linked with the rest.
+A module's optnone functions are a part of their own, compiled with the code
+generator's fast path.
 
 `lisc fmt` lays files out the canonical way without moving line breaks: it
 sets each line's indentation (a body form's body 2 in; a call's arguments
@@ -52,8 +65,8 @@ lisc binary, and checked against every file the headers read (path, size,
 modification time). A build with a warm cache does no header parsing.
 `--no-cache` imports from the headers every time.
 
-`--time` reports how long each phase took (front end, optimiser, code
-generation, link); `-O0` builds fastest.
+`--time` reports how long each phase took (front end, compiling the parts,
+link) and how many parts came from the cache; `-O0` builds fastest.
 
 `--checks` builds with run-time checks that stop the program with the source
 location: indexing arrays, slices and strs out of bounds, integer casts that

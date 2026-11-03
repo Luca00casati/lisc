@@ -595,3 +595,6 @@ void c_include(Compiler &c, const std::vector<std::string> &headers, Loc at) {
     mkdir(dir.c_str(), 0755);
     save(path, key, deps, im.decls);
 }
+
+// ~/.cache/lisc (or $XDG_CACHE_HOME/lisc), for build.cpp's object cache too
+std::string lisc_cache_dir() { return cache_dir(); }

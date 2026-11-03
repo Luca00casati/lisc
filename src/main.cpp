@@ -31,6 +31,7 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
 
+#include "build.h"
 #include "compiler.h"
 
 namespace {
@@ -62,135 +63,6 @@ int run(const std::vector<std::string> &argv) {
     int st = 0;
     waitpid(pid, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-}
-
-void optimize(llvm::Module &m, llvm::TargetMachine *tm, int level) {
-    if (level == 0) return;
-    llvm::LoopAnalysisManager lam;
-    llvm::FunctionAnalysisManager fam;
-    llvm::CGSCCAnalysisManager cgam;
-    llvm::ModuleAnalysisManager mam;
-    // the standard instrumentation is what makes passes skip optnone functions
-    llvm::PassInstrumentationCallbacks pic;
-    llvm::StandardInstrumentations si(m.getContext(), false);
-    si.registerCallbacks(pic, &mam);
-    llvm::PassBuilder pb(tm, llvm::PipelineTuningOptions(), std::nullopt, &pic);
-    pb.registerModuleAnalyses(mam);
-    pb.registerCGSCCAnalyses(cgam);
-    pb.registerFunctionAnalyses(fam);
-    pb.registerLoopAnalyses(lam);
-    pb.crossRegisterProxies(lam, fam, cgam, mam);
-    const llvm::OptimizationLevel levels[] = {llvm::OptimizationLevel::O0, llvm::OptimizationLevel::O1,
-                                              llvm::OptimizationLevel::O2, llvm::OptimizationLevel::O3};
-    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(levels[level]);
-    mpm.run(m, mam);
-}
-
-// Struct and array values copied whole — a load of one straight into a store,
-// or a zero stored — become memcpy / memset. The optimiser does that itself,
-// but not in optnone functions (and not at -O0); there, the code generator's
-// fast instruction selector can't handle whole-aggregate loads and stores and
-// falls back to the slow one for the whole function.
-void lower_aggregate_copies(llvm::Module &m) {
-    const llvm::DataLayout &dl = m.getDataLayout();
-    for (llvm::Function &f : m) {
-        if (f.isDeclaration()) continue;
-        std::vector<llvm::StoreInst *> zeros;
-        std::vector<llvm::LoadInst *> loads;
-        for (llvm::BasicBlock &bb : f)
-            for (llvm::Instruction &i : bb) {
-                if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&i)) {
-                    if (llvm::isa<llvm::ConstantAggregateZero>(st->getValueOperand()) && !st->isVolatile()) zeros.push_back(st);
-                } else if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&i)) {
-                    if (!ld->getType()->isAggregateType() || ld->isVolatile() || ld->use_empty()) continue;
-                    bool only_stored = true;  // (used only as the value of stores)
-                    for (llvm::User *u : ld->users()) {
-                        auto *st = llvm::dyn_cast<llvm::StoreInst>(u);
-                        only_stored &= st && st->getValueOperand() == ld && st->getPointerOperand() != ld && !st->isVolatile();
-                    }
-                    if (only_stored) loads.push_back(ld);
-                }
-            }
-        for (llvm::StoreInst *st : zeros) {
-            llvm::IRBuilder<> b(st);
-            b.CreateMemSet(st->getPointerOperand(), b.getInt8(0), dl.getTypeStoreSize(st->getValueOperand()->getType()), st->getAlign());
-            st->eraseFromParent();
-        }
-        for (llvm::LoadInst *ld : loads) {
-            uint64_t size = dl.getTypeStoreSize(ld->getType());
-            llvm::Value *src = ld->getPointerOperand();
-            llvm::MaybeAlign src_align = ld->getAlign();
-            // one store right after, nothing written between: copy straight from the source
-            auto *only = ld->hasOneUse() ? llvm::cast<llvm::StoreInst>(*ld->user_begin()) : nullptr;
-            bool direct = only && only->getParent() == ld->getParent();
-            for (llvm::Instruction *i = ld->getNextNode(); direct && i != only; i = i->getNextNode()) direct = !i->mayWriteToMemory();
-            if (!direct) {  // otherwise a copy taken where the load was
-                llvm::IRBuilder<> eb(&f.getEntryBlock(), f.getEntryBlock().begin());
-                llvm::AllocaInst *tmp = eb.CreateAlloca(ld->getType());
-                tmp->setAlignment(ld->getAlign());
-                llvm::IRBuilder<> b(ld);
-                b.CreateMemCpy(tmp, ld->getAlign(), src, ld->getAlign(), size);
-                src = tmp;
-            }
-            std::vector<llvm::StoreInst *> sts;
-            for (llvm::User *u : ld->users()) sts.push_back(llvm::cast<llvm::StoreInst>(u));
-            for (llvm::StoreInst *st : sts) {
-                llvm::IRBuilder<> b(st);
-                b.CreateMemCpy(st->getPointerOperand(), st->getAlign(), src, src_align, size);
-                st->eraseFromParent();
-            }
-            ld->eraseFromParent();
-        }
-    }
-}
-
-// The optnone functions, moved to a module of their own (returned; null if
-// there are none), to be compiled as at -O0: the fast instruction selector
-// and register allocator, which is what optnone asks for anyway — in the
-// optimised module the code generator gives them its full (slow) treatment.
-// Names the two modules share become hidden externals; constants are copied.
-std::unique_ptr<llvm::Module> split_optnone(llvm::Module &m) {
-    bool any = false;
-    for (llvm::Function &f : m) any |= !f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::OptimizeNone);
-    if (!any) return nullptr;
-    auto copied = [](const llvm::GlobalValue *g) {  // a constant both modules get a copy of
-        auto *v = llvm::dyn_cast<llvm::GlobalVariable>(g);
-        return v && v->isConstant() && v->hasLocalLinkage();
-    };
-    int n = 0;
-    for (llvm::GlobalValue &g : m.global_values()) {
-        if (g.isDeclaration() || !g.hasLocalLinkage() || copied(&g)) continue;
-        if (!g.hasName()) g.setName("lisc.anon." + std::to_string(n++));
-        g.setLinkage(llvm::GlobalValue::ExternalLinkage);
-        g.setVisibility(llvm::GlobalValue::HiddenVisibility);
-        g.setDSOLocal(true);
-    }
-    llvm::ValueToValueMapTy vmap;
-    std::unique_ptr<llvm::Module> m0 = llvm::CloneModule(m, vmap, [&](const llvm::GlobalValue *g) {
-        auto *f = llvm::dyn_cast<llvm::Function>(g);
-        return (f && f->hasFnAttribute(llvm::Attribute::OptimizeNone)) || copied(g);
-    });
-    for (llvm::GlobalValue &g : m0->global_values())
-        if (g.isDeclaration() && !g.hasDefaultVisibility()) g.setDSOLocal(true);
-    for (llvm::Function &f : m)
-        if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::OptimizeNone)) {
-            f.deleteBody();
-            f.setDSOLocal(true);
-        }
-    return m0;
-}
-
-bool emit_object(llvm::Module &m, llvm::TargetMachine *tm, const std::string &path) {
-    std::error_code ec;
-    llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
-    if (ec) { fprintf(stderr, "lisc: %s: %s\n", path.c_str(), ec.message().c_str()); return false; }
-    llvm::legacy::PassManager pm;
-    if (tm->addPassesToEmitFile(pm, os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
-        fprintf(stderr, "lisc: the target cannot emit object files\n");
-        return false;
-    }
-    pm.run(m);
-    return true;
 }
 
 }  // namespace
@@ -265,41 +137,39 @@ int main(int argc, char **argv) {
     std::string features;
     if (llvm::sys::getHostCPUFeatures(host))
         for (auto &f : host) features += (features.empty() ? "" : ",") + std::string(f.second ? "+" : "-") + f.first().str();
-    auto machine = [&](llvm::CodeGenOptLevel level) {
-        return target->createTargetMachine(triple, llvm::sys::getHostCPUName(), features, llvm::TargetOptions(), llvm::Reloc::PIC_,
-                                           std::nullopt, level);
-    };
-    llvm::TargetMachine *tm = machine(opt == 0 ? llvm::CodeGenOptLevel::None : opt == 1 ? llvm::CodeGenOptLevel::Less
-                                      : opt == 2 ? llvm::CodeGenOptLevel::Default : llvm::CodeGenOptLevel::Aggressive);
+    Target t{target, triple, llvm::sys::getHostCPUName().str(), features};
+    llvm::TargetMachine *tm = t.machine(opt);
     m.setDataLayout(tm->createDataLayout());
     m.setTargetTriple(triple);
     phase("setup");
-    optimize(m, tm, opt);
-    lower_aggregate_copies(m);
-    phase("optimise");
 
-    std::error_code ec;
-    if (emit_llvm) {
-        llvm::raw_fd_ostream os(out, ec, llvm::sys::fs::OF_Text);
-        if (ec) { fprintf(stderr, "lisc: %s: %s\n", out.c_str(), ec.message().c_str()); return 1; }
-        m.print(os, nullptr);
-        return 0;
+    std::vector<std::string> objects, temps;
+    if (emit_llvm || object_only) {  // one module, one file
+        optimize(m, tm, opt);
+        lower_aggregate_copies(m);
+        phase("optimise");
+        std::error_code ec;
+        if (emit_llvm) {
+            llvm::raw_fd_ostream os(out, ec, llvm::sys::fs::OF_Text);
+            if (ec) { fprintf(stderr, "lisc: %s: %s\n", out.c_str(), ec.message().c_str()); return 1; }
+            m.print(os, nullptr);
+            return 0;
+        }
+        bool ok = emit_object(m, tm, out);
+        phase("codegen");
+        return ok ? 0 : 1;
     }
-    std::string obj = object_only ? out : out + ".o", obj0 = out + ".optnone.o";
-    std::unique_ptr<llvm::Module> m0 = opt > 0 && !object_only ? split_optnone(m) : nullptr;
-    if (!emit_object(m, tm, obj)) return 1;
-    phase("codegen");
-    if (m0) {
-        if (!emit_object(*m0, machine(llvm::CodeGenOptLevel::None), obj0)) return 1;
-        phase("codegen optnone");
-    }
-    if (object_only) return 0;
-    std::vector<std::string> link = {"cc", "-o", out, obj, "-lm"};
-    if (m0) link.push_back(obj0);
+    // a part per lisc module, compiled in parallel, from the object cache when unchanged
+    BuildStats stats;
+    if (!build_parts(m, t, opt, c_cache, out + ".part", objects, temps, stats)) return 1;
+    if (timing) fprintf(stderr, "lisc: %zu parts, %zu compiled, %zu from the cache\n", stats.parts, stats.compiled, stats.parts - stats.compiled);
+    phase("compile");
+    std::vector<std::string> link = {"cc", "-o", out};
+    link.insert(link.end(), objects.begin(), objects.end());
+    link.push_back("-lm");
     link.insert(link.end(), libs.begin(), libs.end());
     int r = run(link);
     phase("link");
-    unlink(obj.c_str());
-    if (m0) unlink(obj0.c_str());
+    for (auto &f : temps) unlink(f.c_str());
     return r;
 }

@@ -501,6 +501,22 @@ struct Compiler::Impl : MetaHost {
 
     void add_forms(const std::vector<Form *> &fs, ModInfo *m) {
         for (Form *f : fs) {
+            if (f->is_call("if-defined")) {
+                // at the top level, like #ifdef around #include: the chosen branch's
+                // forms (a (do ...) for several) are the module's, imports included;
+                // the names that count are the -D ones (the program's aren't known yet)
+                if (f->size() < 3 || f->size() > 4 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(if-defined NAME then [else])");
+                auto d = c.globals_.find(f->at(1)->text);
+                bool yes = d != c.globals_.end() && d->second.kind == Global::Const && d->second.form && d->second.form->loc.file &&
+                           !strcmp(d->second.form->loc.file, "<-D>");
+                Form *pick = yes ? f->at(2) : f->size() == 4 ? f->at(3) : nullptr;
+                if (!pick) continue;
+                std::vector<Form *> chosen;
+                if (pick->is_call("do")) chosen.assign(pick->items.begin() + 1, pick->items.end());
+                else chosen.push_back(pick);
+                add_forms(chosen, m);
+                continue;
+            }
             if (f->is_call("import")) {
                 // (import "path" [:as alias]); the path is relative to this file, .lsp optional;
                 // "libc" and "math" are the C modules built in

@@ -164,7 +164,8 @@ Expressions — everything is one; statements have type `void`:
     {T :field e ...} = (make T :field e ...)  {(array T N) e ...}  — the rest is zero
     "text" is a str;  c"text" is a C string;  #\a #\é #\newline — a character's code point;  true false
     null — the zero value of the wanted type;  undefined — no value at all
-    (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one
+    (defined NAME)  (if-defined NAME then [else]) — compile-time, like #ifdef; -D NAME[=value] defines one;
+      at the top level it chooses imports and definitions ((do ...) for several), by -D names only
 
 Three kinds of brackets:
 

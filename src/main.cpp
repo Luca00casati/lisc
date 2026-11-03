@@ -16,6 +16,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -81,6 +83,64 @@ void optimize(llvm::Module &m, llvm::TargetMachine *tm, int level) {
                                               llvm::OptimizationLevel::O2, llvm::OptimizationLevel::O3};
     llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(levels[level]);
     mpm.run(m, mam);
+}
+
+// Struct and array values copied whole — a load of one straight into a store,
+// or a zero stored — become memcpy / memset. The optimiser does that itself,
+// but not in optnone functions (and not at -O0); there, the code generator's
+// fast instruction selector can't handle whole-aggregate loads and stores and
+// falls back to the slow one for the whole function.
+void lower_aggregate_copies(llvm::Module &m) {
+    const llvm::DataLayout &dl = m.getDataLayout();
+    for (llvm::Function &f : m) {
+        if (f.isDeclaration()) continue;
+        std::vector<llvm::StoreInst *> zeros;
+        std::vector<llvm::LoadInst *> loads;
+        for (llvm::BasicBlock &bb : f)
+            for (llvm::Instruction &i : bb) {
+                if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&i)) {
+                    if (llvm::isa<llvm::ConstantAggregateZero>(st->getValueOperand()) && !st->isVolatile()) zeros.push_back(st);
+                } else if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&i)) {
+                    if (!ld->getType()->isAggregateType() || ld->isVolatile() || ld->use_empty()) continue;
+                    bool only_stored = true;  // (used only as the value of stores)
+                    for (llvm::User *u : ld->users()) {
+                        auto *st = llvm::dyn_cast<llvm::StoreInst>(u);
+                        only_stored &= st && st->getValueOperand() == ld && st->getPointerOperand() != ld && !st->isVolatile();
+                    }
+                    if (only_stored) loads.push_back(ld);
+                }
+            }
+        for (llvm::StoreInst *st : zeros) {
+            llvm::IRBuilder<> b(st);
+            b.CreateMemSet(st->getPointerOperand(), b.getInt8(0), dl.getTypeStoreSize(st->getValueOperand()->getType()), st->getAlign());
+            st->eraseFromParent();
+        }
+        for (llvm::LoadInst *ld : loads) {
+            uint64_t size = dl.getTypeStoreSize(ld->getType());
+            llvm::Value *src = ld->getPointerOperand();
+            llvm::MaybeAlign src_align = ld->getAlign();
+            // one store right after, nothing written between: copy straight from the source
+            auto *only = ld->hasOneUse() ? llvm::cast<llvm::StoreInst>(*ld->user_begin()) : nullptr;
+            bool direct = only && only->getParent() == ld->getParent();
+            for (llvm::Instruction *i = ld->getNextNode(); direct && i != only; i = i->getNextNode()) direct = !i->mayWriteToMemory();
+            if (!direct) {  // otherwise a copy taken where the load was
+                llvm::IRBuilder<> eb(&f.getEntryBlock(), f.getEntryBlock().begin());
+                llvm::AllocaInst *tmp = eb.CreateAlloca(ld->getType());
+                tmp->setAlignment(ld->getAlign());
+                llvm::IRBuilder<> b(ld);
+                b.CreateMemCpy(tmp, ld->getAlign(), src, ld->getAlign(), size);
+                src = tmp;
+            }
+            std::vector<llvm::StoreInst *> sts;
+            for (llvm::User *u : ld->users()) sts.push_back(llvm::cast<llvm::StoreInst>(u));
+            for (llvm::StoreInst *st : sts) {
+                llvm::IRBuilder<> b(st);
+                b.CreateMemCpy(st->getPointerOperand(), st->getAlign(), src, src_align, size);
+                st->eraseFromParent();
+            }
+            ld->eraseFromParent();
+        }
+    }
 }
 
 }  // namespace
@@ -160,6 +220,7 @@ int main(int argc, char **argv) {
     m.setTargetTriple(triple);
     phase("setup");
     optimize(m, tm, opt);
+    lower_aggregate_copies(m);
     phase("optimise");
 
     std::error_code ec;

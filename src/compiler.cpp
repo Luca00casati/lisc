@@ -1991,6 +1991,8 @@ struct Compiler::Impl : MetaHost {
             return construct(f->at(0), std::vector<Form *>(f->items.begin() + 1, f->items.end()), want, f->loc);
         if (*h && !strcmp(h, ".") && variant_case(f, vk, vci)) return construct(f, {}, want, f->loc);  // shape.none
         if (!*h) return call(f);
+        Val nr;
+        if (named_call(f, nr)) return nr;
         std::string hs = h;
         if (is_arith(h)) return arith(f, want);
         if (is_cmp(h)) return compare(f);
@@ -2243,7 +2245,7 @@ struct Compiler::Impl : MetaHost {
         if (it == generic_ops.end()) return;
         bool any_struct = false;
         for (auto &x : xs) any_struct |= x.v.v && x.v.t->kind == Type::Struct;
-        if (!any_struct) return;
+        if (!any_struct && !named_ops.count(op)) return;  // (a named defop's are for any types)
         for (Generic *g : it->second) {
             Form *ps = g->def->at(2);
             if (ps->size() != xs.size()) continue;
@@ -2290,6 +2292,50 @@ struct Compiler::Impl : MetaHost {
         if (inst == instance_of.end() || inst->second.first != &generic_structs[gk]) return false;
         for (size_t j = 1; j < pat->size() && j - 1 < inst->second.second.size(); j++)
             if (!fits(g, pat->at(j), inst->second.second[j - 1], b)) return false;
+        return true;
+    }
+
+    // defop of a name rather than an operator: (defop min [a v3] [b v3] v3 ...)
+    // overloads a function, by the types of its arguments, in its module like
+    // other names. Its table key is module::name (an operator's is the operator).
+    std::set<std::string> named_ops;
+    std::string named_op(Form *name) {
+        if (is_arith(name->text.c_str()) || is_cmp(name->text.c_str())) return name->text;
+        std::string k = def_key(name);
+        named_ops.insert(k);
+        note_private(name, k);
+        return k;
+    }
+    // (name args...) where name is defined with defop: the definition the arguments' types pick
+    bool named_call(Form *f, Val &r) {
+        Form *head = f->at(0);
+        if (head->kind != Form::Sym || named_ops.empty() || lookup_local(key(head)).v) return false;
+        std::string k = resolve(head, [&](const std::string &s) { return named_ops.count(s) != 0; });
+        if (k.empty()) return false;
+        std::vector<Opnd> xs = opnds(f);
+        bool found;
+        r = overload(k, xs, f->loc, &found);
+        Global *gl = found ? nullptr : lookup_global(head);
+        if (gl && gl->kind == Global::Func) {  // another module's function of that name, say: its values as they are
+            Type *ft = gl->type;
+            size_t n = xs.size();
+            if (n < ft->params.size() || (n > ft->params.size() && !ft->variadic))
+                fatal(f->loc, "%s takes %zu argument%s, got %zu", head->text.c_str(), ft->params.size(), ft->params.size() == 1 ? "" : "s", n);
+            std::vector<Val> fixed, var;
+            for (size_t i = 0; i < n; i++) {
+                Type *pt = i < ft->params.size() ? ft->params[i] : nullptr;
+                Val v = xs[i].v.v ? xs[i].v : expr(xs[i].f, pt);
+                if (pt) fixed.push_back(coerce(v, pt, xs[i].f->loc, "argument"));
+                else var.push_back(v);
+            }
+            r = emit_call(gl->value, ft, fixed, var);
+            return true;
+        }
+        if (!found) {
+            std::string ts;
+            for (auto &x : xs) ts += " " + (x.v.v ? type_name(x.v.t) : show(x.f));
+            fatal(f->loc, "no definition of %s takes (%s%s)", head->text.c_str(), head->text.c_str(), ts.c_str());
+        }
         return true;
     }
 
@@ -3059,7 +3105,21 @@ struct Compiler::Impl : MetaHost {
             g = lookup_global(head);
             if (!g) {  // a generic function: for the types of the arguments
                 std::string gk = generic_key(head, generic_fns);
-                if (!gk.empty()) g = infer_fn(generic_fns[gk], f);
+                if (!gk.empty()) {
+                    // (new f32 4): the types written first, as (new T) [n u64] takes them
+                    Generic &gen = generic_fns[gk];
+                    size_t nt = gen.params.size(), np = gen.def->at(2)->size();
+                    bool typed = f->size() - 1 == nt + np;
+                    for (size_t i = 1; typed && i <= nt; i++) typed = is_type_form(f->at(i));
+                    if (typed) {
+                        std::vector<Form *> inst{head};
+                        inst.insert(inst.end(), f->items.begin() + 1, f->items.begin() + 1 + nt);
+                        std::vector<Form *> items{mk_list(head->loc, inst)};
+                        items.insert(items.end(), f->items.begin() + 1 + nt, f->items.end());
+                        return call(mk_list(f->loc, items));
+                    }
+                    g = infer_fn(gen, f);
+                }
             }
             if (!g && head->text.size() > 1 && head->text.back() == '!') fatal(head->loc, "unknown macro '%s'", head->text.c_str());
             if (!g) {  // a macro, written without its !
@@ -3271,8 +3331,8 @@ struct Compiler::Impl : MetaHost {
             if (f->size() >= 5 && f->at(1)->is_list() && f->at(1)->size() >= 2 && f->at(1)->at(0)->kind == Form::Sym) {
                 // (defop (op T ...) params R body...): a generic function under a name of its own
                 std::vector<Form *> items = f->items, name = f->at(1)->items;
-                std::string op = name[0]->text;
-                name[0] = mk_sym(name[0]->loc, op + "#" + std::to_string(++generic_op_count));
+                std::string op = named_op(name[0]);
+                name[0] = mk_sym(name[0]->loc, name[0]->text + "#" + std::to_string(++generic_op_count));
                 name[0]->mod = f->at(1)->at(0)->mod;
                 items[0] = mk_sym(f->loc, "defn");
                 items[1] = mk_list(f->at(1)->loc, name);
@@ -3291,7 +3351,7 @@ struct Compiler::Impl : MetaHost {
             std::vector<Form *> items = f->items;
             items[0] = mk_sym(f->loc, "defn");
             items[1] = mk_sym(f->at(1)->loc, name);
-            std::string op = f->at(1)->text;
+            std::string op = named_op(f->at(1));
             f = mk_list(f->loc, items);
             ops.push_back({op, def_key(f->at(1))});
         }
@@ -3319,6 +3379,8 @@ struct Compiler::Impl : MetaHost {
                 fatal(f->loc, "unknown top-level form %s", show(f).c_str());
             }
         });
+        for (auto &k : named_ops)
+            if (c.globals_.count(k)) fatal(c.globals_[k].def ? c.globals_[k].def->loc : Loc{}, "%s is both a function and a defop", bare(k).c_str());
         for (auto &o : ops) overloads[o.first].push_back(&c.globals_[o.second]);
         for (auto &o : generic_op_keys) {
             generic_ops[o.first].push_back(&generic_fns[o.second]);

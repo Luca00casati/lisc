@@ -266,6 +266,16 @@ specialised (compiled anew) for each list of types it is used with:
   (biggest 2.5 1.0))             ; only literals: their own type (f64)
 ```
 
+When the arguments can't tell T, the types go first in the call:
+
+```lisp
+(defn (new T) [n u64] (ptr T) ...)   ; std/mem
+(mem::new f32 4)                     ; T = f32, n = 4
+```
+
+That is, a call that starts with as many types as the function has type
+parameters, followed by its arguments, gives T outright.
+
 Inside, a parameter is the type itself, not its name: `(sizeof T)`,
 `(cast (ptr T) p)`, `(let [s T null] ...)` and macros' `type-of` all see the
 instance's types, whichever module they come from. An error in an instance
@@ -342,7 +352,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | module | |
 |---|---|
 | `std/str` | `eq` `starts-with` `ends-with` `find` on `str`; `from-c` / `to-c` (C strings); `print` `fprint` |
-| `std/mem` | `(mem::new! T n)` — n zeroed T's; `free` |
+| `std/mem` | `(mem::new T n)` — n zeroed T's; `free` |
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 | `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a `(ptr (fn (T T) bool))` |
 | `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
@@ -358,10 +368,24 @@ literal operand takes the type the definition wants (`(* 2.0 v)` with
 Definitions are ordinary functions, so the optimiser inlines them: there is no
 runtime cost.
 
+`defop` also overloads a name: a function with several definitions, chosen by
+the types of the arguments (and their number), in its module like other names:
+
+```lisp
+(defop min [a f32] [b f32] f32 (if (< a b) a b))
+(defop min [a v3] [b v3] v3 {v3 :x (min a.x b.x) :y (min a.y b.y) :z (min a.z b.z)})
+(defop show [s str] void ...)
+(defop (twice T) [x T] T (+ x x))     ; generic ones take any types
+```
+
+A name is either a `defn` or a `defop` in a module, not both. Where another
+module's plain function has the same name (`math::pow` and a `defop pow`),
+arguments no definition fits go to that function.
+
 ## Macros
 
 A macro's name ends in `!`, and only a macro's does, so a call that is a
-macro is plain to see: `(swap! a b)`, `(mem::new! f32 4)`. (A call written
+macro is plain to see: `(swap! a b)`, `(map::for-each! (k v m) ...)`. (A call written
 without the `!` gets told so; `defmeta` helpers are functions, not macros,
 and have no `!`.)
 

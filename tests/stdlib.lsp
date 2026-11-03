@@ -13,7 +13,7 @@
             (cast i32 (str::ends-with s ".lsp")) (str::find s #\.))
     (printf c"to-c: %s  from-c: %lu bytes\n" (str::to-c s (addr (aref buf 0)) 16) (. (str::from-c c"hello") len))
     (str::print "printed as a str\n"))
-  (let ((xs (mem::new! f32 4)))
+  (let ((xs (mem::new f32 4)))
     (set (aref xs 3) 2.5)
     (printf c"mem::new %g %g\n" (cast f64 (aref xs 0)) (cast f64 (aref xs 3)))
     (mem::free xs))

@@ -93,7 +93,12 @@ teapot's CPU side is about 4% slower with all of them on. To leave them out:
 `(unchecked body...)` for a block, `:unchecked` after a function's result type
 for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
 `--no-checks` for the whole build. There, float casts are C's: a value out of
-range gives an undefined result.
+range gives an undefined result. `(cast-force T e)` is that plain conversion
+for one cast (no check, no saturation; an integer keeps its low bits), for hot
+code whose values are known to fit; its operand is still checked.
+
+A failed check flushes what the program printed before it, then prints the
+error to stderr and aborts.
 
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
 prints variables (structs, arrays, enums with their member names); code a
@@ -150,7 +155,7 @@ Expressions — everything is one; statements have type `void`:
     (atomic-load p) (atomic-store p v) (atomic-swap/add/sub/and/or/xor p v) (atomic-cas p old new) (fence)
       — each with an optional :relaxed :acquire :release :acq-rel :seq-cst (default)
     (. x field ...) — also written x.field.sub; pointers are followed automatically
-    a[i] = (aref a i)  (deref p)  (addr place)  (cast T e)  (truncate T e)  (bitcast T e)  (sizeof T)  (alignof T)
+    a[i] = (aref a i)  (deref p)  (addr place)  (cast T e)  (cast-force T e)  (truncate T e)  (bitcast T e)  (sizeof T)  (alignof T)
     {T :field e ...} = (make T :field e ...)  {(array T N) e ...}  — the rest is zero
     "text" is a str;  c"text" is a C string;  #\a #\é #\newline — a character's code point;  true false
     null — the zero value of the wanted type;  undefined — no value at all

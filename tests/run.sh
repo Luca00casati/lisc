@@ -49,6 +49,12 @@ for src in safety/*.lsp; do
         fail=$((fail + 1)); echo "FAIL $src: want '$want', got '$(cat out/check.err out/check.txt)'"
     fi
 done
+# a failed check prints what the program printed before it
+if ../lisc safety/castforce-operand.lsp -o out/check 2>/dev/null && ./out/check 2>/dev/null | grep -q "printed before the abort"; then
+    pass=$((pass + 1))
+else
+    fail=$((fail + 1)); echo "FAIL: output before a failed check was lost"
+fi
 # --no-checks, (unchecked ...) and :unchecked leave the checks out
 nochecks() {
     if ../lisc -O0 -w --emit-llvm "$@" -o out/nc.ll && ! grep -q '^check.fail' out/nc.ll; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL checks left in: $*"; fi

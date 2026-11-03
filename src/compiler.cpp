@@ -263,6 +263,8 @@ struct Compiler::Impl : MetaHost {
         f->addFnAttr(llvm::Attribute::NoInline);
         f->addFnAttr(llvm::Attribute::NoUnwind);
         llvm::IRBuilder<> e(BasicBlock::Create(ctx, "entry", f));
+        // what the program printed so far comes out first
+        e.CreateCall(mod.getOrInsertFunction("fflush", e.getInt32Ty(), e.getPtrTy()), {llvm::ConstantPointerNull::get(e.getPtrTy())});
         auto *va_list_t = llvm::ArrayType::get(e.getInt8Ty(), 24);  // x86-64 SysV va_list
         llvm::Value *ap = e.CreateAlloca(va_list_t);
         e.CreateIntrinsic(llvm::Intrinsic::vastart, {}, {ap});
@@ -2421,7 +2423,7 @@ struct Compiler::Impl : MetaHost {
             if (!v.t->is_int() || !to->is_int()) fatal(f->loc, "truncate is for integers: %s to %s", type_name(v.t).c_str(), type_name(to).c_str());
             return {b.CreateIntCast(v.v, ll(to), v.t->sign), to};
         }
-        if (hs == "cast" || hs == "bitcast") {
+        if (hs == "cast" || hs == "bitcast" || hs == "cast-force") {
             if (f->size() != 3) fatal(f->loc, "(%s T e)", h);
             Type *to = parse_type(f->at(1));
             // an integer literal is read as the type it is cast to (so
@@ -2429,7 +2431,14 @@ struct Compiler::Impl : MetaHost {
             if (hs == "cast" && f->at(2)->kind == Form::Int && to->is_int()) return expr(f->at(2), to);
             // the operand keeps its own type (3.99 is an f64 here), then converts
             Val v = expr(f->at(2), nullptr);
-            return hs == "cast" ? cast(v, to, f->loc) : bitcast(v, to, f->loc);
+            if (hs == "bitcast") return bitcast(v, to, f->loc);
+            if (hs == "cast") return cast(v, to, f->loc);
+            // (cast-force T e): the conversion without a check or saturation: an
+            // integer keeps its low bits, a float out of range gives an undefined result
+            unchecked++;
+            Val r = cast(v, to, f->loc);
+            unchecked--;
+            return r;
         }
         if (hs == "sizeof" || hs == "alignof") {
             if (f->size() != 2) fatal(f->loc, "(%s T)", h);

@@ -7,16 +7,16 @@
 ; Quicksort (Hoare partition, middle pivot), insertion sort for short runs;
 ; not stable.
 
-(defn (sort-by T F) [s (slice T)] [less F] void
+(defn (sort-by T F) [s (slice T)] [less F]
   (quick s.data 0 (cast i64 s.len) less))
 
 (private
-  (defn (lt (T <)) [a T] [b T] bool (< a b)))
-(defn (sort (T <)) [s (slice T)] void (sort-by s (addr (lt T))))
+  (defn (lt (T <)) [a T] [b T] -> bool (return (< a b))))
+(defn (sort (T <)) [s (slice T)] (sort-by s (addr (lt T))))
 
 ; a[lo..hi)
 (private
-  (defn (quick T F) [a (ptr T)] [lo i64] [hi i64] [less F] void
+  (defn (quick T F) [a (ptr T)] [lo i64] [hi i64] [less F]
     (while (> (- hi lo) 16)
       (let [p a[(+ lo (/ (- hi lo) 2))]] [i lo] [j (- hi 1)]
         (while (<= i j)

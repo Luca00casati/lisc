@@ -2,12 +2,12 @@
 (import "libc")
 (using libc)
 (struct v2 [x f32] [y f32])
-(defop + [a v2] [b v2] v2 {v2 :x (+ a.x b.x) :y (+ a.y b.y)})
+(defop + [a v2] [b v2] -> v2 (return {v2 :x (+ a.x b.x) :y (+ a.y b.y)}))
 (struct flags [lo u8 :bits 3] [hi u8 :bits 5])
 (def calls i32 0)
-(defn idx [] i32 (+= calls 1) 2)                 ; counts how often it runs
+(defn idx [] -> i32 (+= calls 1) (return 2))                 ; counts how often it runs
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a {(array i32 4) 1 2 3 4}]
     (+= a[(idx)] 10)                         ; idx runs once
     (printf c"a[2] %d  idx calls %d\n" a[2] calls))
@@ -23,4 +23,4 @@
   (let [p (ptr i8) c"abcdef"]
     (+= p 2)                                       ; pointer arithmetic
     (printf c"p %s\n" p))
-  0)
+  (return 0))

@@ -42,6 +42,7 @@
 #include <functional>
 #include <set>
 
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/IRBuilder.h>
@@ -1393,7 +1394,7 @@ struct Compiler::Impl : MetaHost {
             lit = new Form(*f);
             lit->items.erase(lit->items.begin() + 1);
         }
-        if (lit->size() < 3) fatal(f->loc, heap ? "(fn :heap [a T] ... R body...)" : "(fn [a T] ... R body...)");
+        if (lit->size() < 2) fatal(f->loc, heap ? "(fn :heap [a T] ... [-> R] body...)" : "(fn [a T] ... [-> R] body...)");
         auto made = lambdas_made.find({f, fn});
         if (made != lambdas_made.end()) {
             LambdaMade &m = made->second;
@@ -1405,8 +1406,7 @@ struct Compiler::Impl : MetaHost {
         Form *name = mk_sym(f->loc, "fn#" + std::to_string(++lambda_count));
         std::vector<Form *> items{mk_sym(f->loc, "defn"), name};
         items.insert(items.end(), lit->items.begin() + 1, lit->items.end());
-        Form *def = unbracket(mk_list(f->loc, items), 2);
-        if (def->size() < 4) fatal(f->loc, "(fn [a T] ... R body...): the result type is missing");
+        Form *def = signature(unbracket(mk_list(f->loc, items), 2), 2);
         // the captures: the locals around it its code names (not its parameters)
         std::set<std::string> outer, params;
         for (auto &s : scopes)
@@ -1593,7 +1593,9 @@ struct Compiler::Impl : MetaHost {
             ps.push_back(mk_list(at, {a, ty(p)}));
             call.push_back(a);
         }
-        Form *def = mk_list(at, {mk_sym(at, "defn"), mk_sym(at, k), mk_list(at, ps), ty(ft->elem), mk_list(at, call)});
+        Form *body = mk_list(at, call);
+        if (ft->elem != t_void()) body = mk_list(at, {mk_sym(at, "return"), body});
+        Form *def = mk_list(at, {mk_sym(at, "defn"), mk_sym(at, k), mk_list(at, ps), ty(ft->elem), body});
         declare_fn(def, k);
         pending_fns.push_back({def, k, "(a function as a closure)", cur, {}, at, {}});
         return t = c.globals_[k].value;
@@ -3339,7 +3341,10 @@ struct Compiler::Impl : MetaHost {
         BasicBlock *done = BasicBlock::Create(ctx, "endwhile", fn);
         b.CreateBr(cond);
         b.SetInsertPoint(cond);
-        b.CreateCondBr(to_bool(expr(f->at(1), t_bool()), f->at(1)->loc), bodyb, done);
+        llvm::Value *c0 = to_bool(expr(f->at(1), t_bool()), f->at(1)->loc);
+        // (while true ...): only break leaves it (so code after it is reached only that way)
+        if (auto *k = llvm::dyn_cast<llvm::ConstantInt>(c0); k && k->isOne()) b.CreateBr(bodyb);
+        else b.CreateCondBr(c0, bodyb, done);
         b.SetInsertPoint(bodyb);
         loops.push_back({cond, done, scopes.size()});
         body(f, 2, nullptr);
@@ -3726,7 +3731,45 @@ struct Compiler::Impl : MetaHost {
             for (size_t i = 1; i < f->size(); i++) expand_top(f->at(i), out);
         } else if (f->is_call("variant")) {
             for (Form *x : desugar_variant(f, cur)) out.push_back(x);
-        } else out.push_back(f->is_call("defn") || f->is_call("defop") ? unbracket(f, 2) : f);  // (defn f [a T] [b U] R ...)
+        } else out.push_back(f->is_call("defn") || f->is_call("defop") ? signature(unbracket(f, 2), 2) : f);  // (defn f [a T] [b U] -> R ...)
+    }
+
+    // (defn f (params) -> R opts body...) or, with no result, (defn f (params) opts body...):
+    // the same form with R at params + 1 (void when there is none), as the rest
+    // of the compiler takes it
+    Form *signature(Form *f, size_t params) {
+        if (f->size() <= params || !f->at(params)->is_list()) return f;  // (errors said where it is used)
+        std::vector<Form *> items(f->items.begin(), f->items.begin() + params + 1);
+        size_t i = params + 1;
+        if (i < f->size() && f->at(i)->is_sym("->")) {
+            if (i + 1 >= f->size()) fatal(f->at(i)->loc, "-> needs the result type after it");
+            items.push_back(f->at(i + 1));
+            i += 2;
+        } else {
+            if (i < f->size() && looks_like_type(f->at(i), f))
+                fatal(f->at(i)->loc, "the result type goes after ->: (%s ... [a T] -> %s body...)", f->at(0)->text.c_str(), show(f->at(i)).c_str());
+            items.push_back(mk_sym(f->loc, "void"));
+        }
+        items.insert(items.end(), f->items.begin() + i, f->items.end());
+        Form *r = new Form(*f);
+        r->items = std::move(items);
+        return r;
+    }
+    // a type written where a function body starts (the old place of the result type)
+    bool looks_like_type(Form *x, Form *def) {
+        static const std::set<std::string> builtin = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize",
+                                                      "usize", "f32", "f64", "f80", "i128", "u128", "str"};
+        static const std::set<std::string> ctors = {"ptr", "array", "slice", "simd", "closure", "heap-fn"};
+        if (x->kind == Form::Sym) {
+            if (builtin.count(x->text) || !type_key(x).empty()) return !lookup_local(key(x)).v;
+            if (def->at(1)->is_list())  // a generic's type parameters
+                for (size_t j = 1; j < def->at(1)->size(); j++)
+                    if (def->at(1)->at(j)->is_sym(x->text.c_str()) ||
+                        (def->at(1)->at(j)->is_list() && def->at(1)->at(j)->size() && def->at(1)->at(j)->at(0)->is_sym(x->text.c_str())))
+                        return true;
+            return false;
+        }
+        return x->is_list() && x->size() && x->at(0)->kind == Form::Sym && ctors.count(x->at(0)->text) && !lookup_global(x->at(0));
     }
 
     ModInfo *root = nullptr;  // the program's first file
@@ -4209,13 +4252,14 @@ struct Compiler::Impl : MetaHost {
             scopes.back()[key(f->at(2)->at(i)->at(0))] = {a, t};
             if (dsp) declare_var(a, name, t, f->at(2)->at(i)->loc, i + 1);
         }
-        Val v = body(f, body_start(f), fn_ret == t_void() ? nullptr : fn_ret);
-        if (open()) {
-            if (fn_ret == t_void()) b.CreateRetVoid();
-            else {
-                if (v.t == t_void()) fatal(f->loc, "%s must end with a %s value or return", fname.c_str(), type_name(fn_ret).c_str());
-                emit_ret(coerce(v, fn_ret, f->at(f->size() - 1)->loc, "result"));
-            }
+        // the body is statements: a result is only ever given by (return e)
+        body(f, body_start(f), nullptr);
+        BasicBlock *end = b.GetInsertBlock();
+        bool reachable = end == &fn->getEntryBlock() || !llvm::pred_empty(end);
+        if (open() && reachable) {
+            if (fn_ret == t_void()) b.CreateRetVoid();  // (the body ran its defers)
+            else fatal(f->at(f->size() - 1)->loc, "%s can reach its end without (return e): it gives %s, only by return", fname.c_str(),
+                         type_name(fn_ret).c_str());
         }
         // blocks left empty by control flow that never falls through
         for (BasicBlock &bb : *fn)

@@ -25,7 +25,7 @@
 (defmacro rotate! (a b c)                 ; a macro whose expansion uses swap! twice
   `(do (swap! ,a ,b) (swap! ,b ,c)))
 
-(defn main [] i32
+(defn main [] -> i32
   ; the user's own `tmp` is swapped, not confused with the macro's
   (let [tmp 1] [other 2]
     (swap! tmp other)
@@ -41,4 +41,4 @@
   (let [x 1] [y 2] [z 3]
     (rotate! x y z)
     (printf c"rotate %d %d %d\n" x y z))
-  0)
+  (return 0))

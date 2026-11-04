@@ -2,11 +2,11 @@
 (import "libc") (import "math") (import "posix") (import "io") (import "signal") (import "time") (import "thread")
 (using libc posix)                        ; size_t, NULL ... come from both: one name, not ambiguous
 
-(defn worker [arg (ptr void)] (ptr void)
+(defn worker [arg (ptr void)] -> (ptr void)
   (set (deref (cast (ptr i32) arg)) 42)
-  null)
+  (return null))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [n size_t (strlen c"split")] [fd (open c"/dev/null" O_RDWR)]
        [p {io::pollfd :fd fd :events io::POLLOUT}]
        [ts {time::timespec}] [th thread::pthread_t 0] [out i32 0]
@@ -18,4 +18,4 @@
     (thread::pthread_join th null)
     (printf c"thread %d\n" out)
     (close fd))
-  0)
+  (return 0))

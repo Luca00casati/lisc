@@ -1,4 +1,4 @@
 ; abort: null pointer dereference
-(defn main [] i32
+(defn main [] -> i32
   (let [p (ptr i32) null]
-    (deref p)))
+    (return (deref p))))

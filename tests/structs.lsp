@@ -7,26 +7,26 @@
 (struct mixed [a u8] [b u32] [c u16] [d f64]) ; C padding: 1+3, 4, 2+6, 8
 (union bits [f f32] [u u32])
 
-(defn v3-add [a v3] [b v3] v3             ; structs by value
-  {v3 :x (+ a.x b.x) :y (+ a.y b.y) :z (+ a.z b.z)})
+(defn v3-add [a v3] [b v3] -> v3             ; structs by value
+  (return {v3 :x (+ a.x b.x) :y (+ a.y b.y) :z (+ a.z b.z)}))
 
-(defn dot [a v3] [b v3] f32
-  (+ (* a.x b.x) (* a.y b.y) (* a.z b.z)))
+(defn dot [a v3] [b v3] -> f32
+  (return (+ (* a.x b.x) (* a.y b.y) (* a.z b.z))))
 
-(defn scale [v (ptr v3)] [k f32] void      ; through a pointer: v.x auto-derefs
+(defn scale [v (ptr v3)] [k f32]      ; through a pointer: v.x auto-derefs
   (set v.x (* v.x k))
   (set v.y (* v.y k))
   (set v.z (* v.z k)))
 
-(defn sum [xs (ptr i32)] [n i32] i32
+(defn sum [xs (ptr i32)] [n i32] -> i32
   (let [s 0]
     (for [i 0 n] (set s (+ s xs[i])))
-    s))
+    (return s)))
 
-(defn twice [f (ptr (fn (i32) i32))] [x i32] i32 (f (f x)))
-(defn inc [x i32] i32 (+ x 1))
+(defn twice [f (ptr (fn (i32) i32))] [x i32] -> i32 (return (f (f x))))
+(defn inc [x i32] -> i32 (return (+ x 1)))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [r {ray :origin {v3 :x 1.0 :y 2.0 :z 3.0} :tmax 100.0}]
     (set r.dir.z -1.0)
     (let [s (v3-add r.origin r.dir)]
@@ -53,4 +53,4 @@
   (let [u {bits :f 1.0}]
     (printf c"union %08x size %lu\n" u.u (sizeof bits)))
   (printf c"twice %d\n" (twice inc 40))
-  0)
+  (return 0))

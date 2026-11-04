@@ -22,7 +22,7 @@
                      ((eq t 'str) `((cast i32 (. ,x len)) (. ,x data)))   ; a str: its size, then its bytes
                      (else (list x))))))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a 1] [b 2]
     (swap! a b)
     (printf c"swap %d %d\n" a b))
@@ -34,4 +34,4 @@
     (show! (* f 2.0))
     (show! n)
     (show! s))
-  0)
+  (return 0))

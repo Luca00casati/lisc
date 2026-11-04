@@ -166,13 +166,14 @@ def convert(src):
     return ''.join(out)
 
 
-for path in sys.argv[1:]:
-    src = open(path).read()
-    try:
-        new = convert(src)
-    except (SyntaxError, IndexError) as e:
-        print(f'{path}: not converted ({e})', file=sys.stderr)
-        continue
-    if new != src:
-        open(path, 'w').write(new)
-        print('rewrote', path)
+if __name__ == '__main__':
+    for path in sys.argv[1:]:
+        src = open(path).read()
+        try:
+            new = convert(src)
+        except (SyntaxError, IndexError) as e:
+            print(f'{path}: not converted ({e})', file=sys.stderr)
+            continue
+        if new != src:
+            open(path, 'w').write(new)
+            print('rewrote', path)

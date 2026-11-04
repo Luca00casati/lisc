@@ -11,13 +11,13 @@ header with `import-c`), so libc and kernel interfaces need no hand-written bind
 (import-c "drm/i915_drm.h" :as i915)
 (using libc posix io)
 
-(defn main [] i32
+(defn main [] -> i32
   (let [fd (open c"/dev/dri/renderD128" O_RDWR)]
        [id i32 0]
        [gp {i915::drm_i915_getparam :param i915::I915_PARAM_CHIPSET_ID :value (addr id)}]
     (when (= (ioctl fd i915::DRM_IOCTL_I915_GETPARAM (addr gp)) 0)
       (printf c"i915 chip id 0x%04x\n" id)))
-  0)
+  (return 0))
 ```
 
 ## Build
@@ -96,7 +96,7 @@ Bounds checks in loops mostly cost nothing after optimisation (LLVM proves
 them); saturating float casts cost the most (a few instructions each). The
 teapot's CPU side is about 1.5% slower with all of them on. To leave them out:
 `(unchecked body...)` for a block, `:unchecked` after a function's result type
-for a whole function (`(defn sum [xs (slice i32)] i32 :unchecked ...)`), or
+for a whole function (`(defn sum [xs (slice i32)] -> i32 :unchecked ...)`), or
 `--no-checks` for the whole build. There, float casts are C's: a value out of
 range gives an undefined result. `(cast-force T e)` is that plain conversion
 for one cast (no check, no saturation; an integer keeps its low bits), for hot
@@ -132,9 +132,9 @@ Top level:
 | `(export name ...)` | these functions and globals get external linkage and their own name, for C |
 | `(const NAME expr)` | compile-time constant; untyped if `expr` is |
 | `(def name T [init])` | global variable |
-| `(defn name [a T] ... R [:noinline\|:inline\|:cold\|:optnone\|:unchecked] body...)` | function (`[]`: no parameters); the last expression is the result |
+| `(defn name [a T] ... [-> R] [:noinline\|:inline\|:cold\|:optnone\|:unchecked] body...)` | function (`[]`: no parameters); with `-> R` it gives an R, only by `(return e)` (see Functions) |
 | `(extern name (T ... [...]) R)` | a C function by hand |
-| `(defop op [a T] ... R body...)` | an operator for these operand types |
+| `(defop op [a T] ... -> R body...)` | an operator for these operand types |
 | `(defmacro name! (params...) body...)` | a macro (see below); its name ends in `!` |
 | `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
 | `(private form ...)` | definitions (any kind) only their module can use |
@@ -148,8 +148,8 @@ Expressions — everything is one; statements have type `void`:
       or a struct with data and len (a (vec T)), also through a pointer; x is the element itself
       (setting it sets the element), i its index (a u64)
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
-    (fn [a T] ... R body...) — a function written where it is used; with captures a closure (see below)
-    (fn :heap [a T] ... R body...) — a heap-fn, kept until (drop f)
+    (fn [a T] ... [-> R] body...) — a function written where it is used; with captures a closure (see below)
+    (fn :heap [a T] ... [-> R] body...) — a heap-fn, kept until (drop f)
     (unchecked body...) — no run-time checks in it
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
@@ -230,24 +230,51 @@ Typing rules:
 - Floating point is strict IEEE (no fast-math, no FMA contraction), so results
   match a C build with `-ffp-contract=off`.
 
-Functions can be written where they are used: `(fn [a T] ... R body...)`.
+## Functions
+
+`(defn name [a T] [b U] -> R body...)` gives an R; the result type comes after
+`->`. A function gives its result only with `(return e)`: the body is
+statements, and a function with a result that can reach its end without
+returning is an error. Without `-> R` a function gives nothing (`-> void` is
+allowed, for macros).
+
+```lisp
+(defn sign [x i32] -> i32
+  (if (< x 0) (return -1) (return 1)))     ; every path returns
+
+(defn first-big [xs (slice i32)] -> i32
+  (for [x :in xs]
+    (when (> x 10) (return x)))
+  (return 0))
+
+(defn greet [name str]                     ; no result
+  (println "hello " name))
+```
+
+Blocks are still expressions inside a function: `(set x (if c 1 2))`,
+`(let [y (let [t 2] (* t t))] ...)`. `(while true ...)` is left only by
+`break` or `return`, so a function ending in one needs nothing after it.
+`tools/returns.py file.lsp ...` rewrites code from the older style (a result
+type right after the parameters, the last expression the result).
+
+Functions can be written where they are used: `(fn [a T] ... [-> R] body...)`.
 One that uses only its parameters, globals and other functions is a function
 pointer, typed `(ptr (fn (T ...) R))`, and can go to C:
 
 ```lisp
-(sort-by (slice-of xs) (fn [a i32] [b i32] bool (> a b)))   ; descending
-(let [inc (fn [x i32] i32 (+ x 1))] (inc 41))
+(sort-by (slice-of xs) (fn [a i32] [b i32] -> bool (return (> a b))))   ; descending
+(let [inc (fn [x i32] -> i32 (return (+ x 1)))] (inc 41))
 ```
 
 One that uses locals around it is a **closure**, typed `(closure (T ...) R)`.
 It captures them by reference: it reads and sets the variables themselves.
 
 ```lisp
-(defn (each T) [xs (slice T)] [f (closure (T) void)] void
+(defn (each T) [xs (slice T)] [f (closure (T) void)]
   (for [x :in xs] (f x)))
 
 (let [total 0] [k 3]
-  (each (slice-of a) (fn [x i32] void (+= total (* x k))))
+  (each (slice-of a) (fn [x i32] (+= total (* x k))))
   total)
 ```
 
@@ -271,10 +298,10 @@ value goes, and lives until `(drop f)` frees its env:
 ```lisp
 (struct button [name str] [on-click (heap-fn (i32) void)])
 
-(defn make-greet [who str] [times (ptr i32)] (heap-fn (i32) void)
-  (fn :heap [x i32] void
+(defn make-greet [who str] [times (ptr i32)] -> (heap-fn (i32) void)
+  (return (fn :heap [x i32]
     (+= (deref times) 1)               ; shared state: capture a pointer to it
-    (println "hello " who " at " x)))
+    (println "hello " who " at " x))))
 
 (let [clicks 0] [ok {button :name "ok" :on-click (make-greet "ann" (addr clicks))}]
   (ok.on-click 10)
@@ -299,11 +326,11 @@ A variant is a tagged union: a value that is one of its cases, each with its own
 ```lisp
 (variant shape (circle [r f32]) (rect [w f32] [h f32]) none)
 
-(defn area [s shape] f32
+(defn area [s shape] -> f32
   (match s
-    ((circle r) (* 3.0 r r))
-    ((rect w h) (* w h))
-    (none 0.0)))
+    ((circle r) (return (* 3.0 r r)))
+    ((rect w h) (return (* w h)))
+    (none (return 0.0))))
 
 (area (shape.rect 2.0 3.0))   ; a case with fields is built like a call
 (area shape.none)             ; one without is a value
@@ -323,9 +350,9 @@ type wanted where there are no values to go by:
 (variant (option T) (some [value T]) none)   ; these two are in std/option
 (variant (result T E) (ok [value T]) (err [error E]))
 
-(defn find [xs (slice i32)] [want i32] (option u64)
+(defn find [xs (slice i32)] [want i32] -> (option u64)
   (for [i x :in xs] (when (= x want) (return (option.some i))))
-  option.none)                                ; (option u64): from the result type
+  (return option.none))                                ; (option u64): from the result type
 ```
 
 A variant is a struct `[tag u32] [cases ...]` (`tag` is the case's index),
@@ -385,8 +412,8 @@ specialised (compiled anew) for each list of types it is used with:
 ```lisp
 (struct (vec T) [data (ptr T)] [len u64] [cap u64])
 
-(defn (push T) [v (ptr (vec T))] [x T] void ...)
-(defn (biggest T) [a T] [b T] T (if (> a b) a b))
+(defn (push T) [v (ptr (vec T))] [x T] ...)
+(defn (biggest T) [a T] [b T] -> T (if (> a b) (return a) (return b)))
 
 (let [v {(vec i32)}]     ; (vec i32) is a type wherever types go
   (push (addr v) 42)             ; T from the arguments' types: push for i32
@@ -397,7 +424,7 @@ specialised (compiled anew) for each list of types it is used with:
 When the arguments can't tell T, the types go first in the call:
 
 ```lisp
-(defn (new T) [n u64] (ptr T) ...)   ; std/mem
+(defn (new T) [n u64] -> (ptr T) (return ...))   ; std/mem
 (mem::new f32 4)                     ; T = f32, n = 4
 ```
 
@@ -414,7 +441,7 @@ A parameter can say which operators its type must have, `(T op ...)`; using
 the generic with a type that lacks one is an error at the use, naming it:
 
 ```lisp
-(defn (sort (T <)) [s (slice T)] void ...)    ; numbers, or a struct with a (defop < ...)
+(defn (sort (T <)) [s (slice T)] ...)    ; numbers, or a struct with a (defop < ...)
 ```
 
 A generic function is a value too: `(addr (inc i64))`, or just `inc` where a
@@ -423,7 +450,7 @@ function pointer is wanted (its type says what T is): `(apply-twice inc 2.5)`.
 Operators can be generic, for every instance of a generic struct:
 
 ```lisp
-(defop (+ T) [a (vec2 T)] [b (vec2 T)] (vec2 T) (v2 (+ a.x b.x) (+ a.y b.y)))
+(defop (+ T) [a (vec2 T)] [b (vec2 T)] -> (vec2 T) (return (v2 (+ a.x b.x) (+ a.y b.y))))
 ```
 
 A generic `defop` applies only when an operand is a struct, so numbers keep
@@ -440,9 +467,9 @@ relative to the importing file, `.lsp` optional) makes its names reachable as
     (import "vec")
     (using vec)                  ; also dot, cross ... unqualified
 
-    (defn hyp [a f32] [b f32] f32
+    (defn hyp [a f32] [b f32] -> f32
       (using math)               ; just here: sqrtf
-      (sqrtf (+ (* a a) (* b b))))
+      (return (sqrtf (+ (* a a) (* b b)))))
 
 A name resolves to the module's own definition first, then to the modules in
 use (the innermost block's, then the file's; a name two of them define must
@@ -450,11 +477,11 @@ be written qualified), then to `-D` constants. Definitions inside
 `(private ...)` are unreachable from other modules:
 
 ```lisp
-(defn area [s shape] f32 (* (side s) (side s)))   ; public
+(defn area [s shape] -> f32 (return (* (side s) (side s))))   ; public
 
 (private
   (def calls i32 0)
-  (defn side [s shape] f32 ...))
+  (defn side [s shape] -> f32 (return ...)))
 ```
 
 Macros are hygienic across modules too: the symbols of a macro's template
@@ -496,10 +523,10 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 
 ## Operators
 
-`(defop + [a v3] [b v3] v3 ...)` defines `+` for two `v3`s. An operator form
+`(defop + [a v3] [b v3] -> v3 ...)` defines `+` for two `v3`s. An operator form
 uses the definition whose parameter types match its operands exactly; a
 literal operand takes the type the definition wants (`(* 2.0 v)` with
-`(defop * [k f32] [a v3] ...)`). n-ary forms fold left: `(+ a b c)` is
+`(defop * [k f32] [a v3] -> v3 ...)`). n-ary forms fold left: `(+ a b c)` is
 `(+ (+ a b) c)`. Unary `-` and the comparisons can be defined the same way.
 Definitions are ordinary functions, so the optimiser inlines them: there is no
 runtime cost.
@@ -508,10 +535,10 @@ runtime cost.
 the types of the arguments (and their number), in its module like other names:
 
 ```lisp
-(defop min [a f32] [b f32] f32 (if (< a b) a b))
-(defop min [a v3] [b v3] v3 {v3 :x (min a.x b.x) :y (min a.y b.y) :z (min a.z b.z)})
-(defop show [s str] void ...)
-(defop (twice T) [x T] T (+ x x))     ; generic ones take any types
+(defop min [a f32] [b f32] -> f32 (if (< a b) (return a) (return b)))
+(defop min [a v3] [b v3] -> v3 (return {v3 :x (min a.x b.x) :y (min a.y b.y) :z (min a.z b.z)}))
+(defop show [s str] ...)
+(defop (twice T) [x T] -> T (return (+ x x)))     ; generic ones take any types
 ```
 
 A name is either a `defn` or a `defop` in a module, not both. Where another
@@ -541,11 +568,11 @@ field of a struct:
 (defmacro derive-ops! (T)                 ; + - * and = for any struct, field by field
   (let [fields (map first (type-fields T))]
     `(do ,@(map (lambda (op)
-                  `(defop ,op [a ,T] [b ,T] ,T
-                     {,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields)}))
+                  `(defop ,op [a ,T] [b ,T] -> ,T
+                     (return {,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields)})))
                 '(+ - *))
-         (defop = [a ,T] [b ,T] bool
-           (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
+         (defop = [a ,T] [b ,T] -> bool
+           (return (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields)))))))
 
 (derive-ops! v3)
 ```

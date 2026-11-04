@@ -5,7 +5,7 @@
 (def g p3)                                     ; globals: zero
 (def scratch (array u8 1024) undefined)        ; left as the loader gives it (bss anyway)
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a i32] [v p3] [arr (array f64 4)]       ; zero, without a value
     (printf c"zero: %d %g %g %d %p %g %d\n" a (cast f64 v.x) (cast f64 v.y) v.n (cast (ptr void) v.next) arr[3] g.n))
   (let [v {p3 :x 1.5 :n 7}]
@@ -20,4 +20,4 @@
     (set buf[63] 0)
     (set n (cast u32 (strlen (cast (ptr i8) (addr buf[0])))))
     (printf c"undefined, then filled: %u\n" n))
-  0)
+  (return 0))

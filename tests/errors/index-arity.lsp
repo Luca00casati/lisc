@@ -1,2 +1,2 @@
 ; error: an index takes one form
-(defn main [] i32 (let [a (array i32 2)] a[0 1]))
+(defn main [] -> i32 (return (let [a (array i32 2)] a[0 1])))

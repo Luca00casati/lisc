@@ -11,11 +11,11 @@
 (variant (option T) (some [value T]) none)
 (variant (result T E) (ok [value T]) (err [error E]))
 
-(defn (or-else T) [o (option T)] [d T] T
-  (match o ((some x) x) (none d)))
+(defn (or-else T) [o (option T)] [d T] -> T
+  (match o ((some x) (return x)) (none (return d))))
 
-(defn (is-some T) [o (option T)] bool
-  (match o (some true) (none false)))
+(defn (is-some T) [o (option T)] -> bool
+  (match o (some (return true)) (none (return false))))
 
-(defn (is-ok T E) [r (result T E)] bool
-  (match r (ok true) (err false)))
+(defn (is-ok T E) [r (result T E)] -> bool
+  (match r (ok (return true)) (err (return false))))

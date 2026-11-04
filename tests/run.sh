@@ -75,7 +75,7 @@ done
 # The C import cache must notice a header that changed (even at the same size).
 mkdir -p out/hc
 printf '#define ANSWER 41\nstruct pt { int x, y; };\n' >out/hc/h.h
-printf '(import "libc")\n(import-c "h.h" :as h)\n(defn main [] i32 (libc::printf c"%%d %%lu\\n" h::ANSWER (sizeof h::pt)) 0)\n' >out/hc/t.lsp
+printf '(import "libc")\n(import-c "h.h" :as h)\n(defn main [] -> i32 (libc::printf c"%%d %%lu\\n" h::ANSWER (sizeof h::pt)) (return 0))\n' >out/hc/t.lsp
 got=$(../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t && ../lisc out/hc/t.lsp -o out/hc/t && ./out/hc/t)
 sleep 0.01
 printf '#define ANSWER 42\nstruct pt { int x, y; };\n' >out/hc/h.h
@@ -87,11 +87,11 @@ if [ "$got" = "41 8
 # The object cache: a rebuild with nothing changed compiles nothing; a change
 # in one module compiles that module (and the program's output follows it).
 mkdir -p out/oc
-printf '(defn twice [x i32] i32 (* 2 x))\n(defn big [x i32] i32 (let [s 0] (for [i 0 x] (+= s (* i i))) s))\n' >out/oc/b.lsp
-printf '(import "b")\n(defn main [] i32 (println (b::twice 21) " " (b::big 10)) 0)\n' >out/oc/a.lsp
+printf '(defn twice [x i32] -> i32 (return (* 2 x)))\n(defn big [x i32] -> i32 (let [s 0] (for [i 0 x] (+= s (* i i))) (return s)))\n' >out/oc/b.lsp
+printf '(import "b")\n(defn main [] -> i32 (println (b::twice 21) " " (b::big 10)) (return 0))\n' >out/oc/a.lsp
 oc() { ../lisc out/oc/a.lsp -o out/oc/a --time 2>&1 | sed -n 's/.*parts, \([0-9]*\) compiled.*/\1/p'; }
 got="$(oc) $(./out/oc/a) $(oc)"
-printf '(defn twice [x i32] i32 (* 3 x))\n(defn big [x i32] i32 (let [s 0] (for [i 0 x] (+= s (* i i))) s))\n' >out/oc/b.lsp
+printf '(defn twice [x i32] -> i32 (return (* 3 x)))\n(defn big [x i32] -> i32 (let [s 0] (for [i 0 x] (+= s (* i i))) (return s)))\n' >out/oc/b.lsp
 got="$got $(oc) $(./out/oc/a)"
 if [ "$got" = "2 42 285 0 2 63 285" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL object cache: got '$got'"; fi
 # lisc fmt: tests/fmt/in.lsp formatted is tests/fmt/out.lsp (and that stays as it is);

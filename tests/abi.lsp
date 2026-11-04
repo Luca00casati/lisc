@@ -12,11 +12,11 @@
 (def gbf mybf {mybf :a 5 :b 17 :c -33 :d 100000 :e true :tail -2})
 (def gcbf bf {bf :a 5 :b 17 :c -33 :d 100000 :e true :tail -2})
 
-(defn len2 [v v3] f32 (+ (* v.x v.x) (* v.y v.y) (* v.z v.z)))   ; called from C
-(defn rot [b big] big                                              ; called from C, big result
-  {big :v {(array i32 5) b.v[1] b.v[2] b.v[3] b.v[4] b.v[0]}})
+(defn len2 [v v3] -> f32 (return (+ (* v.x v.x) (* v.y v.y) (* v.z v.z))))   ; called from C
+(defn rot [b big] -> big                                              ; called from C, big result
+  (return {big :v {(array i32 5) b.v[1] b.v[2] b.v[3] b.v[4] b.v[0]}}))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [v (v3_scale {v3 :x 1.0 :y 2.0 :z 3.0} 0.5)]
     (printf c"v3 %g %g %g\n" (cast f64 v.x) (cast f64 v.y) (cast f64 v.z)))
   (let [d (d2_swap {d2 :a 1.5 :b 2.25})]
@@ -63,4 +63,4 @@
   (let [r (v4f_mad {(simd f32 4) 1.0 2.0 3.0 4.0} (splat (simd f32 4) 0.5) 2.0)]
        [i (cabi::v8i_sum {(simd i32 8) 1 1 1 1 1 1 1 1} 100 (splat (simd i32 8) 2))]
     (println "simd " r " " i " " (sizeof cabi::v4f) " " (alignof cabi::v8i)))
-  0)
+  (return 0))

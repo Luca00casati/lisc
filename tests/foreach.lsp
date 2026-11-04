@@ -4,12 +4,12 @@
 
 (struct ring [data (ptr i32)] [len u32] [cap u32])   ; anything with data and len
 
-(defn total [xs (slice i32)] i32
+(defn total [xs (slice i32)] -> i32
   (let [s 0]
     (for [x :in xs] (+= s x))
-    s))
+    (return s)))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a {(array i32 5) 5 3 8 1 9}] [v {(vec f64)}] [m {(array (array i32 3) 2) {(array i32 3) 1 2 3} {(array i32 3) 4 5 6}}]
     (for [x :in a] (*= x 10))                    ; x is the element itself
     (println a " " (total (slice-of a 1 4)))
@@ -30,4 +30,4 @@
     (for [_ :in (slice-of a 0 0)] (print "never"))
     (println)
     (release (addr v)))
-  0)
+  (return 0))

@@ -6,10 +6,10 @@
 (using libc sort vec)
 
 (struct pt [x i32] [y i32])
-(defop < [a pt] [b pt] bool (or (< a.x b.x) (and (= a.x b.x) (< a.y b.y))))
-(defn by-len [a str] [b str] bool (< a.len b.len))
+(defop < [a pt] [b pt] -> bool (return (or (< a.x b.x) (and (= a.x b.x) (< a.y b.y)))))
+(defn by-len [a str] [b str] -> bool (return (< a.len b.len)))
 
-(defn main [] i32
+(defn main [] -> i32
   ; sort numbers, structs by their <, strs by a function
   (let [v {(vec i32)}] [seed u32 12345] [ok true]
     (for [_i 0 1000]
@@ -53,4 +53,4 @@
     (printf c"%g %g %d\n" (deref (map::get (addr grid) {pt :x 3 :y 4})) (deref (map::get (addr grid) {pt :x 4 :y 3}))
             (cast i32 (map::has (addr grid) {pt :x 3 :y 3})))
     (map::release (addr grid)))
-  0)
+  (return 0))

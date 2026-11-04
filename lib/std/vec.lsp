@@ -9,7 +9,7 @@
 
 (struct (vec T) [data (ptr T)] [len u64] [cap u64])
 
-(defn (push T) [v (ptr (vec T))] [x T] void
+(defn (push T) [v (ptr (vec T))] [x T]
   (when (= v.len v.cap)
     (set v.cap (if (= v.cap 0) 8 (* v.cap 2)))
     (set v.data (cast (ptr T) (libc::realloc v.data (* v.cap (sizeof T)))))
@@ -18,16 +18,16 @@
   (+= v.len 1))
 
 ; the last element, taken off (the vec must not be empty)
-(defn (pop T) [v (ptr (vec T))] T
+(defn (pop T) [v (ptr (vec T))] -> T
   (-= v.len 1)
-  v.data[v.len])
+  (return v.data[v.len]))
 
-(defn (clear T) [v (ptr (vec T))] void (set v.len 0))
+(defn (clear T) [v (ptr (vec T))] (set v.len 0))
 
-(defn (items T) [v (ptr (vec T))] (slice T)
-  {(slice T) :data v.data :len v.len})
+(defn (items T) [v (ptr (vec T))] -> (slice T)
+  (return {(slice T) :data v.data :len v.len}))
 
 ; free the elements' memory; the vec is empty again
-(defn (release T) [v (ptr (vec T))] void
+(defn (release T) [v (ptr (vec T))]
   (libc::free v.data)
   (set (deref v) null))

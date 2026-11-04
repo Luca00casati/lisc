@@ -6,31 +6,31 @@
 (struct (vec T) [data (ptr T)] [len u64] [cap u64])
 (struct (node T) [value T] [next (ptr (node T))])   ; points to itself
 
-(defn (push T) [v (ptr (vec T))] [x T] void
+(defn (push T) [v (ptr (vec T))] [x T]
   (when (= v.len v.cap)
     (set v.cap (if (= v.cap 0) 4 (* v.cap 2)))
     (set v.data (cast (ptr T) (realloc v.data (* v.cap (sizeof T))))))
   (set v.data[v.len] x)
   (+= v.len 1))
 
-(defn (sum T) [v (ptr (vec T))] T
+(defn (sum T) [v (ptr (vec T))] -> T
   (let [s T null]                              ; (zero, whatever T is)
     (for [i u64 0 v.len] (+= s v.data[i]))
-    s))
+    (return s)))
 
-(defn (biggest (T >)) [a T] [b T] T (if (> a b) a b))   ; T must have >
-(defn (swap A B) [p (pair A B)] (pair B A) {(pair B A) :a p.b :b p.a})
-(defn (size-of T) [] u64 (sizeof T))
-(defn (length T) [n (ptr (node T))] i32       ; recursive, and calling itself by inference
-  (if (= n null) 0 (+ 1 (length n.next))))
+(defn (biggest (T >)) [a T] [b T] -> T (if (> a b) (return a) (return b)))   ; T must have >
+(defn (swap A B) [p (pair A B)] -> (pair B A) (return {(pair B A) :a p.b :b p.a}))
+(defn (size-of T) [] -> u64 (return (sizeof T)))
+(defn (length T) [n (ptr (node T))] -> i32       ; recursive, and calling itself by inference
+  (if (= n null) (return 0) (return (+ 1 (length n.next)))))
 
-(defn (apply-twice T) [f (ptr (fn (T) T))] [x T] T (f (f x)))
-(defn (inc T) [x T] T (+ x 1))
+(defn (apply-twice T) [f (ptr (fn (T) T))] [x T] -> T (return (f (f x))))
+(defn (inc T) [x T] -> T (return (+ x 1)))
 
 (struct point [x f32] [y f32])
-(defop + [p point] [q point] point {point :x (+ p.x q.x) :y (+ p.y q.y)})
+(defop + [p point] [q point] -> point (return {point :x (+ p.x q.x) :y (+ p.y q.y)}))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [ints {(vec i32)}] [floats {(vec f64)}] [pts {(vec point)}]
     (for [i 0 10] (push (addr ints) i))
     (push (addr floats) 1.5)
@@ -49,4 +49,4 @@
   ; generic functions as values: written out, or told by the pointer type wanted
   (let [f (addr (inc i64))] [g (ptr (fn (f32) f32)) inc]
     (printf c"%ld %g %d %g\n" (f 41) (cast f64 (g 0.5)) (apply-twice (addr (inc i32)) 5) (apply-twice inc 2.5)))
-  0)
+  (return 0))

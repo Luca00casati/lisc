@@ -9,25 +9,25 @@
 (defmacro derive-ops! (T)
   (let [fields (map first (type-fields T))]
     `(do ,@(map (lambda (op)
-                  `(defop ,op [a ,T] [b ,T] ,T
-                     {,T ,@(mapcat (lambda (f) `(,(sym c":" f) (,op (. a ,f) (. b ,f)))) fields)}))
+                  `(defop ,op [a ,T] [b ,T] -> ,T
+                     (return {,T ,@(mapcat (lambda (f) `(,(sym c":" f) (,op (. a ,f) (. b ,f)))) fields)})))
                 '(+ - *))
-         (defop = [a ,T] [b ,T] bool
-           (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields))))))
+         (defop = [a ,T] [b ,T] -> bool
+           (return (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields)))))))
 
 (derive-ops! v3)
 (derive-ops! rgb)
 
 ; by hand: scalar times vector (either order), negation, dot product
-(defop * [a v3] [k f32] v3 {v3 :x (* a.x k) :y (* a.y k) :z (* a.z k)})
-(defop * [k f32] [a v3] v3 (* a k))
-(defop - [a v3] v3 {v3 :x (- a.x) :y (- a.y) :z (- a.z)})
-(defn dot [a v3] [b v3] f32 (+ (* a.x b.x) (* a.y b.y) (* a.z b.z)))
+(defop * [a v3] [k f32] -> v3 (return {v3 :x (* a.x k) :y (* a.y k) :z (* a.z k)}))
+(defop * [k f32] [a v3] -> v3 (return (* a k)))
+(defop - [a v3] -> v3 (return {v3 :x (- a.x) :y (- a.y) :z (- a.z)}))
+(defn dot [a v3] [b v3] -> f32 (return (+ (* a.x b.x) (* a.y b.y) (* a.z b.z))))
 
-(defn show [name (ptr i8)] [v v3] void
+(defn show [name (ptr i8)] [v v3]
   (printf c"%s %g %g %g\n" name (cast f64 v.x) (cast f64 v.y) (cast f64 v.z)))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a {v3 :x 1.0 :y 2.0 :z 3.0}]
        [b {v3 :x 0.5 :y 0.5 :z 0.5}]
     (show c"a+b" (+ a b))
@@ -43,4 +43,4 @@
     (printf c"numbers %d %g\n" (+ 1 2 3) (cast f64 (* a.x 4.0))))
   (let [c (+ {rgb :r 0.25 :g 0.5 :b 1.0} {rgb :r 0.25 :g 0.25 :b 0.0})]
     (printf c"rgb %g %g %g\n" (cast f64 c.r) (cast f64 c.g) (cast f64 c.b)))
-  0)
+  (return 0))

@@ -7,23 +7,23 @@
 (defmacro two-cases! (name a b) `(variant ,name ,a ,b))
 (two-cases! dir up down)
 
-(defn area [s shape] f32
+(defn area [s shape] -> f32
   (match s
-    ((circle r) (* 3.0 r r))
-    ((rect w h) (* w h))
-    (none 0.0)))
+    ((circle r) (return (* 3.0 r r)))
+    ((rect w h) (return (* w h)))
+    (none (return 0.0))))
 
-(defn (len T) [l (lst T)] i32
-  (match l ((cons _ t) (+ 1 (len (deref t)))) (nil 0)))
+(defn (len T) [l (lst T)] -> i32
+  (match l ((cons _ t) (return (+ 1 (len (deref t))))) (nil (return 0))))
 
-(defn find [xs (slice i32)] [want i32] (option u64)
+(defn find [xs (slice i32)] [want i32] -> (option u64)
   (for [i x :in xs] (when (= x want) (return (option.some i))))
-  option.none)
+  (return option.none))
 
-(defn parse [s str] (result i32 str)
-  (if (= s.len 0) (result.err "empty") (result.ok (cast i32 s.len))))
+(defn parse [s str] -> (result i32 str)
+  (if (= s.len 0) (return (result.err "empty")) (return (result.ok (cast i32 s.len)))))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [shapes {(array shape 3) (shape.circle 1.0) (shape.rect 2.0 3.0) shape.none}] [total f32 0.0]
        [a {(array i32 4) 5 30 8 1}]
     (for [s :in shapes] (+= total (area s)))
@@ -41,4 +41,4 @@
     (println (match (parse "xy") ((ok n) (* n 10)) ((err _) -1)))
     (for [s :in shapes]                          ; several cases in one clause
       (print (match s ((or circle rect) "round-or-square ") (none "nothing\n")))))
-  0)
+  (return 0))

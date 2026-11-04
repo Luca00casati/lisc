@@ -4,7 +4,7 @@
 (import "math")
 (using math)
 
-(defn main [] i32
+(defn main [] -> i32
   ; printf's real declaration: variadic, const char *
   (printf c"pi %.6f  sqrtf(2) %.7f  INT_MAX %d  UINT32_MAX %u\n" M_PI (cast f64 (sqrtf 2.0)) INT_MAX UINT32_MAX)
   ; malloc / strlen / memcpy / free with C's types (size_t is u64)
@@ -22,4 +22,4 @@
   ; stderr is an extern variable of type (ptr FILE)
   (fprintf stderr c"")
   (printf c"EXIT_FAILURE %d  SEEK_END %d  EOF %d\n" EXIT_FAILURE SEEK_END EOF)
-  EXIT_SUCCESS)
+  (return EXIT_SUCCESS))

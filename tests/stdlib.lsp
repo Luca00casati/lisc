@@ -7,7 +7,7 @@
 
 (struct named [name str] [n i32])
 
-(defn main [] i32
+(defn main [] -> i32
   (let [s "teapot.lsp"] [buf (array i8 16)]
     (printf c"%d %d %d %lu\n" (cast i32 (str::eq s "teapot.lsp")) (cast i32 (str::starts-with s "tea"))
             (cast i32 (str::ends-with s ".lsp")) (str::find s #\.))
@@ -29,4 +29,4 @@
     (let [last (pop (addr ns))]
       (printf c"%.*s %d, %lu left\n" (cast i32 last.name.len) last.name.data last.n ns.len))
     (release (addr ns)))
-  0)
+  (return 0))

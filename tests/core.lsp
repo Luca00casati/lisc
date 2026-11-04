@@ -5,24 +5,24 @@
 (const SCALE 2.5)                 ; untyped: f32 or f64 where it is used
 (def counter i32 0)
 
-(defn fib [n i32] i32
-  (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(defn fib [n i32] -> i32
+  (if (< n 2) (return n) (return (+ (fib (- n 1)) (fib (- n 2))))))
 
-(defn bump [] void
+(defn bump []
   (set counter (+ counter 1)))
 
-(defn sum-to [n i64] i64
+(defn sum-to [n i64] -> i64
   (let [i i64 1]
     (let [acc i64 0]
       (while (<= i n)
         (set acc (+ acc i))
         (set i (+ i 1)))
-      acc)))
+      (return acc))))
 
-(defn classify [x i32] (ptr i8)
-  (if (< x 0) c"negative" (if (= x 0) c"zero" c"positive")))
+(defn classify [x i32] -> (ptr i8)
+  (if (< x 0) (return c"negative") (if (= x 0) (return c"zero") (return c"positive"))))
 
-(defn main [] i32
+(defn main [] -> i32
   (printf c"fib %d = %d\n" N (fib N))
   (bump) (bump) (bump)
   (printf c"counter %d\n" counter)
@@ -51,4 +51,4 @@
   ; short-circuit logic: the second call must not run
   (let [hits 0]
     (when (or (> 1 0) (do (set hits 1) true)) (printf c"or ok %d\n" hits)))
-  0)
+  (return 0))

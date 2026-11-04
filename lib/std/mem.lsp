@@ -2,14 +2,14 @@
 (import "libc")
 
 ; (mem::new T n): n zeroed T's, a (ptr T); aborts if there is no memory
-(defn (new T) [n u64] (ptr T)
-  (cast (ptr T) (zeroed (* (sizeof T) n))))
+(defn (new T) [n u64] -> (ptr T)
+  (return (cast (ptr T) (zeroed (* (sizeof T) n)))))
 
-(defn zeroed [bytes u64] (ptr void)
+(defn zeroed [bytes u64] -> (ptr void)
   (let [p (libc::calloc 1 bytes)]
     (when (and (= p null) (> bytes 0))
       (libc::fputs c"out of memory\n" libc::stderr)
       (libc::abort))
-    p))
+    (return p)))
 
-(defn free [p (ptr void)] void (libc::free p))
+(defn free [p (ptr void)] (libc::free p))

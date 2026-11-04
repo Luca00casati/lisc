@@ -1,9 +1,9 @@
 ; lisc fmt: indentation and spacing normalised, line breaks kept
 
-(defn area [s shape] f32         ; trailing comment keeps its column
+(defn area [s shape] -> f32         ; trailing comment keeps its column
   (match s
-    ((circle r) (* 3.0 r r))
-    (none 0.0)))
+    ((circle r) (return (* 3.0 r r)))
+    (none (return 0.0))))
 (let [a 1]
      [b (foo a
              b)]

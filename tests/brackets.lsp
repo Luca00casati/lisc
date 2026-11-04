@@ -6,17 +6,17 @@
 (struct (pair A B) [a A] [b B])
 (struct line [from point] [to point])
 
-(defop + [p point] [q point] point {point :x (+ p.x q.x) :y (+ p.y q.y)})
+(defop + [p point] [q point] -> point (return {point :x (+ p.x q.x) :y (+ p.y q.y)}))
 
-(defn (swap A B) [p (pair A B)] (pair B A) {(pair B A) :a p.b :b p.a})
+(defn (swap A B) [p (pair A B)] -> (pair B A) (return {(pair B A) :a p.b :b p.a}))
 
-(defn sum [xs (ptr i32)] [n i32] i32
+(defn sum [xs (ptr i32)] [n i32] -> i32
   (let [s 0]
     (for [i 0 n] (+= s xs[i]))
-    s))
+    (return s)))
 
-(defn answer [] i32 42)
-(defn three [] (array i32 3) {(array i32 3) 1 2 3})
+(defn answer [] -> i32 (return 42))
+(defn three [] -> (array i32 3) (return {(array i32 3) 1 2 3}))
 
 (def origin point {point :x 0.5 :y 0.25})   ; a constant global
 
@@ -29,7 +29,7 @@
 ; compile-time code takes them too
 (defmacro twice! (x) (let [n 2] `(* ,n ,x)))
 
-(defn main [] i32
+(defn main [] -> i32
   (let [a (array i32 5)]
        [grid (array (array i32 3) 3)]
        [pts (array point 2)]
@@ -46,4 +46,4 @@
             (cast f64 pts[0].x) (cast f64 pts[0].y) (cast f64 pts[1].y) (cast f64 l.to.y))
     (let [q (swap {(pair i32 f64) :a 7 :b 0.5})]
       (printf c"%g %d  %d %d  %d\n" q.a q.b (answer) (twice! 21) (three)[2])))
-  0)
+  (return 0))

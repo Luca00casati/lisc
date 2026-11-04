@@ -13,15 +13,15 @@
 (struct (map K V) [keys (ptr K)] [vals (ptr V)] [used (ptr bool)] [len u64] [cap u64])
 
 (private
-  (defn hash-bytes [p (ptr u8)] [n u64] u64
+  (defn hash-bytes [p (ptr u8)] [n u64] -> u64
     (let [h u64 0xcbf29ce484222325]
       (for [i u64 0 n]
         (set h (* (^ h p[i]) 0x100000001b3)))
-      (mix h)))
-  (defn mix [x u64] u64                         ; (splitmix64's finalizer)
+      (return (mix h))))
+  (defn mix [x u64] -> u64                         ; (splitmix64's finalizer)
     (set x (* (^ x (>> x 30)) 0xbf58476d1ce4e5b9))
     (set x (* (^ x (>> x 27)) 0x94d049bb133111eb))
-    (^ x (>> x 31)))
+    (return (^ x (>> x 31))))
 
   (defmeta by-value? (t) (let [k (type-kind t)] (or (eq k 'int) (eq k 'bool) (eq k 'ptr))))
 
@@ -38,13 +38,13 @@
             (else `(= (libc::memcmp (addr ,a) (addr ,b) (sizeof ,K)) 0)))))
 
   ; where k is, or the free slot where it would go (cap > 0)
-  (defn (slot K V) [m (ptr (map K V))] [k K] u64
+  (defn (slot K V) [m (ptr (map K V))] [k K] -> u64
     (let [mask (- m.cap 1)] [i (& (hash-of! k K) mask)]
       (while (and m.used[i] (not (same! m.keys[i] k K)))
         (set i (& (+ i 1) mask)))
-      i))
+      (return i)))
 
-  (defn (grow K V) [m (ptr (map K V))] void
+  (defn (grow K V) [m (ptr (map K V))]
     (let [old (deref m)] [cap (if (= old.cap 0) 16 (* old.cap 2))]
       (set m.cap cap)
       (set m.len 0)
@@ -58,7 +58,7 @@
       (libc::free old.vals)
       (libc::free old.used))))
 
-(defn (put K V) [m (ptr (map K V))] [k K] [v V] void
+(defn (put K V) [m (ptr (map K V))] [k K] [v V]
   (when (>= (* (+ m.len 1) 4) (* m.cap 3)) (grow m))   ; (at most 3/4 full)
   (let [i (slot m k)]
     (unless m.used[i]
@@ -67,14 +67,14 @@
       (+= m.len 1))
     (set m.vals[i] v)))
 
-(defn (get K V) [m (ptr (map K V))] [k K] (ptr V)
+(defn (get K V) [m (ptr (map K V))] [k K] -> (ptr V)
   (when (= m.cap 0) (return null))
   (let [i (slot m k)]
-    (if m.used[i] (addr m.vals[i]) null)))
+    (return (if m.used[i] (addr m.vals[i]) null))))
 
-(defn (has K V) [m (ptr (map K V))] [k K] bool (!= (get m k) null))
+(defn (has K V) [m (ptr (map K V))] [k K] -> bool (return (!= (get m k) null)))
 
-(defn (remove K V) [m (ptr (map K V))] [k K] bool
+(defn (remove K V) [m (ptr (map K V))] [k K] -> bool
   (when (= m.cap 0) (return false))
   (let [mask (- m.cap 1)] [i (slot m k)]
     (unless m.used[i] (return false))
@@ -92,9 +92,9 @@
             (set m.used[j] false)
             (set i j)))
         (set j (& (+ j 1) mask))))
-    true))
+    (return true)))
 
-(defn (release K V) [m (ptr (map K V))] void
+(defn (release K V) [m (ptr (map K V))]
   (libc::free m.keys)
   (libc::free m.vals)
   (libc::free m.used)

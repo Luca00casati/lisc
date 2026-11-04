@@ -2,4 +2,4 @@
 (def g i32 1)
 (defmacro like! (name e) `(def ,name ,(type-of e) 0))
 (like! h g)
-(defn main [] i32 0)
+(defn main [] -> i32 (return 0))

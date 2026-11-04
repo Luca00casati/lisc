@@ -4,7 +4,7 @@
 (struct point [x i32] [y i32])
 (struct named [name str] [p point] [c color] [tags (array u8 3)] [ok bool :bits 1])
 
-(defn main [] i32
+(defn main [] -> i32
   (let [n named]
     (set n {named :name "kettle" :p {point :x 1 :y -2} :c color.blue :tags {(array u8 3) 7 8 9} :ok true})
     (println n)
@@ -16,4 +16,4 @@
     (println :to libc::stdout "to " "stdout")
     (println "i128 " (* (cast i128 -170141183460469231) 1000000000 1000000000000) " " (cast u128 0) " "
              (- (<< (cast u128 1) 127) 1) " " (cast i128 -7)))
-  0)
+  (return 0))

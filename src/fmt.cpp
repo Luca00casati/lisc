@@ -11,7 +11,7 @@
 //   - another call: under its first argument, if that is on the paren's line,
 //     else 1 past the paren (so do lists of data)
 //   - inside [ ]: 1 past the bracket; inside { }: as a call
-// Tokens written touching (a[i], 'x, ,@xs, c"...") stay touching; other gaps
+// Tokens written touching (a[i], a[i].x, c"...") stay touching; other gaps
 // become one space, none just inside a bracket. A comment after code keeps
 // its column when the code leaves room for it.
 
@@ -33,9 +33,9 @@ struct Open {
 };
 
 const std::set<std::string> body_forms = {
-    "defn", "defop", "fn", "let", "when", "unless", "while", "for",
+    "defn", "defop", "lambda", "let", "when", "unless", "while", "for",
     "match", "case", "defer", "if-defined", "def", "const", "struct", "union", "variant", "enum", "private", "unchecked", "%alias"};
-const std::set<std::string> binding_forms = {"defn", "defop", "fn", "let", "%alias"};
+const std::set<std::string> binding_forms = {"defn", "defop", "lambda", "let", "%alias"};
 
 bool delim(int c) { return c == 0 || strchr(" \t\r\n()[]{}\";'`,", c) != nullptr; }
 
@@ -47,7 +47,6 @@ struct Formatter {
     int line = 0;         // output line number
     int col = 0;          // output column on the current line
     bool in_string = false;
-    bool prefix = false;  // a ' ` , ,@ waits for its form
 
     explicit Formatter(const std::string &s) : src(s) {}
 
@@ -73,7 +72,6 @@ struct Formatter {
 
     // a new element of the innermost list starts at the current column
     void element(const std::string &atom, bool opener) {
-        if (prefix) { prefix = false; return; }  // ('x is one element)
         if (stack.empty()) return;
         Open &p = stack.back();
         int i = p.items++;
@@ -86,7 +84,7 @@ struct Formatter {
     void line_of(size_t start, size_t end) {
         size_t i = start;
         bool first = true;
-        char last = 0;  // the previous token's kind: '(' opener, ')' closer, 'p' prefix, 'a' other
+        char last = 0;  // the previous token's kind: '(' opener, ')' closer, 'a' other
         if (in_string) {  // the rest of a string: as it is (then the line goes on)
             string_body(i, end);
             if (in_string) { pos = end; return; }
@@ -115,7 +113,7 @@ struct Formatter {
                 break;
             }
             bool closer = c == ')' || c == ']' || c == '}';
-            if (!first && gap && last != '(' && last != 'p' && !closer) put(" ");
+            if (!first && gap && last != '(' && !closer) put(" ");
             first = false;
             pos = i;
             if (c == '(' || c == '[' || c == '{') {
@@ -130,13 +128,6 @@ struct Formatter {
                 put(std::string(1, c));
                 i++;
                 last = ')';
-            } else if (c == '\'' || c == '`' || c == ',') {
-                element("", false);
-                prefix = true;
-                size_t j = i + 1 + (c == ',' && i + 1 < end && src[i + 1] == '@');
-                put(src.substr(i, j - i));
-                i = j;
-                last = 'p';
             } else if (c == '"' || (c == 'c' && i + 1 < end && src[i + 1] == '"')) {
                 element("", false);
                 size_t j = i + (c == 'c') + 1;
@@ -149,11 +140,11 @@ struct Formatter {
                 size_t j = i;
                 if (c == '#' && i + 1 < end && src[i + 1] == '\\') j += 3;  // #\( #\; : the character is taken whatever it is
                 while (j < end && !delim(src[j])) j++;
+                if (j == i) j++;  // (a stray ' ` or ,: a token of its own)
                 std::string tok = src.substr(i, j - i);
                 // .x right after an index is part of it (a[i].x), not an element
                 bool attached = !gap && (last == ')' || last == 'a');
                 if (!attached) element(tok, false);
-                else prefix = false;
                 put(tok);
                 i = j;
                 last = 'a';

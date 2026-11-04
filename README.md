@@ -145,8 +145,8 @@ Expressions — everything is one; statements have type `void`:
       or a struct with data and len (a (vec T)), also through a pointer; x is the element itself
       (setting it sets the element), i its index (a u64)
     (match x (case body...) ((case a b) body...) ((or c d) body...) ... (else body...)) — see Variants
-    (fn [a T] ... [-> R] body...) — a function written where it is used; with captures a closure (see below)
-    (fn :heap [a T] ... [-> R] body...) — a heap-fn, kept until (drop f)
+    (lambda [a T] ... [-> R] body...)  (lambda [a T] ... -> e) — a function written where it is used; with captures a closure
+    (lambda :heap [a T] ... [-> R] body...) — a heap-fn, kept until (drop f)
     (unchecked body...) — no run-time checks in it
     (print x ...)  (println x ...)  [:to file] — see Printing
     (cond (test body...) ... (else body...))   (case x (v body...) ((v1 v2) body...) ... (else body...))
@@ -251,13 +251,20 @@ Blocks are still expressions inside a function: `(set x (if c 1 2))`,
 `tools/returns.py file.lsp ...` rewrites code from the older style (a result
 type right after the parameters, the last expression the result).
 
-Functions can be written where they are used: `(fn [a T] ... [-> R] body...)`.
-One that uses only its parameters, globals and other functions is a function
-pointer, typed `(ptr (fn (T ...) R))`, and can go to C:
+Functions can be written where they are used, with `lambda`:
+`(lambda [a T] ... -> R body...)` as a `defn`, or, for one expression,
+`(lambda [a T] ... -> e)`: a single form after `->` is the result itself (a
+result type would need a body), its type the one wanted (a function pointer,
+closure or heap-fn type) or else the expression's. A lambda that uses only its
+parameters, globals and other functions is a function pointer, typed
+`(ptr (fn (T ...) R))`, and can go to C:
 
 ```lisp
-(sort-by (slice-of xs) (fn [a i32] [b i32] -> bool (return (> a b))))   ; descending
-(let [inc (fn [x i32] -> i32 (return (+ x 1)))] (inc 41))
+(sort-by (slice-of xs) (lambda [a i32] [b i32] -> (> a b)))   ; descending
+(let [inc (lambda [x i32] -> (+ x 1))] (inc 41))
+(lambda [x i32] -> i32                                          ; the long form
+  (let [y (* x 3)]
+    (return (+ y 1))))
 ```
 
 One that uses locals around it is a **closure**, typed `(closure (T ...) R)`.
@@ -268,7 +275,7 @@ It captures them by reference: it reads and sets the variables themselves.
   (for [x :in xs] (f x)))
 
 (let [total 0] [k 3]
-  (each (slice-of a) (fn [x i32] (+= total (* x k))))
+  (each (slice-of a) (lambda [x i32] (+= total (* x k))))
   total)
 ```
 
@@ -278,12 +285,12 @@ down: it is an argument, a parameter, or a local given one when it is made.
 It can't be set again, returned, kept in a global, a field, an array or a
 slice, or put behind a pointer (each is an error). Nothing then outlives the
 captured variables, and nothing keeps a closure from an earlier pass of a
-loop. A plain function, or a fn without captures, goes wherever a closure is
+loop. A plain function, or a lambda without captures, goes wherever a closure is
 wanted. A generic parameter `[f F]` takes either, with no indirection added
 (`sort-by` does this).
 
 To keep a function with what it captured (a struct of event handlers, a
-`vec` of callbacks, a function that makes one), write `(fn :heap ...)`: a
+`vec` of callbacks, a function that makes one), write `(lambda :heap ...)`: a
 **heap-fn**, typed `(heap-fn (T ...) R)`. It captures by value: its captures
 are copied into an env `malloc`'d when it is made, and are its own from then
 on (setting one changes the copy, kept between calls). It goes anywhere a
@@ -293,7 +300,7 @@ value goes, and lives until `(drop f)` frees its env:
 (struct button [name str] [on-click (heap-fn (i32) void)])
 
 (defn make-greet [who str] [times (ptr i32)] -> (heap-fn (i32) void)
-  (return (fn :heap [x i32]
+  (return (lambda :heap [x i32]
     (+= (deref times) 1)               ; shared state: capture a pointer to it
     (println "hello " who " at " x))))
 
@@ -309,9 +316,8 @@ function goes where a heap-fn is wanted (dropping it frees nothing), and a
 heap-fn goes where a closure is wanted (to `sort-by`, say). A heap-fn can't
 capture a closure, which would outlive what that captured.
 
-A fn is compiled as a function of its own; in a generic, it sees the
-instance's types. `(fn (T) R)`, with a list where the brackets are, is
-still the type.
+A lambda is compiled as a function of its own; in a generic, it sees the
+instance's types. `(fn (T) R)` is the function type; `fn` is only that.
 
 ## Variants
 

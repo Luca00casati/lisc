@@ -44,7 +44,7 @@
     (printf c"the %d pot %d lid %d spout %d kettle %d, %lu words\n" (deref (map::get (addr words) "the")) (deref (map::get (addr words) "pot"))
             (deref (map::get (addr words) "lid")) (deref (map::get (addr words) "spout")) (cast i32 (map::has (addr words) "kettle")) words.len)
     (let [total 0]
-      (map::each (addr words) (fn [_k str] [n i32] (+= total n)))
+      (map::each (addr words) (lambda [_k str] [n i32] (+= total n)))
       (printf c"total %d\n" total))
     (map::release (addr words)))
   (let [grid {(map::map pt f64)}]

@@ -5,13 +5,13 @@
 (struct button [name str] [on-click (heap-fn (i32) void)])   ; allowed in a field
 
 (defn make-greet [who str] [times (ptr i32)] -> (heap-fn (i32) void)   ; and as a result
-  (return (fn :heap [x i32]
+  (return (lambda :heap [x i32]
             (+= (deref times) 1)
             (println "hello " who " at " x))))
 
 (defn counter [] -> (heap-fn () i32)
   (let [n 0]
-    (return (fn :heap [] -> i32 (+= n 1) (return n)))))       ; n is its own copy, kept between calls
+    (return (lambda :heap [] -> i32 (+= n 1) (return n)))))       ; n is its own copy, kept between calls
 
 (defn plus1 [x i32] (println "plain " x))
 (defn run [f (closure (i32) void)] [x i32] (f x))
@@ -29,11 +29,11 @@
     (run ok.on-click 30)                ; passed down as a closure
     (println clicks " clicks")
     (for [i 0 3]
-      (vec::push (addr hs) (fn :heap [x i32] (println "handler " i " got " x))))   ; each keeps its own i
+      (vec::push (addr hs) (lambda :heap [x i32] (println "handler " i " got " x))))   ; each keeps its own i
     (vec::push (addr hs) plus1)                ; a plain function too
     (for [h :in hs] (h 7))
     (println (c) " " (c) " " (c))
-    (let [cmp (fn :heap [x i32] [y i32] -> bool (if desc (return (> x y)) (return (< x y))))]
+    (let [cmp (lambda :heap [x i32] [y i32] -> bool (if desc (return (> x y)) (return (< x y))))]
       (sort::sort-by (slice-of a) cmp)
       (println a)
       (drop cmp))

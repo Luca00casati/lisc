@@ -3,5 +3,5 @@
 (import "std/vec")
 (defn main [] -> i32
   (let [k 1] [v (vec::vec (closure () void))]
-    (vec::push v (fn [] (println k))))
+    (vec::push v (lambda [] (println k))))
   (return 0))

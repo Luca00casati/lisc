@@ -20,7 +20,7 @@
 (defn (show T) [x T] :optnone (println "show " x))
 
 (defn main [] -> i32
-  (let [p (build 5)] [f (fn [x i64] -> i64 :optnone (return (+ x hidden)))]
+  (let [p (build 5)] [f (lambda [x i64] -> i64 :optnone (return (+ x hidden)))]
     (record (twice p))
     (show p.b) (show 2.5)
     (println "total " total " hidden " hidden " fn " (f 1)))

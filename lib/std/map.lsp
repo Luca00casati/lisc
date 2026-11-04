@@ -93,7 +93,7 @@
   (libc::free m.used)
   (set (deref m) null))
 
-; f called with every entry, in no particular order: (each m (fn [k K] [v V] ...))
+; f called with every entry, in no particular order: (each m (lambda [k K] [v V] ...))
 (defn (each K V F) [m (ptr (map K V))] [f F]
   (for [i u64 0 m.cap]
     (when m.used[i] (f m.keys[i] m.vals[i]))))

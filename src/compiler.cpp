@@ -1309,7 +1309,7 @@ struct Compiler::Impl {
     const std::set<std::string> *lambda_outer = nullptr;  // while compiling a fn's body
     int lambda_count = 0;
 
-    // (fn [a T] ... R body...): a function written where it is used. It is
+    // (lambda [a T] ... [-> R] body...): a function written where it is used. It is
     // compiled on its own; the locals around it that it uses are its captures,
     // reached by reference through an env (their addresses) made with it.
     // Without captures it is a plain function pointer; with them a
@@ -1321,11 +1321,11 @@ struct Compiler::Impl {
         Type *env_t = nullptr;
         bool heap = false;
     };
-    // a fn literal compiled again in the same function (a generic call infers
+    // a lambda compiled again in the same function (a generic call infers
     // its types from the arguments first) is the function made the first time
     std::map<std::pair<Form *, llvm::Function *>, LambdaMade> lambdas_made;
 
-    // (fn :heap [a T] ... R body...): a heap-fn, its captures copied into an env
+    // (lambda :heap [a T] ... [-> R] body...): a heap-fn, its captures copied into an env
     // malloc'd when it is made (freed by drop)
     Val lambda(Form *f, Type *want) {
         bool heap = f->size() >= 2 && f->at(1)->is_sym(":heap");
@@ -1334,7 +1334,7 @@ struct Compiler::Impl {
             lit = new Form(*f);
             lit->items.erase(lit->items.begin() + 1);
         }
-        if (lit->size() < 2) fatal(f->loc, heap ? "(fn :heap [a T] ... [-> R] body...)" : "(fn [a T] ... [-> R] body...)");
+        if (lit->size() < 2) fatal(f->loc, heap ? "(lambda :heap [a T] ... [-> R] body...)" : "(lambda [a T] ... [-> R] body...)");
         auto made = lambdas_made.find({f, fn});
         if (made != lambdas_made.end()) {
             LambdaMade &m = made->second;
@@ -1346,7 +1346,15 @@ struct Compiler::Impl {
         Form *name = mk_sym(f->loc, "fn#" + std::to_string(++lambda_count));
         std::vector<Form *> items{mk_sym(f->loc, "defn"), name};
         items.insert(items.end(), lit->items.begin() + 1, lit->items.end());
-        Form *def = signature(unbracket(mk_list(f->loc, items), 2), 2);
+        Form *def = unbracket(mk_list(f->loc, items), 2);
+        // (lambda [a T] -> e): one form after -> is the result itself (a result type would need a body)
+        if (def->size() == 5 && def->at(3)->is_sym("->")) {
+            if (looks_like_type(def->at(4), def))
+                fatal(def->at(4)->loc, "a lambda giving %s needs a body ending in (return e), or write the result itself: (lambda [a T] -> e)",
+                      show(def->at(4)).c_str());
+            def = short_lambda(def, want);
+        }
+        def = signature(def, 2);
         // the captures: the locals around it its code names (not its parameters)
         std::set<std::string> outer, params;
         for (auto &s : scopes)
@@ -1377,8 +1385,8 @@ struct Compiler::Impl {
             return {g.value, t_ptr(g.type)};
         }
         if (want && want->is_ptr() && want->elem->kind == Type::Fn)
-            fatal(heap ? f->loc : caps[0]->loc, heap ? "a (fn :heap ...) is a heap-fn, not a function pointer"
-                                                     : "this fn uses '%s' from the code around it, so it is a closure, not a function pointer: (closure (A ...) R) holds one",
+            fatal(heap ? f->loc : caps[0]->loc, heap ? "a (lambda :heap ...) is a heap-fn, not a function pointer"
+                                                     : "this lambda uses '%s' from the code around it, so it is a closure, not a function pointer: (closure (A ...) R) holds one",
                   caps.empty() ? "" : caps[0]->text.c_str());
         // the env, c0 c1 ...: a closure's holds the captured locals' addresses, a heap-fn's copies of their values
         auto *st = new StructInfo;
@@ -1386,7 +1394,7 @@ struct Compiler::Impl {
         std::vector<Val> vals;
         for (size_t i = 0; i < caps.size(); i++) {
             Val a = lookup_local(key(caps[i]));
-            if (a.bwidth && !heap) fatal(caps[i]->loc, "a fn can't capture '%s', a bit field", caps[i]->text.c_str());
+            if (a.bwidth && !heap) fatal(caps[i]->loc, "a lambda can't capture '%s', a bit field", caps[i]->text.c_str());
             if (heap && is_closure(a.t))
                 fatal(caps[i]->loc, "a heap-fn can't capture '%s', a closure (it would outlive what that captured)", caps[i]->text.c_str());
             vals.push_back(a);
@@ -1511,6 +1519,40 @@ struct Compiler::Impl {
         b.CreateBr(done);
         b.SetInsertPoint(done);
         return {nullptr, t_void()};
+    }
+
+    // (lambda [a T] ... -> e): a function whose result is e, the result type
+    // the one wanted (a function pointer, closure or heap-fn type) or e's.
+    // Made into (defn name (params) -> R (return e)).
+    Form *short_lambda(Form *def, Type *want) {
+        Form *e = def->at(4);
+        Type *rt = nullptr;
+        if (want && want->is_ptr() && want->elem->kind == Type::Fn) rt = want->elem->elem;
+        else if (want && want->kind == Type::Struct && want->st->closure_of) rt = want->st->closure_of->elem;
+        else {  // e's type, with the parameters in scope (and the locals around, for captures)
+            auto saved = lambdas_made;  // (lambdas in e are made again for real)
+            scopes.emplace_back();
+            for (Form *p : def->at(2)->items) {
+                if (!p->is_list() || p->size() != 2 || p->at(0)->kind != Form::Sym) fatal(p->loc, "parameter must be [name T]");
+                Type *t = parse_type(p->at(1));
+                scopes.back()[key(p->at(0))] = {alloca_(t, "param"), t};
+            }
+            rt = type_of(e);
+            scopes.pop_back();
+            lambdas_made = saved;
+        }
+        Form *ty = mk_sym(e->loc, "#result");
+        ty->type = rt;
+        std::vector<Form *> items(def->items.begin(), def->items.begin() + 3);
+        if (rt == t_void()) items.push_back(e);
+        else {
+            items.push_back(mk_sym(def->at(3)->loc, "->"));
+            items.push_back(ty);
+            items.push_back(mk_list(e->loc, {mk_sym(e->loc, "return"), e}));
+        }
+        Form *r = new Form(*def);
+        r->items = std::move(items);
+        return r;
     }
 
     // a plain function used as a closure: its env is the function itself, and
@@ -1849,7 +1891,7 @@ struct Compiler::Impl {
     }
     void no_closure(Type *t, Loc at, const char *what) {
         if (is_closure(t))
-            fatal(at, "a closure can't be %s (here %s): it is only passed down, as an argument or a local; to keep one, make a heap-fn with (fn :heap ...)",
+            fatal(at, "a closure can't be %s (here %s): it is only passed down, as an argument or a local; to keep one, make a heap-fn with (lambda :heap ...)",
                   what, type_name(t).c_str());
     }
 
@@ -2333,7 +2375,7 @@ struct Compiler::Impl {
         Global *g = lookup_global(f);
         if (!g) g = generic_value(f, want);
         if (!g && lambda_outer && lambda_outer->count(key(f)))
-            fatal(f->loc, "a fn can't use '%s' here, a local of the code around it", n.c_str());
+            fatal(f->loc, "a lambda can't use '%s' here, a local of the code around it", n.c_str());
         if (!g) fatal(f->loc, "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
@@ -2386,7 +2428,9 @@ struct Compiler::Impl {
             unchecked--;
             return r;
         }
-        if (hs == "fn" && f->size() >= 2 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return lambda(f, want);
+        if (hs == "lambda" && f->size() >= 2 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return lambda(f, want);
+        if (hs == "fn" && f->size() >= 2 && (f->at(1)->bracket || f->at(1)->is_sym(":heap")))
+            fatal(f->loc, "a function literal is (lambda [a T] ...); (fn (A ...) R) is only the type");
         if (hs == "drop" && !lookup_global(f->at(0))) return drop(f);
         if (hs == "match") return match_(f, want);
         if ((hs == "print" || hs == "println") && !lookup_global(f->at(0))) return print(f, hs == "println");
@@ -3013,7 +3057,7 @@ struct Compiler::Impl {
             return !type_key(f).empty() && !lookup_local(key(f)).v && !lookup_global(f);
         }
         if (f->is_list() && f->size() >= 2 && !generic_key(f->at(0), generic_structs).empty()) return true;
-        if (f->is_call("fn") && f->size() > 1 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return false;  // (fn [a T] R ...): a function, not a type
+        if (f->is_call("fn") && f->size() > 1 && (f->at(1)->bracket || f->at(1)->is_sym(":heap"))) return false;  // (an old fn literal: an error later)
         return f->is_call("ptr") || f->is_call("array") || f->is_call("fn") || f->is_call("slice") || f->is_call("simd");
     }
 
@@ -3334,7 +3378,7 @@ struct Compiler::Impl {
     }
 
     // (%alias [name place] ... body...): names for places (for :in and match bind them)
-    // (%captures ...): a fn literal's captures (not warned about when unused)
+    // (%captures ...): a lambda's captures (not warned about when unused)
     Val alias(Form *f, Type *want, bool warn = true) {
         f = unbracket(f, 1);
         scopes.emplace_back();

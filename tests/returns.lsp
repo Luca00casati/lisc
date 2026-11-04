@@ -15,6 +15,6 @@
   (hello)
   (let [a {(array i32 3) 3 30 4}]
        [x (if (> (sign -5) 0) 1 2)]           ; blocks are still expressions
-       [f (fn [x i32] -> i32 (return (* x 2)))]
+       [f (lambda [x i32] -> i32 (return (* x 2)))]
     (println (sign -5) " " (first-big (slice-of a)) " " (count-up) " " x " " (f 21)))
   (return 0))

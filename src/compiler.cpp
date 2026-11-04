@@ -55,6 +55,19 @@
 using llvm::BasicBlock;
 
 Type *t_str();
+// the run-time description of types, for any (built in, like str):
+//   (enum type-kind u32 void bool int float ptr array slice struct union enum simd fn str variant closure)
+//   (struct field-info [name str] [type (ptr type-info)] [offset u64])
+//   (struct type-info [kind type-kind] [name str] [size u64] [align u64] [signed bool]
+//     [elem (ptr type-info)] [len u64] [fields (slice field-info)] [names (slice str)] [values (slice i64)]
+//     [cases (slice (ptr type-info))])
+//   (struct any [data (ptr void)] [type (ptr type-info)])
+Type *t_type_kind();
+Type *t_type_info();
+Type *t_field_info();
+Type *t_any();
+const char *const TYPE_KINDS[] = {"void", "bool", "int", "float", "ptr", "array", "slice", "struct", "union", "enum",
+                                  "simd", "fn", "str", "variant", "closure"};
 
 namespace {
 
@@ -269,6 +282,108 @@ struct Compiler::Impl {
         e.CreateCall(mod.getOrInsertFunction("abort", llvm::FunctionType::get(e.getVoidTy(), false)));
         e.CreateUnreachable();
         return f;
+    }
+
+    /* ------------------------------------------------- type descriptions --- */
+    // a struct constant of type t with the given field values (others zero)
+    llvm::Constant *struct_const(Type *t, const std::map<std::string, llvm::Constant *> &vals) {
+        auto *sty = llvm::cast<llvm::StructType>(ll(t));
+        std::vector<const Field *> order;
+        for (auto &f : t->st->fields) order.push_back(&f);
+        std::stable_sort(order.begin(), order.end(), [](const Field *a, const Field *x) { return a->offset < x->offset; });
+        std::vector<llvm::Constant *> parts;
+        uint64_t cur = 0;
+        for (const Field *fd : order) {
+            if (fd->offset < cur) continue;
+            if (fd->offset > cur) parts.push_back(llvm::Constant::getNullValue(sty->getElementType(parts.size())));
+            auto it = vals.find(fd->name);
+            parts.push_back(it != vals.end() ? it->second : llvm::Constant::getNullValue(ll(fd->type)));
+            cur = fd->offset + size_of(fd->type);
+        }
+        if (parts.size() < sty->getNumElements()) parts.push_back(llvm::Constant::getNullValue(sty->getElementType(parts.size())));
+        return llvm::ConstantStruct::get(sty, parts);
+    }
+    llvm::Constant *str_const(const std::string &s) {
+        auto *bytes = llvm::ConstantDataArray::getString(ctx, s, false);
+        auto *g = new llvm::GlobalVariable(mod, bytes->getType(), true, llvm::GlobalValue::PrivateLinkage, bytes, "typename");
+        return struct_const(t_str(), {{"data", g}, {"len", b.getInt64(s.size())}});
+    }
+    llvm::Constant *slice_const(Type *elem, const std::vector<llvm::Constant *> &xs) {
+        if (xs.empty()) return llvm::Constant::getNullValue(ll(t_slice(elem)));
+        auto *at = llvm::ArrayType::get(ll(elem), xs.size());
+        auto *g = new llvm::GlobalVariable(mod, at, true, llvm::GlobalValue::PrivateLinkage, llvm::ConstantArray::get(at, xs), "typeinfo.items");
+        return struct_const(t_slice(elem), {{"data", g}, {"len", b.getInt64(xs.size())}});
+    }
+    // the description of t: one global per type (not constant, so the parallel
+    // build keeps one copy, and the same type has the same address everywhere)
+    std::map<Type *, llvm::GlobalVariable *> type_infos;
+    llvm::GlobalVariable *type_info(Type *t) {
+        auto found = type_infos.find(t);
+        if (found != type_infos.end()) return found->second;
+        Type *ti = t_type_info();
+        auto *g = new llvm::GlobalVariable(mod, ll(ti), false, llvm::GlobalValue::InternalLinkage, nullptr, "lisc.type." + type_name(t));
+        g->setAlignment(llvm::Align(align_of(ti)));
+        type_infos[t] = g;
+        auto kind = [&](const char *k) {
+            uint64_t i = std::find_if(std::begin(TYPE_KINDS), std::end(TYPE_KINDS), [&](const char *x) { return !strcmp(x, k); }) - std::begin(TYPE_KINDS);
+            return llvm::ConstantInt::get(ll(t_type_kind()), i);
+        };
+        std::map<std::string, llvm::Constant *> v;
+        v["name"] = str_const(type_name(t));
+        if (t->kind != Type::Void && t->kind != Type::Fn) {
+            if (t->kind == Type::Struct) ensure_layout(t->st, {});
+            v["size"] = b.getInt64(size_of(t));
+            v["align"] = b.getInt64(align_of(t));
+        }
+        switch (t->kind) {
+        case Type::Void: v["kind"] = kind("void"); break;
+        case Type::Bool: v["kind"] = kind("bool"); break;
+        case Type::Int:
+            v["signed"] = b.getInt1(t->sign);
+            if (t->en) {
+                v["kind"] = kind("enum");
+                std::vector<llvm::Constant *> names, values;
+                for (auto &m : t->en->values) {
+                    names.push_back(str_const(m.first));
+                    values.push_back(b.getInt64(m.second));
+                }
+                v["names"] = slice_const(t_str(), names);
+                v["values"] = slice_const(t_int(64, true), values);
+                v["name"] = str_const(t->en->name);
+            } else v["kind"] = kind("int");
+            break;
+        case Type::Float: v["kind"] = kind("float"); v["signed"] = b.getInt1(true); break;
+        case Type::Ptr: v["kind"] = kind("ptr"); v["elem"] = type_info(t->elem); break;
+        case Type::Fn: v["kind"] = kind("fn"); break;
+        case Type::Array: v["kind"] = kind("array"); v["elem"] = type_info(t->elem); v["len"] = b.getInt64(t->n); break;
+        case Type::Simd: v["kind"] = kind("simd"); v["elem"] = type_info(t->elem); v["len"] = b.getInt64(t->n); break;
+        case Type::Struct: {
+            StructInfo *st = t->st;
+            if (t == t_str()) { v["kind"] = kind("str"); break; }
+            if (st->slice_of) { v["kind"] = kind("slice"); v["elem"] = type_info(st->slice_of); break; }
+            if (st->closure_of) { v["kind"] = kind("closure"); break; }
+            std::vector<llvm::Constant *> fields;
+            for (auto &fd : st->fields)
+                fields.push_back(struct_const(t_field_info(), {{"name", str_const(fd.name)}, {"type", type_info(fd.type)}, {"offset", b.getInt64(fd.offset)}}));
+            v["fields"] = slice_const(t_field_info(), fields);
+            if (VariantInfo *vi = variant_of(t)) {  // its cases: names, and each case's struct (null without fields)
+                v["kind"] = kind("variant");
+                v["name"] = str_const(vi->name);
+                const Field *cf = st->find("cases");
+                std::vector<llvm::Constant *> names, cases;
+                for (size_t ci = 0; ci < vi->cases.size(); ci++) {
+                    names.push_back(str_const(vi->cases[ci]));
+                    const Field *c = cf && cf->type->kind == Type::Struct ? cf->type->st->find(vi->cases[ci]) : nullptr;
+                    cases.push_back(c ? (llvm::Constant *)type_info(c->type) : llvm::ConstantPointerNull::get(b.getPtrTy()));
+                }
+                v["names"] = slice_const(t_str(), names);
+                v["cases"] = slice_const(t_ptr(t_type_info()), cases);
+            } else v["kind"] = kind(st->is_union ? "union" : "struct");
+            break;
+        }
+        }
+        g->setInitializer(struct_const(ti, v));
+        return g;
     }
 
     // indexable through its fields: data, a pointer, and len, an integer
@@ -1781,16 +1896,37 @@ struct Compiler::Impl {
     Global *infer_fn(Generic &g, Form *call) {
         Form *ps = g.def->at(2);
         size_t n = call->size() - 1;
-        if (n != ps->size()) fatal(call->loc, "%s takes %zu argument%s, got %zu", bare(g.key).c_str(), ps->size(), ps->size() == 1 ? "" : "s", n);
+        bool rest = rest_defs.count(g.def);
+        Form *spread = rest ? spread_of(call, ps->size() - 1) : nullptr;
+        if (spread) {  // (f a .. s) → (f a s), with s matched as the slice
+            std::vector<Form *> items(call->items.begin(), call->items.begin() + ps->size());
+            items.push_back(spread);
+            call = mk_list(call->loc, items);
+            n = call->size() - 1;
+        }
+        if (rest ? n + 1 < ps->size() : n != ps->size())
+            fatal(call->loc, "%s takes %s%zu argument%s, got %zu", bare(g.key).c_str(), rest ? "at least " : "", rest ? ps->size() - 1 : ps->size(),
+                  ps->size() == 1 ? "" : "s", n);
+        // the parameter type an argument is matched against (the rest's are the element type)
+        auto param_type = [&](size_t i) -> Form * {
+            Form *p = ps->at(i < ps->size() ? i : ps->size() - 1);
+            if (!p->is_list() || p->size() != 2) return nullptr;
+            if (rest && i + 1 >= ps->size() && !spread) return p->at(1)->at(1);  // ((slice T)'s T)
+            return p->at(1);
+        };
         std::map<std::string, Type *> b;
         for (size_t i = 0; i < n; i++) {
             Form *a = call->at(i + 1);
+            if (spread && i + 1 == n) {
+                match(g, param_type(i), type_of(a), b, a);
+                continue;
+            }
             if (untyped(a) || a->is_sym("null") || bare_generic(a)) continue;  // (these get their type from the parameter)
-            if (ps->at(i)->is_list() && ps->at(i)->size() == 2) match(g, ps->at(i)->at(1), type_of(a), b, a);
+            if (Form *pt = param_type(i)) match(g, pt, type_of(a), b, a);
         }
         // a parameter only literals stand for: their own type ((max 1 2) is for i32)
         for (size_t i = 0; i < n; i++) {
-            Form *a = call->at(i + 1), *pt = ps->at(i)->is_list() && ps->at(i)->size() == 2 ? ps->at(i)->at(1) : nullptr;
+            Form *a = call->at(i + 1), *pt = param_type(i);
             if (pt && pt->kind == Form::Sym && untyped(a) && !b.count(pt->text) &&
                 std::find(g.params.begin(), g.params.end(), pt->text) != g.params.end())
                 b[pt->text] = default_type(a);
@@ -1815,6 +1951,7 @@ struct Compiler::Impl {
                 {"isize", t_int(64, true)}, {"usize", t_int(64, false)},
                 {"f32", t_float(32)}, {"f64", t_float(64)}, {"str", t_str()},
                 {"i128", t_int(128, true)}, {"u128", t_int(128, false)}, {"f80", t_float(80)},
+                {"any", t_any()}, {"type-info", t_type_info()}, {"field-info", t_field_info()}, {"type-kind", t_type_kind()},
             };
             auto it = builtin.find(f->text);
             if (it != builtin.end()) return it->second;
@@ -2025,6 +2162,13 @@ struct Compiler::Impl {
 
     Val coerce(Val v, Type *to, Loc at, const char *what) {
         if (v.t == to) return v;
+        if (to == t_any() && v.t != t_void()) {  // the value, copied to the stack, and its type's description
+            if (v.t->kind == Type::Fn) fatal(at, "%s: a function is not a value (take (addr f))", what);
+            Val m = spill(v);
+            llvm::Value *a = llvm::UndefValue::get(ll(to));
+            a = b.CreateInsertValue(a, m.v, 0);
+            return {b.CreateInsertValue(a, type_info(v.t), 1), to};
+        }
         if (to->kind == Type::Struct && to->st->closure_of && !to->st->heap_fn && v.t->kind == Type::Struct && v.t->st->heap_fn &&
             v.t->st->closure_of == to->st->closure_of)
             return {v.v, to};  // a heap-fn passed down as a closure (the same two pointers)
@@ -2422,6 +2566,10 @@ struct Compiler::Impl {
         if (hs == "for") return for_(f);
         if (hs == "%alias") return alias(f, want);
         if (hs == "%captures") return alias(f, want, false);
+        if (hs == "type-info-of") {  // (type-info-of T): T's description, a (ptr type-info)
+            if (f->size() != 2) fatal(f->loc, "(type-info-of T)");
+            return {type_info(parse_type(f->at(1))), t_ptr(t_type_info())};
+        }
         if (hs == "unchecked") {  // (unchecked body...): no run-time checks in it
             unchecked++;
             Val r = body(f, 1, want);
@@ -3586,6 +3734,7 @@ struct Compiler::Impl {
             }
         }
         if (g && g->kind == Global::Func) { callee = {g->value, g->type}; ft = g->type; }
+        if (g && g->kind == Global::Func && g->def && rest_defs.count(g->def)) return call_rest(callee, ft, f, head);
         if (!ft) {
             callee = expr(head, nullptr);
             if (callee.t->kind == Type::Struct && callee.t->st->closure_of) {  // (fn env args...), a closure or heap-fn
@@ -3721,7 +3870,71 @@ struct Compiler::Impl {
         items.insert(items.end(), f->items.begin() + i, f->items.end());
         Form *r = new Form(*f);
         r->items = std::move(items);
+        // [xs ..T] or [xs .. T], the last parameter: the rest of the arguments, as a (slice T)
+        Form *ps = r->at(params);
+        for (size_t k = 0; k < ps->size(); k++) {
+            Form *p = ps->at(k);
+            if (!p->is_list() || p->size() < 2) continue;
+            Form *et = nullptr;
+            if (p->size() == 2 && p->at(1)->kind == Form::Sym && p->at(1)->text.size() > 2 && p->at(1)->text.compare(0, 2, "..") == 0) {
+                et = new Form(*p->at(1));
+                et->text = et->text.substr(2);
+            } else if (p->size() == 3 && p->at(1)->is_sym("..")) et = p->at(2);
+            if (!et) continue;
+            if (k + 1 != ps->size()) fatal(p->loc, "only the last parameter takes the rest of the arguments: [xs ..T]");
+            if (!f->is_call("defn")) fatal(p->loc, "a %s can't take a variable number of arguments", f->is_call("defop") ? "defop" : "lambda");
+            Form *np = mk_list(p->loc, {p->at(0), mk_list(et->loc, {mk_sym(et->loc, "slice"), et})});
+            np->bracket = p->bracket;
+            Form *nps = new Form(*ps);
+            nps->items[k] = np;
+            r->items[params] = nps;
+            rest_defs.insert(r);
+        }
         return r;
+    }
+    std::set<const Form *> rest_defs;  // functions whose last parameter takes the rest of the arguments
+
+    // (f a ..s) or (f a .. (expr)): the slice to pass as the rest, else null
+    Form *spread_of(Form *f, size_t nfix) {
+        size_t n = f->size() - 1;
+        if (n == nfix + 1 && f->at(n)->kind == Form::Sym && f->at(n)->text.size() > 2 && f->at(n)->text.compare(0, 2, "..") == 0) {
+            Form *s = new Form(*f->at(n));
+            s->text = s->text.substr(2);
+            return s;
+        }
+        if (n == nfix + 2 && f->at(n - 1)->is_sym("..")) return f->at(n);
+        return nullptr;
+    }
+
+    // a call of a function with [xs ..T]: the arguments after the fixed ones
+    // go into an array on the stack, passed as a (slice T); (f a ..s) passes
+    // the slice s itself
+    Val call_rest(Val callee, Type *ft, Form *f, Form *head) {
+        size_t nfix = ft->params.size() - 1, n = f->size() - 1;
+        if (n < nfix)
+            fatal(f->loc, "%s takes at least %zu argument%s, got %zu", show(head).c_str(), nfix, nfix == 1 ? "" : "s", n);
+        Type *st = ft->params.back(), *et = st->st->slice_of;
+        std::vector<Val> args;
+        for (size_t i = 0; i < nfix; i++) args.push_back(value_for(f->at(i + 1), ft->params[i], "argument"));
+        if (Form *s = spread_of(f, nfix)) {
+            args.push_back(value_for(s, st, "the rest of the arguments"));
+        } else {
+            size_t k = n - nfix;
+            llvm::Value *data = llvm::ConstantPointerNull::get(b.getPtrTy());
+            if (k) {
+                Type *at = t_array(et, k);
+                Val arr{alloca_(at, "rest"), at};
+                for (size_t i = 0; i < k; i++) {
+                    Val v = value_for(f->at(nfix + 1 + i), et, "argument");
+                    store({b.CreateInBoundsGEP(ll(at), arr.v, {b.getInt64(0), b.getInt64(i)}), et}, v.v);
+                }
+                data = arr.v;
+            }
+            llvm::Value *sv = llvm::UndefValue::get(ll(st));
+            sv = b.CreateInsertValue(sv, data, 0);
+            args.push_back({b.CreateInsertValue(sv, b.getInt64(k), 1), st});
+        }
+        return emit_call(callee.v, ft, args, {});
     }
     // a type written where a function body starts (the old place of the result type)
     bool looks_like_type(Form *x, Form *def) {
@@ -3753,6 +3966,7 @@ struct Compiler::Impl {
 
     void top(const std::vector<Form *> &files) {
         if (files.empty()) return;
+        c.types_["type-kind"] = t_type_kind();  // (so type-kind.int is a member, like any enum's)
         std::vector<Form *> fs = files;
         root = load_module(files[0]->loc.file, files[0]->loc, &fs);
         std::vector<std::pair<Form *, ModInfo *>> all;
@@ -4249,6 +4463,53 @@ Type *t_str() {
     }();
     return t;
 }
+Type *t_type_kind() {
+    static Type *t = [] {
+        auto *en = new EnumInfo;
+        en->name = "type-kind";
+        uint64_t i = 0;
+        for (const char *k : TYPE_KINDS) en->values.push_back({k, i++});
+        return t_enum(en, t_int(32, false));
+    }();
+    return t;
+}
+namespace {
+StructInfo *type_info_st = nullptr, *field_info_st = nullptr;
+void make_type_info() {
+    if (type_info_st) return;
+    type_info_st = new StructInfo;
+    type_info_st->name = "type-info";
+    field_info_st = new StructInfo;
+    field_info_st->name = "field-info";
+    Type *ti = t_struct(type_info_st), *fi = t_struct(field_info_st), *u64 = t_int(64, false);
+    field_info_st->fields = {{"name", t_str(), 0}, {"type", t_ptr(ti), 0}, {"offset", u64, 0}};
+    layout_struct(field_info_st);
+    type_info_st->fields = {{"kind", t_type_kind(), 0}, {"name", t_str(), 0},          {"size", u64, 0},
+                            {"align", u64, 0},          {"signed", t_bool(), 0},       {"elem", t_ptr(ti), 0},
+                            {"len", u64, 0},            {"fields", t_slice(fi), 0},    {"names", t_slice(t_str()), 0},
+                            {"values", t_slice(t_int(64, true)), 0}, {"cases", t_slice(t_ptr(ti)), 0}};
+    layout_struct(type_info_st);
+}
+}  // namespace
+Type *t_type_info() {
+    make_type_info();
+    return t_struct(type_info_st);
+}
+Type *t_field_info() {
+    make_type_info();
+    return t_struct(field_info_st);
+}
+Type *t_any() {
+    static Type *t = [] {
+        auto *st = new StructInfo;
+        st->name = "any";
+        st->fields = {{"data", t_ptr(t_void()), 0}, {"type", t_ptr(t_type_info()), 0}};
+        layout_struct(st);
+        return t_struct(st);
+    }();
+    return t;
+}
+
 Compiler::~Compiler() = default;
 
 void Compiler::compile(const std::vector<Form *> &forms) {

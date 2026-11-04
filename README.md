@@ -251,6 +251,25 @@ Blocks are still expressions inside a function: `(set x (if c 1 2))`,
 `tools/returns.py file.lsp ...` rewrites code from the older style (a result
 type right after the parameters, the last expression the result).
 
+The last parameter can take the rest of the arguments: `[xs ..T]` (or
+`[xs .. (ptr u8)]` for a type in parentheses) is a `(slice T)` of them. A call
+puts them in an array on the stack, so it allocates nothing; `(f a ..s)` (or
+`(f a .. (expr))`) passes a slice of them on instead. A generic's `T` is
+found from them as from any argument.
+
+```lisp
+(defn sum [xs ..i32] -> i32
+  (let [s 0]
+    (for [x :in xs] (+= s x))
+    (return s)))
+
+(sum 1 2 3)                 ; 6
+(sum)                       ; 0
+(sum ..(slice-of a))        ; a's elements
+```
+
+Only `defn`s take a rest (not `defop` or `lambda`). C functions keep C's `...`.
+
 Functions can be written where they are used, with `lambda`:
 `(lambda [a T] ... -> R body...)` as a `defn`, or, for one expression,
 `(lambda [a T] ... -> e)`: a single form after `->` is the result itself (a
@@ -456,6 +475,37 @@ Operators can be generic, for every instance of a generic struct:
 A generic `defop` applies only when an operand is a struct, so numbers keep
 their own operators.
 
+## any
+
+An `any` is a value of any type: a pointer to it (`data`) and its type's
+description (`type`, a `(ptr type-info)`). Any value goes where an `any` is
+wanted (it is copied to the stack for the call), so `[args ..any]` takes
+arguments of different types, checked when they are used, never unsafely as
+C's `...`. `(type-info-of T)` is T's description; there is one per type, so two
+are the same type exactly when they are the same pointer.
+
+```lisp
+(defn show [a any]
+  (cond ((= a.type (type-info-of str)) (println "a str: " (deref (cast (ptr str) a.data))))
+        ((= a.type.kind type-kind.struct) (println "a struct with " a.type.fields.len " fields"))
+        (else (println "a " a.type.name))))
+
+(show "lid") (show {point :x 1 :y 2}) (show 2.5)
+```
+
+The descriptions are built-in types:
+
+    (enum type-kind u32 void bool int float ptr array slice struct union enum simd fn str variant closure)
+    (struct type-info [kind type-kind] [name str] [size u64] [align u64] [signed bool]
+                      [elem (ptr type-info)]        ; ptr, array, slice, simd
+                      [len u64]                     ; array, simd
+                      [fields (slice field-info)]   ; struct, union, variant (tag, cases)
+                      [names (slice str)] [values (slice i64)]   ; enum members; variant cases
+                      [cases (slice (ptr type-info))])           ; variant: each case's fields (or null)
+    (struct field-info [name str] [type (ptr type-info)] [offset u64])
+
+`std/fmt` is written this way, in lisc.
+
 ## Modules
 
 Every file is a module, named after the file. `(import "scene")` (path
@@ -517,6 +567,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 | `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a function or closure `(T T) → bool` |
 | `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
+| `std/fmt` | `(fmt::format "x = {} at {:08x}" x p)` — a str; `print` `println` `eprint` `eprintln` `write` (to a FILE), `append` (to a `buffer`); `{}` shows any value as print does; specs `{:[fill][<^>][0][width][.precision][x X b o e ?]}`, `{{ }}` |
 | `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(each m f)` (f a function or closure of k and v); strs by contents, other keys by bytes |
 
 ## Operators

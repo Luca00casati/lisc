@@ -1,0 +1,10 @@
+i32 kind type-kind.int size 4 = 42
+f64 kind type-kind.float size 8
+str kind type-kind.str size 16
+bool kind type-kind.bool size 1
+pt kind type-kind.struct size 8 :x i32@0 :y f32@4
+color kind type-kind.enum size 1 red green blue
+shape kind type-kind.variant size 8 circle none
+(ptr (fn () i32)) kind type-kind.ptr size 8 to (fn () i32)
+(array u8 3) kind type-kind.array size 3
+true false

@@ -1,0 +1,12 @@
+hello world, 2 + 3 = 5
+hex ff FF 0000beef bin 101 oct 10 neg ffffffff
+floats 3.14159 3.14 3.141590e+04    2.500|
+pad [    42] [42    ] [  42  ] [**ab***] [-00042] [    x]
+bool true char-ish 97 ptr-null (nil) cstr text "quoted"
+struct {pt :x 1 :y 2.5} enum color.green color.blue
+variant (shape.circle 2) (shape.rect 1 2) shape.none
+array [1 2 3] slice [2 3] strs ["a" "b"]
+u64 18446744073709551615 i64 -9223372036854775807 u8 255 i8 -128 i128 -1000000000000000000000000
+braces {} missing 1 {?}
+format gave [a-7] len 3
+buffer [0 1 2 ]

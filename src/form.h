@@ -6,23 +6,13 @@
 #include <string>
 #include <vector>
 
-struct Expansion;
-
 struct Loc {
     const char *file = "?";
     int line = 0, col = 0;
-    // code a macro produced: the expansion it came from (for error messages)
-    const Expansion *via = nullptr;
 };
 
-// a macro call that produced code: the macro, and where it was called
-struct Expansion {
-    std::string macro;
-    Loc at;
-};
-
-// Print "file:line:col: error: ...", plus "in expansion of" lines for code a
-// macro produced, and exit — or, while error_trap is set (compiling a
+// Print "file:line:col: error: ...", plus notes for the generic instances
+// being made, and exit — or, while error_trap is set (compiling a
 // function body), count it and jump there, so the next function is compiled.
 [[noreturn]] void fatal(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
@@ -37,30 +27,23 @@ void warn(Loc at, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 extern bool warnings;
 
 struct Form {
-    enum Kind { Int, Float, Sym, Str, List, Fn } kind;  // Fn: a compile-time closure (macro.cpp)
+    enum Kind { Int, Float, Sym, Str, List } kind;
     Loc loc;
     uint64_t ival = 0;          // Int (two's complement of the written value)
     std::string text;           // Sym name, Str contents, Int/Float as written
     std::vector<Form *> items;  // List
     void *fn = nullptr;         // Fn
-    // Sym: hygiene mark. A symbol written in a macro's template gets the
-    // expansion's mark; it is bound and looked up as a different name from
-    // the same symbol without the mark (see key() in compiler.cpp).
-    unsigned mark = 0;
     // Str: c"..." — a C string (NUL-terminated, a pointer) rather than a str
     bool cstr = false;
-    // List: written [ ... ] — a binding: (let [x 1] [y 2] body), (defn f [a T] [b U] R body),
+    // List: written [ ... ] — a binding: (let [x 1] [y 2] body), (defn f [a T] [b U] -> R body),
     // (for [i 0 n] ...), (struct s [x f32] ...)
     bool bracket = false;
-    // Sym: the module whose source the symbol was read from (or whose macro
-    // template it was copied from); null for symbols the compiler made up
+    // Sym: the module whose source the symbol was read from; null for symbols
+    // the compiler made up
     const char *mod = nullptr;
-    // Sym: the type itself, for a symbol type-of made: it means this type
-    // wherever it lands, whatever its name would resolve to there
+    // Sym: the type itself, for a symbol the compiler made to stand for a
+    // type (a fn literal's env, a trampoline's parameters)
     const struct Type *type = nullptr;
-    // creation order: forms newer than an expansion's start were made by it
-    uint64_t id = next_id++;
-    static inline uint64_t next_id = 0;
 
     bool is_sym(const char *s) const { return kind == Sym && text == s; }
     bool is_list() const { return kind == List; }

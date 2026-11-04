@@ -2,11 +2,10 @@
 ;
 ;   (put m k v)      add or replace          (get m k)     (ptr V), or null
 ;   (has m k)        bool                    (remove m k)  bool: was it there
-;   (release m)      free it (empty again)   (for-each (k v m) body...)
+;   (release m)      free it (empty again)   (each m f)    f called with each k and v
 ;
-; m is a (ptr (map K V)); a zero map is an empty one. Keys: integers, enums,
-; bools and pointers by value, strs by their contents, anything else by its
-; bytes. Open addressing with linear probing; removal shifts entries back, so
+; m is a (ptr (map K V)); a zero map is an empty one. Keys: strs by their
+; contents, anything else by its bytes. Open addressing with linear probing; removal shifts entries back, so
 ; there are no tombstones.
 (import "libc")
 
@@ -23,24 +22,18 @@
     (set x (* (^ x (>> x 27)) 0x94d049bb133111eb))
     (return (^ x (>> x 31))))
 
-  (defmeta by-value? (t) (let [k (type-kind t)] (or (eq k 'int) (eq k 'bool) (eq k 'ptr))))
-
-  (defmacro hash-of! (x K)
-    (let [t (type-of x)]
-      (cond ((eq t 'str) `(hash-bytes (. ,x data) (. ,x len)))
-            ((by-value? t) `(mix (cast u64 ,x)))
-            (else `(hash-bytes (cast (ptr u8) (addr ,x)) (sizeof ,K))))))
-
-  (defmacro same! (a b K)
-    (let [t (type-of a)]
-      (cond ((eq t 'str) `(and (= (. ,a len) (. ,b len)) (= (libc::memcmp (. ,a data) (. ,b data) (. ,a len)) 0)))
-            ((by-value? t) `(= ,a ,b))
-            (else `(= (libc::memcmp (addr ,a) (addr ,b) (sizeof ,K)) 0)))))
+  ; a key's hash and equality, chosen by its type: a str by its contents,
+  ; anything else by its bytes
+  (defop key-hash [x str] -> u64 (return (hash-bytes x.data x.len)))
+  (defop (key-hash T) [x T] -> u64 (return (hash-bytes (cast (ptr u8) (addr x)) (sizeof T))))
+  (defop same-key [a str] [b str] -> bool
+    (return (and (= a.len b.len) (= (libc::memcmp a.data b.data a.len) 0))))
+  (defop (same-key T) [a T] [b T] -> bool (return (= (libc::memcmp (addr a) (addr b) (sizeof T)) 0)))
 
   ; where k is, or the free slot where it would go (cap > 0)
   (defn (slot K V) [m (ptr (map K V))] [k K] -> u64
-    (let [mask (- m.cap 1)] [i (& (hash-of! k K) mask)]
-      (while (and m.used[i] (not (same! m.keys[i] k K)))
+    (let [mask (- m.cap 1)] [i (& (key-hash k) mask)]
+      (while (and m.used[i] (not (same-key m.keys[i] k)))
         (set i (& (+ i 1) mask)))
       (return i)))
 
@@ -84,7 +77,7 @@
     ; isn't between the hole and them, so lookups still reach them
     (let [j (& (+ i 1) mask)]
       (while m.used[j]
-        (let [home (& (hash-of! m.keys[j] K) mask)]
+        (let [home (& (key-hash m.keys[j]) mask)]
           (when (if (<= i j) (or (<= home i) (> home j)) (and (<= home i) (> home j)))
             (set m.keys[i] m.keys[j])
             (set m.vals[i] m.vals[j])
@@ -100,10 +93,7 @@
   (libc::free m.used)
   (set (deref m) null))
 
-; (for-each (k v m) body...): every entry, in no particular order (v is a copy)
-(defmacro for-each! ((k v m) &body body)
-  `(let [mp ,m]
-     (for [i u64 0 mp.cap]
-       (when mp.used[i]
-         (let [,k mp.keys[i]] [,v mp.vals[i]]
-           ,@body)))))
+; f called with every entry, in no particular order: (each m (fn [k K] [v V] ...))
+(defn (each K V F) [m (ptr (map K V))] [f F]
+  (for [i u64 0 m.cap]
+    (when m.used[i] (f m.keys[i] m.vals[i]))))

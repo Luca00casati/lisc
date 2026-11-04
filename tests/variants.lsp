@@ -4,8 +4,7 @@
 
 (variant shape (circle [r f32]) (rect [w f32] [h f32]) none)
 (variant (lst T) (cons [head T] [tail (ptr (lst T))]) nil)
-(defmacro two-cases! (name a b) `(variant ,name ,a ,b))
-(two-cases! dir up down)
+(variant dir up down)
 
 (defn area [s shape] -> f32
   (match s

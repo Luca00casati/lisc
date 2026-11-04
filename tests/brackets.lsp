@@ -20,14 +20,13 @@
 
 (def origin point {point :x 0.5 :y 0.25})   ; a constant global
 
-; templates keep brackets; ,v[i] is (aref ,v i)
-(defmacro swap! (v i j)
-  `(let [tmp ,v[,i]]
-     (set ,v[,i] ,v[,j])
-     (set ,v[,j] tmp)))
+; indexes through a slice
+(defn swap-at [v (slice i32)] [i u64] [j u64]
+  (let [tmp v[i]]
+    (set v[i] v[j])
+    (set v[j] tmp)))
 
-; compile-time code takes them too
-(defmacro twice! (x) (let [n 2] `(* ,n ,x)))
+(defn twice [x i32] -> i32 (return (* 2 x)))
 
 (defn main [] -> i32
   (let [a (array i32 5)]
@@ -36,7 +35,7 @@
        [l {line :to {point :x 3.0 :y 4.0}}]
        [k u64 1]
     (for [i 0 5] (set a[i] (* i i)))
-    (swap! a 0 4)
+    (swap-at (slice-of a) 0 4)
     (+= a[(+ k 1)] 100)
     (for [y 0 3] (for [x 0 3] (set grid[y][x] (+ (* y 10) x))))
     (set pts[1].y 7.5)
@@ -45,5 +44,5 @@
     (printf c"grid %d %d  pts %g %g %g  l.to.y %g\n" grid[2][1] grid[1][2]
             (cast f64 pts[0].x) (cast f64 pts[0].y) (cast f64 pts[1].y) (cast f64 l.to.y))
     (let [q (swap {(pair i32 f64) :a 7 :b 0.5})]
-      (printf c"%g %d  %d %d  %d\n" q.a q.b (answer) (twice! 21) (three)[2])))
+      (printf c"%g %d  %d %d  %d\n" q.a q.b (answer) (twice 21) (three)[2])))
   (return 0))

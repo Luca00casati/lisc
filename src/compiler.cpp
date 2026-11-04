@@ -30,7 +30,6 @@
 // (cast T e).
 
 #include "compiler.h"
-#include "macro.h"
 
 #include <unistd.h>
 
@@ -93,18 +92,15 @@ bool in(const char *s, const char *const *list, size_t n) {
         if (!strcmp(s, list[i])) return true;
     return false;
 }
-// A local variable's name in the scopes: the symbol's text, plus its
-// hygiene mark if a macro template introduced it. Globals, types, fields and
-// keywords are looked up by text alone, so a template's free names mean the
-// global definitions, never a local of the code the macro is used in.
-std::string key(const Form *sym) { return sym->mark ? sym->text + "\x01" + std::to_string(sym->mark) : sym->text; }
+// a local variable's name in the scopes
+std::string key(const Form *sym) { return sym->text; }
 
 bool is_arith(const char *s) { return in(s, ARITH, sizeof ARITH / sizeof *ARITH); }
 bool is_cmp(const char *s) { return in(s, CMP, sizeof CMP / sizeof *CMP); }
 
 }  // namespace
 
-struct Compiler::Impl : MetaHost {
+struct Compiler::Impl {
     Compiler &c;
     llvm::LLVMContext &ctx;
     llvm::Module &mod;
@@ -125,7 +121,6 @@ struct Compiler::Impl : MetaHost {
     std::vector<Scope> scopes;
     std::vector<Loop> loops;
     std::map<StructInfo *, bool> laying_out;          // cycle guard
-    Meta meta{*this};
     // defop: operator → its definitions (functions named like "+(v3,v3)")
     std::map<std::string, std::vector<Global *>> overloads;
 
@@ -133,7 +128,7 @@ struct Compiler::Impl : MetaHost {
 
     /* ---------------------------------------------------- debug info --- */
     // lisc -g: DWARF for gdb. The program is described as C (so gdb's print
-    // uses C expressions); code a macro produced is at the macro call's line.
+    // uses C expressions).
 
     std::unique_ptr<llvm::DIBuilder> dib;
     llvm::DICompileUnit *cu = nullptr;
@@ -243,7 +238,7 @@ struct Compiler::Impl : MetaHost {
         // the failure is never expected: laid out of the way, one small call
         b.CreateCondBr(ok, cont, fail, llvm::MDBuilder(ctx).createBranchWeights(1 << 20, 1));
         b.SetInsertPoint(fail);
-        Loc u = user_loc(at);
+        Loc u = at;
         std::string file;
         for (const char *p = u.file; *p; p++) file += *p == '%' ? std::string("%%") : std::string(1, *p);
         std::string msg = file + ":" + std::to_string(u.line) + ":" + std::to_string(u.col) + ": " + what + "\n";
@@ -283,11 +278,6 @@ struct Compiler::Impl : MetaHost {
         return d && l && d->type->is_ptr() && d->type->elem != t_void() && l->type->is_int() && !l->bit_width;
     }
 
-    // where generated code is: the outermost macro call, for code macros made
-    static Loc user_loc(Loc l) {
-        while (l.via) l = l.via->at;
-        return l;
-    }
     // the scope for a line in `file`: the function, or the function seen from another file
     llvm::DIScope *dscope_in(const char *file) {
         if (dsp->getFile() == difile(file)) return dsp;
@@ -295,14 +285,12 @@ struct Compiler::Impl : MetaHost {
     }
     void set_loc(Loc at) {
         if (!dsp) return;
-        at = user_loc(at);
-        if (!real_file(at.file) || at.line <= 0) return;
+                if (!real_file(at.file) || at.line <= 0) return;
         b.SetCurrentDebugLocation(llvm::DILocation::get(ctx, at.line, at.col, dscope_in(at.file)));
     }
     void declare_var(llvm::Value *addr, const std::string &name, Type *t, Loc at, unsigned argno = 0) {
         if (!dsp || !ditype(t)) return;
-        at = user_loc(at);
-        if (!real_file(at.file)) at = {dsp->getFile()->getFilename().data(), (int)dsp->getLine(), 0};
+                if (!real_file(at.file)) at = {dsp->getFile()->getFilename().data(), (int)dsp->getLine(), 0};
         llvm::DIScope *sc = real_file(at.file) ? dscope_in(at.file) : dsp;
         llvm::DIFile *file = real_file(at.file) ? difile(at.file) : dsp->getFile();
         llvm::DILocalVariable *v = argno ? dib->createParameterVariable(sc, name, argno, file, at.line, ditype(t), true)
@@ -312,9 +300,9 @@ struct Compiler::Impl : MetaHost {
 
     /* ------------------------------------------------------- modules --- */
     // A module is a file. Its top-level names are stored as "module::name" in
-    // the tables (globals, types, macros); C imports and -D constants keep
-    // their plain names. A symbol is resolved in the module it was read from
-    // (a macro template's symbols in the macro's module):
+    // the tables (globals, types); C imports and -D constants keep their
+    // plain names. A symbol is resolved in the module it was read from (a
+    // generic's body in the generic's module):
     //   name      the module's own name, else from a module it is using (in this
     //             block, then in the file), else a plain global (-D constants)
     //   m::name   from the module imported as m (one level: no m::n::x); not if private
@@ -373,13 +361,8 @@ struct Compiler::Impl : MetaHost {
     ModInfo *mod_of(Form *sym) { return sym->mod ? &mods[sym->mod] : cur; }
 
     // the qualified name a definition in the current module gets
-    // macro: is this a defmacro's name? Macros' names end in ! (as in (swap! a b)),
-    // and only theirs, so a call to a macro is plain to see
-    std::string def_key(Form *name, bool macro = false) {
+    std::string def_key(Form *name) {
         if (name->text.find("::") != std::string::npos) fatal(name->loc, "a definition's name has no module part: %s", name->text.c_str());
-        bool bang = name->text.size() > 1 && name->text.back() == '!';
-        if (macro && !bang) fatal(name->loc, "a macro's name ends in !: %s!", name->text.c_str());
-        if (!macro && bang) fatal(name->loc, "only macros' names end in !: %s", name->text.c_str());
         return cur ? cur->name + "::" + name->text : name->text;
     }
 
@@ -420,7 +403,7 @@ struct Compiler::Impl : MetaHost {
                 }
                 return found;
             };
-            if (m == cur)  // (a macro template's symbols are not affected by the blocks they land in)
+            if (m == cur)  // (a generic's body, compiled for an instance elsewhere, isn't affected by the blocks there)
                 for (auto sc = scopes.rbegin(); sc != scopes.rend(); ++sc)
                     if (!sc->usings.empty()) {
                         std::string f = look(sc->usings);
@@ -451,8 +434,6 @@ struct Compiler::Impl : MetaHost {
         return resolve(sym, [&](const std::string &k) { return c.types_.count(k) != 0; },
                        [&](const std::string &a, const std::string &b) { return c.types_[a] == c.types_[b]; });
     }
-    std::string macro_key(Form *sym) { return resolve(sym, [&](const std::string &k) { return meta.is_macro(k); }); }
-    std::string meta_key(Form *sym) override { return resolve(sym, [&](const std::string &k) { return meta.is_meta(k); }); }
 
     // every symbol of a file's forms belongs to its module
     void tag(Form *f, const char *m) {
@@ -580,7 +561,7 @@ struct Compiler::Impl : MetaHost {
                 for (Form *x : inner) mark_private(x);
                 add_forms(inner, m);
             } else {
-                static const char *const dash[] = {"defn-", "def-", "const-", "defmacro-", "defmeta-", "struct-", "union-"};
+                static const char *const dash[] = {"defn-", "def-", "const-", "struct-", "union-"};
                 for (const char *d : dash)
                     if (f->is_call(d)) {
                         std::string h = d;
@@ -605,23 +586,10 @@ struct Compiler::Impl : MetaHost {
         if (priv_names.count(name)) priv.insert(key);
     }
 
-    /* -------------------------------------------------------- macros --- */
-
-    // f with its macro calls at the head expanded (repeatedly)
-    Form *expand(Form *f) {
-        while (f->kind == Form::List && !f->items.empty() && f->at(0)->kind == Form::Sym) {
-            std::string k = macro_key(f->at(0));
-            if (k.empty()) break;
-            f = meta.expand(f, k);
-        }
-        return f;
-    }
-
     // the type of an expression where it stands, without emitting code: it is
     // compiled into a scratch block that is thrown away
     std::map<Form *, Type *> type_memo;  // type-of results in the function being compiled
-    Type *type_of(Form *f) override {
-        if (!fn) return type_of_top(f);
+    Type *type_of(Form *f) {
         auto memo = type_memo.find(f);
         if (memo != type_memo.end()) return memo->second;
         llvm::IRBuilderBase::InsertPoint ip = b.saveIP();
@@ -636,33 +604,6 @@ struct Compiler::Impl : MetaHost {
         for (BasicBlock *bb : made) bb->eraseFromParent();
         b.restoreIP(ip);
         return type_memo[f] = t;
-    }
-
-    // type-of in a top-level macro: compiled in a function made for it and
-    // thrown away. (The program's own functions, globals and constants are
-    // declared after top-level macros run, so only types and C declarations are known.)
-    bool at_top_typeof = false;
-    Type *type_of_top(Form *f) {
-        auto saved_temps = std::move(temp_pool);
-        auto saved_scopes = std::move(scopes);
-        auto saved_loops = std::move(loops);
-        auto ip = b.saveIP();
-        temp_pool.clear();
-        scopes.assign(1, {});
-        loops.clear();
-        fn = llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(), false), llvm::GlobalValue::InternalLinkage, "lisc.typeof", mod);
-        b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
-        at_top_typeof = true;
-        Type *t = expr(f, nullptr).t;
-        at_top_typeof = false;
-        fn->eraseFromParent();
-        fn = nullptr;
-        temp_pool = std::move(saved_temps);
-        scopes = std::move(saved_scopes);
-        loops = std::move(saved_loops);
-        if (ip.isSet()) b.restoreIP(ip);
-        else b.ClearInsertionPoint();
-        return t;
     }
 
     /* --------------------------------------------------------- types --- */
@@ -913,7 +854,6 @@ struct Compiler::Impl : MetaHost {
         auto name = [&](const std::string &suffix) {
             Form *s = new Form(*base);
             s->text = base->text + suffix;
-            s->id = Form::next_id++;
             return s;
         };
         auto header = [&](const std::string &suffix) -> Form * {  // what a struct is defined as
@@ -1331,7 +1271,7 @@ struct Compiler::Impl : MetaHost {
             i = 3;
         }
         for (; i < f->size(); i++) {
-            Form *x = expand(f->at(i));
+            Form *x = f->at(i);
             if (x->kind == Form::Str) o.fmt += escape_pct(x->text);
             else show_val(o, expr(x, nullptr), false, x->loc);
         }
@@ -1422,7 +1362,7 @@ struct Compiler::Impl : MetaHost {
                 std::string k = key(&s);
                 if (outer.count(k) && !params.count(k) && seen.insert(k).second) caps.push_back(new Form(s));
             }
-            if (x->is_list() && !x->is_call("quote"))
+            if (x->is_list())
                 for (Form *y : x->items) scan(y);
         };
         for (size_t i = 3; i < def->size(); i++) scan(def->at(i));
@@ -1821,9 +1761,8 @@ struct Compiler::Impl : MetaHost {
         return instantiate_fn(g, args, call->loc);
     }
 
-    Type *parse_type(Form *f) override {
+    Type *parse_type(Form *f) {
         if (f->kind == Form::Sym && f->type) return const_cast<Type *>(f->type);  // (from type-of)
-        f = expand(f);
         if (f->kind == Form::Sym) {
             auto tb = tbind.find(f->text);
             if (tb != tbind.end()) return tb->second;
@@ -1983,7 +1922,6 @@ struct Compiler::Impl : MetaHost {
 
     // does f's value take its type from the context? (literals and arithmetic on them)
     bool untyped(Form *f) {
-        f = expand(f);
         if (f->kind == Form::Int || f->kind == Form::Float) return true;
         if (f->kind == Form::Sym) {
             if (lookup_local(key(f)).v) return false;
@@ -2000,7 +1938,6 @@ struct Compiler::Impl : MetaHost {
     }
     // the type an untyped form gets when nothing is expected
     Type *default_type(Form *f) {
-        f = expand(f);
         if (f->kind == Form::Float) return t_float(64);
         if (f->kind == Form::Int) {
             int64_t v = (int64_t)f->ival;
@@ -2075,7 +2012,6 @@ struct Compiler::Impl : MetaHost {
     /* ------------------------------------------------------- places ---- */
 
     bool is_place(Form *f) {
-        f = expand(f);
         if (f->kind == Form::Sym) {
             if (lookup_local(key(f)).v) return true;
             Global *g = lookup_global(f);
@@ -2089,7 +2025,6 @@ struct Compiler::Impl : MetaHost {
 
     // the address of a place, with the place's type
     Val place(Form *f) {
-        f = expand(f);
         if (f->kind == Form::Sym) {
             Val l = lookup_local(key(f));
             if (l.v) return l;
@@ -2367,7 +2302,6 @@ struct Compiler::Impl : MetaHost {
     }
     // a C-string literal, an if choosing between two, or a constant naming one
     bool is_cstring_lit(Form *f) {
-        f = expand(f);
         if (f->kind == Form::Sym && !lookup_local(key(f)).v) {
             Global *g = lookup_global(f);
             return g && g->kind == Global::Const && g->form && is_cstring_lit(g->form);
@@ -2400,7 +2334,7 @@ struct Compiler::Impl : MetaHost {
         if (!g) g = generic_value(f, want);
         if (!g && lambda_outer && lambda_outer->count(key(f)))
             fatal(f->loc, "a fn can't use '%s' here, a local of the code around it", n.c_str());
-        if (!g) fatal(f->loc, at_top_typeof ? "unknown name '%s' (type-of in a top-level macro knows types and C declarations, not the program's functions, globals and constants: they are declared after)" : "unknown name '%s'", n.c_str());
+        if (!g) fatal(f->loc, "unknown name '%s'", n.c_str());
         switch (g->kind) {
         case Global::Var: return {load({g->value, g->type}), g->type};
         case Global::Func: return {g->value, t_ptr(g->type)};
@@ -2412,13 +2346,11 @@ struct Compiler::Impl : MetaHost {
     }
 
     Val expr(Form *f, Type *want) {
-        f = expand(f);
         if (dsp && f->kind == Form::List) set_loc(f->loc);
         switch (f->kind) {
         case Form::Int: case Form::Float: return literal(f, want);
         case Form::Str: return string(f, want);
         case Form::Sym: return symbol(f, want);
-        case Form::Fn: fatal(f->loc, "a compile-time function (from a macro) cannot be used in code");
         case Form::List: break;
         }
         if (f->items.empty()) fatal(f->loc, "empty form ()");
@@ -2561,7 +2493,7 @@ struct Compiler::Impl : MetaHost {
             if (!global_key(f->at(1)).empty()) return expr(f->at(2), want);
             return f->size() == 4 ? expr(f->at(3), want) : Val{nullptr, t_void()};
         }
-        if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoted forms exist only inside macros");
+        if (hs == "quote" || hs == "quasiquote") fatal(f->loc, "quoting was for macros, which lisc no longer has");
         return call(f);
     }
 
@@ -2569,7 +2501,7 @@ struct Compiler::Impl : MetaHost {
     void end_scope() {
         Scope &s = scopes.back();
         for (Form *name : s.declared)
-            if (!s.used.count(key(name)) && name->text[0] != '_' && !name->mark && !name->loc.via)
+            if (!s.used.count(key(name)) && name->text[0] != '_')
                 warn(name->loc, "'%s' is never used", name->text.c_str());
         scopes.pop_back();
     }
@@ -2579,7 +2511,7 @@ struct Compiler::Impl : MetaHost {
     // a call, written here, of a lisc function (C functions' results are
     // often ignored on purpose: printf, memcpy ...)
     bool lisc_call(Form *f) {
-        if (!f->is_list() || f->items.empty() || f->loc.via) return false;
+        if (!f->is_list() || f->items.empty()) return false;
         Form *h = f->at(0);
         if (h->is_list()) return h->size() >= 2 && !generic_key(h->at(0), generic_fns).empty();
         if (h->kind != Form::Sym || lookup_local(key(h)).v) return false;
@@ -2592,7 +2524,7 @@ struct Compiler::Impl : MetaHost {
         Val last{nullptr, t_void()};
         bool warned = false;
         for (size_t i = from; i < f->size(); i++) {
-            if (!open() && !warned && !f->at(i)->loc.via) {  // after a return, break or continue
+            if (!open() && !warned) {  // after a return, break or continue
                 warn(f->at(i)->loc, "unreachable code");
                 warned = true;
             }
@@ -3072,7 +3004,6 @@ struct Compiler::Impl : MetaHost {
     // (x T) in a let: is the second item a type rather than an initializer?
     bool is_type_form(Form *f) {
         if (f->kind == Form::Sym && f->type) return true;
-        f = expand(f);
         if (f->kind == Form::Sym) {
             static const char *const names[] = {"void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32", "f64", "str",
                                                 "i128", "u128", "f80"};
@@ -3602,13 +3533,7 @@ struct Compiler::Impl : MetaHost {
                     g = infer_fn(gen, f);
                 }
             }
-            if (!g && head->text.size() > 1 && head->text.back() == '!') fatal(head->loc, "unknown macro '%s'", head->text.c_str());
-            if (!g) {  // a macro, written without its !
-                Form *bang = new Form(*head);
-                bang->text += "!";
-                if (!macro_key(bang).empty()) fatal(head->loc, "%s is a macro: write %s!", head->text.c_str(), head->text.c_str());
-            }
-            if (!g) fatal(head->loc, at_top_typeof ? "unknown function '%s' (type-of in a top-level macro knows C functions, not the program's: they are declared after)" : "unknown function '%s'", head->text.c_str());
+            if (!g) fatal(head->loc, "unknown function '%s'", head->text.c_str());
         } else if (head->is_list() && head->size() >= 2 && head->at(0)->kind == Form::Sym && !lookup_local(key(head->at(0))).v) {
             std::string gk = generic_key(head->at(0), generic_fns);  // ((name T ...) args...)
             if (!gk.empty()) {
@@ -3724,9 +3649,8 @@ struct Compiler::Impl : MetaHost {
 
     /* ------------------------------------------------------ top level --- */
 
-    // top-level macro calls expanded; (do ...) at the top level is spliced
+    // a top-level form: (do ...) is spliced, a variant desugared, a function's signature normalised
     void expand_top(Form *f, std::vector<Form *> &out) {
-        f = expand(f);
         if (f->is_call("do")) {
             for (size_t i = 1; i < f->size(); i++) expand_top(f->at(i), out);
         } else if (f->is_call("variant")) {
@@ -3787,15 +3711,11 @@ struct Compiler::Impl : MetaHost {
         if (files.empty()) return;
         std::vector<Form *> fs = files;
         root = load_module(files[0]->loc.file, files[0]->loc, &fs);
-        // macros and compile-time helpers first, so everything can use them
         std::vector<std::pair<Form *, ModInfo *>> all;
         each(items, [&](Form *f) {
-            if (f->is_call("defmacro") || f->is_call("defmeta")) {
-                if (f->size() < 2 || f->at(1)->kind != Form::Sym) fatal(f->loc, "(%s name (params...) body...)", f->head());
-                std::string k = def_key(f->at(1), f->is_call("defmacro"));
-                meta.define(f, k);
-                note_private(f->at(1), k);
-            } else all.push_back({f, cur});
+            if (f->is_call("defmacro") || f->is_call("defmeta"))
+                fatal(f->loc, "%s is gone: lisc has no macros (write a function, a generic or a defop)", f->head());
+            all.push_back({f, cur});
         });
         // pass 0: the C modules' headers
         for (auto &n : c_mods) {
@@ -3823,8 +3743,7 @@ struct Compiler::Impl : MetaHost {
         });
         add_fields(structs, struct_mods);
         for (auto &s : structs) lay_out(s.second, s.first->loc);
-        // top-level macros run once the structs are known (they may ask about them);
-        // structs they produce are added the same way
+        // the other top-level forms, once the structs are known
         std::vector<std::pair<Form *, ModInfo *>> expanded;
         each(all, [&](Form *f) {
             if (f->is_call("struct") || f->is_call("union") || f->is_call("enum")) {
@@ -3841,7 +3760,7 @@ struct Compiler::Impl : MetaHost {
         each(all, [&](Form *f) {
             if ((f->is_call("struct") || f->is_call("union")) && f->size() >= 2 && f->at(1)->is_list() && f->at(1)->size() &&
                 !generic_structs.count(def_key(f->at(1)->at(0))))
-                return register_generic(f, false);  // (made by a macro)
+                return register_generic(f, false);  // (from a variant)
             if ((!f->is_call("struct") && !f->is_call("union")) || f->size() < 2 || f->at(1)->kind != Form::Sym) return;
             std::string k = def_key(f->at(1));
             if (c.types_.count(k) && c.types_[k]->kind == Type::Struct && c.types_[k]->st->complete) return;
@@ -4083,7 +4002,6 @@ struct Compiler::Impl : MetaHost {
     // a compile-time constant of type t: an expression that folds, or a
     // (make T ...) of constants (arrays and structs, nested)
     llvm::Constant *constant(Form *f, Type *t) {
-        f = expand(f);
         if (f->is_call("make") && f->size() >= 2) {
             Type *mt = parse_type(f->at(1));
             if (mt != t) type_error(f->loc, "initializer", t, mt);
@@ -4196,7 +4114,6 @@ struct Compiler::Impl : MetaHost {
         dsp = nullptr;
         b.ClearInsertionPoint();
         b.SetCurrentDebugLocation(llvm::DebugLoc());
-        meta.reset();
     }
 
     void define_fn(Form *f, const std::string &ikey = "", const std::string &shown = "") {
@@ -4213,7 +4130,7 @@ struct Compiler::Impl : MetaHost {
         b.SetInsertPoint(BasicBlock::Create(ctx, "entry", fn));
         dsp = nullptr;
         if (dib) {
-            Loc at = user_loc(f->loc);
+            Loc at = f->loc;
             if (!real_file(at.file)) at = {cu->getFile()->getFilename().data(), 1, 0};
             llvm::DIFile *file = real_file(at.file) ? difile(at.file) : cu->getFile();
             auto *sty = llvm::cast<llvm::DISubroutineType>(ditype(g.type));

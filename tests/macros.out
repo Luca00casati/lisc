@@ -1,6 +1,0 @@
-swap 2 1
-unrolled 60
-f = 1.5
-(* f 2.0) = 3
-n = 200
-s = text

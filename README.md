@@ -106,8 +106,7 @@ A failed check flushes what the program printed before it, then prints the
 error to stderr and aborts.
 
 `-g` adds DWARF debug info: gdb breaks on lisc lines, steps through them and
-prints variables (structs, arrays, enums with their member names); code a
-macro produced belongs to the line of the macro call. Extra `.c`/`.o` inputs
+prints variables (structs, arrays, enums with their member names). Extra `.c`/`.o` inputs
 are linked in. `import-c` searches the source file's
 directory and `-I` directories, then the system ones.
 
@@ -135,8 +134,6 @@ Top level:
 | `(defn name [a T] ... [-> R] [:noinline\|:inline\|:cold\|:optnone\|:unchecked] body...)` | function (`[]`: no parameters); with `-> R` it gives an R, only by `(return e)` (see Functions) |
 | `(extern name (T ... [...]) R)` | a C function by hand |
 | `(defop op [a T] ... -> R body...)` | an operator for these operand types |
-| `(defmacro name! (params...) body...)` | a macro (see below); its name ends in `!` |
-| `(defmeta name (params...) body...)` | a compile-time helper function for macros (belongs to its module, like other names) |
 | `(private form ...)` | definitions (any kind) only their module can use |
 
 Expressions — everything is one; statements have type `void`:
@@ -178,12 +175,10 @@ Three kinds of brackets:
 - `{T :field e ...}` is `(make T :field e ...)`.
 - `a[i]`, written right after a name, `a.b`, `(...)` or another index, is
   `(aref a i)`: `v.data[v.len]`, `grid[y][x]`, `(f)[0]`. A `.field` may
-  follow an index: `pts[i].x`. In a macro template `,v[i]` is `(aref ,v i)`.
+  follow an index: `pts[i].x`.
 
-Macro templates keep brackets as written, and compile-time code takes them in
-`let` too. `tools/brackets.py file.lsp ...` rewrites code in the old spelling
-(keeping comments and layout). Code a macro builds with `list` rather than a
-template isn't checked: the compiler takes either shape from macros.
+`tools/brackets.py file.lsp ...` rewrites code in the old spelling
+(keeping comments and layout).
 
 Everything starts as zero: `let` bindings without a value, globals, and the
 fields and elements `make` doesn't set. `null` is the zero value of the
@@ -205,8 +200,7 @@ literal C functions take, so the terminator is always visible in the source:
     (printf c"%.*s\n" (cast i32 s.len) s.data)   ; a str, given to C with its size
     (fopen "out.ppm" c"wb")                      ; error: a str is not a C string
 
-`-D NAME=text` values are C strings (they are for C, like C macros); in macros,
-`(cstr ...)` builds a `c"..."` literal as `(str ...)` builds a plain one.
+`-D NAME=text` values are C strings (they are for C, like C macros).
 
 Typing rules:
 
@@ -236,7 +230,7 @@ Typing rules:
 `->`. A function gives its result only with `(return e)`: the body is
 statements, and a function with a result that can reach its end without
 returning is an error. Without `-> R` a function gives nothing (`-> void` is
-allowed, for macros).
+allowed).
 
 ```lisp
 (defn sign [x i32] -> i32
@@ -432,7 +426,7 @@ That is, a call that starts with as many types as the function has type
 parameters, followed by its arguments, gives T outright.
 
 Inside, a parameter is the type itself, not its name: `(sizeof T)`,
-`(cast (ptr T) p)`, `(let [s T null] ...)` and macros' `type-of` all see the
+`(cast (ptr T) p)`, `(let [s T null] ...)` all see the
 instance's types, whichever module they come from. An error in an instance
 says which one and where it was used. A generic that is never used is never
 compiled, so its body is only checked once something uses it.
@@ -484,10 +478,8 @@ be written qualified), then to `-D` constants. Definitions inside
   (defn side [s shape] -> f32 (return ...)))
 ```
 
-Macros are hygienic across modules too: the symbols of a macro's template
-resolve in the macro's own module, so `(geom::doubled! v)` works anywhere
-even though its expansion calls geom's private helpers. Operators (`defop`)
-are chosen by type, so they apply wherever their types are used.
+Operators (`defop`) are chosen by type, so they apply wherever their types
+are used.
 
 C modules hold a header's functions, extern variables, structs (with
 clang's exact layout, bit fields included), typedefs, enum constants and
@@ -519,7 +511,7 @@ in `lib/` next to the `lisc` binary, which holds the standard library:
 | `std/vec` | `(vec T)` — a growable array; `push` `pop` `clear` `items` (a slice) `release` |
 | `std/sort` | `(sort s)` — a slice in place, by `<`; `(sort-by s less)` with a function or closure `(T T) → bool` |
 | `std/option` | `(option T)`: `(option.some x)` or `option.none`; `(result T E)`: `(result.ok x)` or `(result.err e)`; `or-else` `is-some` `is-ok` |
-| `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(for-each! (k v m) ...)`; keys by value, strs by contents, structs by bytes |
+| `std/map` | `(map K V)` — a hash map; `put` `get` (a pointer, or null) `has` `remove` `release`, `(each m f)` (f a function or closure of k and v); strs by contents, other keys by bytes |
 
 ## Operators
 
@@ -545,58 +537,8 @@ A name is either a `defn` or a `defop` in a module, not both. Where another
 module's plain function has the same name (`math::pow` and a `defop pow`),
 arguments no definition fits go to that function.
 
-## Macros
-
-A macro's name ends in `!`, and only a macro's does, so a call that is a
-macro is plain to see: `(swap! a b)`, `(map::for-each! (k v m) ...)`. (A call written
-without the `!` gets told so; `defmeta` helpers are functions, not macros,
-and have no `!`.)
-
-A macro is a function that runs inside the compiler, on forms: it receives its
-arguments unevaluated and returns the form to compile in its place. The
-language inside is a small Lisp (see `src/macro.h` for the full list):
-quasiquote, `if`/`cond`/`let`/`while`/`lambda`, list functions (`map`,
-`mapcat`, `filter`, `range`, ...), `sym`/`str`/`gensym`, and parameters that
-destructure (`(defmacro unroll! ((i n) &body body) ...)`).
-
-Macros can ask about types: `(type-of e)` is the type `e` has where the macro
-is used, and `(type-kind T)`, `(type-elem T)`, `(type-fields T)` ... describe a
-type. So a macro can dispatch on its argument's type, or generate code for every
-field of a struct:
-
-```lisp
-(defmacro derive-ops! (T)                 ; + - * and = for any struct, field by field
-  (let [fields (map first (type-fields T))]
-    `(do ,@(map (lambda (op)
-                  `(defop ,op [a ,T] [b ,T] -> ,T
-                     (return {,T ,@(mapcat (lambda (f) `(,(sym ":" f) (,op (. a ,f) (. b ,f)))) fields)})))
-                '(+ - *))
-         (defop = [a ,T] [b ,T] -> bool
-           (return (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields)))))))
-
-(derive-ops! v3)
-```
-
-`type-of` works in top-level macros too, for types, literals and C
-declarations (`(type-of (libc::strlen c""))` is `u64`); the program's own
-functions, globals and constants are declared after top-level macros run, so
-it can't see those there.
-
-Macros are hygienic. Every symbol written in a template gets a mark unique to
-that expansion, so:
-
-- variables the template binds can't capture the user's names, and the user's
-  code (passed in as arguments) can't see them: `(swap! tmp other)` works
-  with a `swap!` whose template binds its own `tmp`;
-- names the template uses without binding mean the global definitions, even if
-  the use site has a local of the same name;
-- keywords, operators, types, fields and global definitions are unaffected.
-
-To capture a name on purpose (an anaphoric `it`), insert an unmarked symbol
-with `,'it`. `gensym` still exists for names a macro builds itself.
-
 ## Status
 
 Done: reader, typed core, LLVM code generation and optimisation, modules
-(with C headers as modules), the C calling convention, bit fields, macros with type queries, and
+(with C headers as modules), the C calling convention, bit fields, and
 operator overloading, generics, variants with match, typed printing, SIMD types. The teapot ray tracer is written in lisc.

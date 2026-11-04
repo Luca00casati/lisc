@@ -4,6 +4,6 @@
 (include "inc/lib.lsp" "inc/more.lsp")
 (defn main [] -> i32
   (let [n 20]
-    (inc! n)
+    (inc (addr n))
     (printf c"%d\n" (twice n)))
   (return 0))

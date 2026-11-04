@@ -1,22 +1,19 @@
-; operator overloading by static type, and a macro that writes defops for any struct
+; operator overloading by static type
 (import "libc")
 (using libc)
 
 (struct v3 [x f32] [y f32] [z f32])
 (struct rgb [r f32] [g f32] [b f32])
 
-; generate componentwise + - * and = for a struct, by asking for its fields
-(defmacro derive-ops! (T)
-  (let [fields (map first (type-fields T))]
-    `(do ,@(map (lambda (op)
-                  `(defop ,op [a ,T] [b ,T] -> ,T
-                     (return {,T ,@(mapcat (lambda (f) `(,(sym c":" f) (,op (. a ,f) (. b ,f)))) fields)})))
-                '(+ - *))
-         (defop = [a ,T] [b ,T] -> bool
-           (return (and ,@(map (lambda (f) `(= (. a ,f) (. b ,f))) fields)))))))
-
-(derive-ops! v3)
-(derive-ops! rgb)
+; componentwise + - * and =
+(defop + [a v3] [b v3] -> v3 (return {v3 :x (+ a.x b.x) :y (+ a.y b.y) :z (+ a.z b.z)}))
+(defop - [a v3] [b v3] -> v3 (return {v3 :x (- a.x b.x) :y (- a.y b.y) :z (- a.z b.z)}))
+(defop * [a v3] [b v3] -> v3 (return {v3 :x (* a.x b.x) :y (* a.y b.y) :z (* a.z b.z)}))
+(defop = [a v3] [b v3] -> bool (return (and (= a.x b.x) (= a.y b.y) (= a.z b.z))))
+(defop + [a rgb] [b rgb] -> rgb (return {rgb :r (+ a.r b.r) :g (+ a.g b.g) :b (+ a.b b.b)}))
+(defop - [a rgb] [b rgb] -> rgb (return {rgb :r (- a.r b.r) :g (- a.g b.g) :b (- a.b b.b)}))
+(defop * [a rgb] [b rgb] -> rgb (return {rgb :r (* a.r b.r) :g (* a.g b.g) :b (* a.b b.b)}))
+(defop = [a rgb] [b rgb] -> bool (return (and (= a.r b.r) (= a.g b.g) (= a.b b.b))))
 
 ; by hand: scalar times vector (either order), negation, dot product
 (defop * [a v3] [k f32] -> v3 (return {v3 :x (* a.x k) :y (* a.y k) :z (* a.z k)}))

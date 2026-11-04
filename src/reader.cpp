@@ -3,7 +3,6 @@
 //   ; comment            (a b c)             "string\n"  (UTF-8; \u{1F600}, \xHH raw byte)
 //   c"C string"  (NUL-terminated, for C)     #\a #\é #\newline  (a character: its code point)
 //   123  -5  0x1f        1.5  2e-3  -0.5     symbols: anything else
-//   'x  `x  ,x  ,@x  →  (quote x) (quasiquote x) (unquote x) (unquote-splicing x)
 //   a.b.c  →  (. a b c)  field access (a symbol with inner dots)
 
 #include <cctype>
@@ -23,8 +22,6 @@ void fatal(Loc at, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
-    for (const Expansion *e = at.via; e; e = e->at.via)
-        fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
     for (auto c = error_context.rbegin(); c != error_context.rend(); ++c)
         fprintf(stderr, "%s:%d:%d: note: in %s, used here\n", c->first.file, c->first.line, c->first.col, c->second.c_str());
     error_count++;
@@ -48,8 +45,6 @@ void warn(Loc at, const char *fmt, ...) {
     static std::set<std::string> said;
     if (!said.insert(std::string(at.file) + ":" + std::to_string(at.line) + ":" + std::to_string(at.col) + msg).second) return;
     fprintf(stderr, "%s:%d:%d: warning: %s\n", at.file, at.line, at.col, msg);
-    for (const Expansion *e = at.via; e; e = e->at.via)
-        fprintf(stderr, "%s:%d:%d: note: in expansion of macro %s\n", e->at.file, e->at.line, e->at.col, e->macro.c_str());
 }
 
 Form *mk_sym(Loc at, const std::string &name) {
@@ -158,11 +153,7 @@ struct Reader {
             items.insert(items.begin(), mk_sym(at, "make"));
             f = mk_list(at, std::move(items));
         } else if (c == '\'' || c == '`' || c == ',') {
-            next();
-            const char *name = c == '\'' ? "quote" : c == '`' ? "quasiquote" : "unquote";
-            if (c == ',' && peek() == '@') { next(); name = "unquote-splicing"; }
-            Form *inner = primary();  // ,v[i] is (aref ,v i)
-            f = mk_list(at, {mk_sym(at, name), inner});
+            fatal(at, "%c: quoting was for macros, which lisc no longer has", c);
         } else if (c == '"') f = read_string(at);
         else if (c == '#' && pos + 1 < src.size() && src[pos + 1] == '\\') f = read_char(at);
         else if (c == 'c' && pos + 1 < src.size() && src[pos + 1] == '"') {  // c"...": a C string
@@ -313,11 +304,8 @@ static void check_utf8(const char *path, const std::string &s) {
 
 namespace {
 
-// a list written with ( ) where a binding goes ([x T]); ,x and ,@x in a
-// template stand for whatever they are given, so they pass
-bool old_binding(const Form *f) {
-    return f->is_list() && !f->bracket && !f->is_call("unquote") && !f->is_call("unquote-splicing");
-}
+// a list written with ( ) where a binding goes ([x T])
+bool old_binding(const Form *f) { return f->is_list() && !f->bracket; }
 
 [[noreturn]] void old_spelling(const Form *f, const char *want) {
     fatal(f->loc, "bindings are written in [ ]: %s (tools/brackets.py rewrites old code)", want);
@@ -326,7 +314,7 @@ bool old_binding(const Form *f) {
 // bindings have one spelling, [ ]: (let ((x 1)) ...), (defn f ((a T)) R ...),
 // (for (i 0 n) ...) and (struct s (x T)) are errors in written source
 void check_bindings(const Form *f) {
-    if (!f->is_list() || f->is_call("quote")) return;
+    if (!f->is_list()) return;
     if (f->is_call("let") && f->size() >= 2 && old_binding(f->at(1)))
         old_spelling(f->at(1), "(let [x 1] [y T 2] body...)");
     if ((f->is_call("defn") || f->is_call("defop")) && f->size() >= 3 && old_binding(f->at(2)))
@@ -385,7 +373,6 @@ std::string show(const Form *f) {
     switch (f->kind) {
     case Form::Int: case Form::Float: case Form::Sym: return f->text;
     case Form::Str: return (f->cstr ? "c\"" : "\"") + f->text + "\"";
-    case Form::Fn: return "<fn>";
     case Form::List: {
         std::string s = f->bracket ? "[" : "(";
         for (size_t i = 0; i < f->items.size(); i++) s += (i ? " " : "") + show(f->items[i]);

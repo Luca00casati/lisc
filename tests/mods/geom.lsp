@@ -13,9 +13,10 @@
 (private
   (def calls i32 0))
 
-; uses the private helper and counter: expands correctly in any module
-(defmacro doubled! (e)
-  `(do (set calls (+ calls 1)) (scale-by ,e 2.0)))
+; public, using the private helper and counter
+(defn doubled [e v2] -> v2
+  (set calls (+ calls 1))
+  (return (scale-by e 2.0)))
 (defn call-count [] -> i32 (return calls))
 
 ; a private generic (tests/errors/generic-private.lsp)

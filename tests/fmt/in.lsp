@@ -13,7 +13,7 @@
         [c 3]
     (when ( > a b )
   (set v.data[ i ] x)
-      (println 'x `(a ,b ,@c) c"s" #\( #\; pts[i].x)))
+      (println x c"s" #\( #\; pts[i].x)))
 (def table (array i32 3)
       {(array i32 3) 1
   2 3})
